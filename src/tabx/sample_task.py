@@ -63,6 +63,12 @@ class SampleConfig:
     composition_archetypes: tuple[str, ...] = COMPOSITION_ARCHETYPES
     composition_match_modes: tuple[str, ...] = COMPOSITION_MATCH_MODES
     composition_price_rel_tol: float = 0.15
+    composition_effective_rel_tol: float = 0.15
+    # Per-unit HP as a fraction of template max HP; B is projected to match
+    # sum(price * hp_frac) after price-matched roster sampling.
+    health_frac_buckets: tuple[float, ...] = (0.6, 0.7, 0.8, 0.9, 1.0)
+    health_frac_min: float = 0.5
+    health_frac_max: float = 1.0
     layout_archetypes: tuple[str, ...] = LAYOUT_ARCHETYPES
     distance_buckets: tuple[str, ...] = DISTANCE_BUCKETS
     spread_buckets: tuple[str, ...] = SPREAD_BUCKETS
@@ -604,6 +610,14 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
         raise ValueError("composition_match_modes must not be empty.")
     if config.composition_price_rel_tol < 0.0:
         raise ValueError("composition_price_rel_tol must be non-negative.")
+    if config.composition_effective_rel_tol < 0.0:
+        raise ValueError("composition_effective_rel_tol must be non-negative.")
+    if not config.health_frac_buckets:
+        raise ValueError("health_frac_buckets must not be empty.")
+    if any(not 0.0 < float(value) <= 1.0 for value in config.health_frac_buckets):
+        raise ValueError("health_frac_buckets must lie in (0, 1].")
+    if not 0.0 < config.health_frac_min <= config.health_frac_max <= 1.0:
+        raise ValueError("Require 0 < health_frac_min <= health_frac_max <= 1.")
     if config.bucket_coverage_candidates <= 0:
         raise ValueError("bucket_coverage_candidates must be positive.")
     if not 0.0 <= config.win_rate_min <= config.win_rate_max <= 1.0:
@@ -675,6 +689,8 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
         "Balance-first sampling: "
         f"match_modes={list(config.composition_match_modes)}, "
         f"price_rel_tol={config.composition_price_rel_tol}, "
+        f"effective_rel_tol={config.composition_effective_rel_tol}, "
+        f"health_frac_buckets={list(config.health_frac_buckets)}, "
         f"couple_stat_scales={config.couple_stat_scales}, "
         f"bucket_coverage={config.bucket_coverage}"
     )
@@ -713,6 +729,10 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
                     max_n_enemy=config.max_n_enemy,
                     match_mode=match_mode,
                     price_rel_tol=config.composition_price_rel_tol,
+                    effective_rel_tol=config.composition_effective_rel_tol,
+                    health_frac_buckets=config.health_frac_buckets,
+                    health_frac_min=config.health_frac_min,
+                    health_frac_max=config.health_frac_max,
                 )
             except ValueError as exc:
                 n_generation_failures += 1
@@ -805,6 +825,7 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
                 f"comp={metadata.get('composition_archetype')} "
                 f"match={match_info.get('match_mode')} "
                 f"price_diff={match_info.get('price_rel_diff', float('nan')):.3f} "
+                f"eff_diff={match_info.get('effective_rel_diff', float('nan')):.3f} "
                 f"layout={metadata.get('layout_archetype')} "
                 f"zone={metadata.get('zone_archetype')} ..."
             )

@@ -35,6 +35,20 @@ LAYOUT_ARCHETYPES = (
     "split_force",
     "protect_core",
 )
+# Empirically significant layout biases from 60-task expert-vs-expert analysis
+# (ε=0.05, 16 seeds). Values multiply the *enemy* budget targets relative to ally:
+#   >1: layout favors ally → strengthen enemy (buff)
+#   <1: layout favors enemy → weaken enemy (debuff)
+# Only layouts with Wilson CI excluding 0.5, |pooled_wr-0.5|>=0.10, and n_tasks>=4.
+LAYOUT_ENEMY_BUDGET_MULTIPLIER = {
+    "ambush": 1.2,  # ally pooled wr ≈ 0.76
+    "encircle": 1.2,  # ally pooled wr ≈ 0.64
+    "breakout": 0.8,  # ally pooled wr ≈ 0.28
+    "crossfire": 0.8,  # ally pooled wr ≈ 0.38
+    "narrow_depth": 0.8,  # ally pooled wr ≈ 0.31
+}
+LAYOUT_BUDGET_BUFF = 1.2
+LAYOUT_BUDGET_DEBUFF = 0.8
 DISTANCE_BUCKETS = ("close", "medium", "far")
 SPREAD_BUCKETS = ("compact", "line", "dispersed")
 ZONE_ARCHETYPES = (
@@ -103,6 +117,107 @@ def team_price(units: Sequence[int]) -> float:
         return 0.0
     prices = _unit_prices()
     return float(prices[np.asarray(units, dtype=int)].sum())
+
+
+def unit_prices_list(units: Sequence[int]) -> list[float]:
+    prices = _unit_prices()
+    return [float(prices[int(unit_id)]) for unit_id in units]
+
+
+def team_effective_value(units: Sequence[int], health_fracs: Sequence[float]) -> float:
+    """Weighted strength: sum_i price_i * health_frac_i."""
+
+    if len(units) != len(health_fracs):
+        raise ValueError("units and health_fracs must have the same length.")
+    return float(
+        sum(price * float(frac) for price, frac in zip(unit_prices_list(units), health_fracs))
+    )
+
+
+def sample_health_fractions(
+    rng: random.Random,
+    count: int,
+    buckets: Sequence[float],
+) -> list[float]:
+    """Sample per-unit HP fractions relative to each unit's template max HP."""
+
+    if count < 0:
+        raise ValueError("count must be non-negative.")
+    if not buckets:
+        raise ValueError("health fraction buckets must not be empty.")
+    if any(not 0.0 < float(value) <= 1.0 for value in buckets):
+        raise ValueError("health fraction buckets must lie in (0, 1].")
+    return [float(rng.choice(tuple(buckets))) for _ in range(count)]
+
+
+def _fit_health_fractions(fracs: Sequence[float], count: int) -> list[float]:
+    """Trim/pad health fractions to match a resized roster."""
+
+    if count < 1:
+        raise ValueError("count must be at least one.")
+    values = [float(value) for value in fracs[:count]]
+    if not values:
+        raise ValueError("Cannot fit empty health fractions.")
+    while len(values) < count:
+        values.append(values[len(values) % len(fracs)])
+    return values
+
+
+def project_health_fractions(
+    rng: random.Random,
+    prices: Sequence[float],
+    target_effective: float,
+    *,
+    f_min: float = 0.5,
+    f_max: float = 1.0,
+) -> list[float]:
+    """Match sum(price * frac) to a target via scale + residual repair.
+
+    This is O(n) and avoids nested roster search for the HP constraint.
+    """
+
+    if not 0.0 < f_min <= f_max <= 1.0:
+        raise ValueError("Require 0 < f_min <= f_max <= 1.")
+    price_values = [float(price) for price in prices]
+    n_units = len(price_values)
+    if n_units == 0:
+        return []
+    total_price = sum(price_values)
+    target = min(f_max * total_price, max(f_min * total_price, float(target_effective)))
+
+    # Random shape for diversity, then project onto the feasible effective budget.
+    base = [rng.uniform(f_min, f_max) for _ in range(n_units)]
+    current = sum(price * frac for price, frac in zip(price_values, base))
+    if current < 1e-8:
+        base = [(f_min + f_max) * 0.5] * n_units
+        current = sum(price * frac for price, frac in zip(price_values, base))
+    scale = target / current
+    fracs = [min(f_max, max(f_min, frac * scale)) for frac in base]
+
+    for _ in range(8):
+        current = sum(price * frac for price, frac in zip(price_values, fracs))
+        residual = target - current
+        if abs(residual) / max(target, 1.0) < 1e-4:
+            break
+        if residual > 0:
+            slots = [
+                (index, (f_max - fracs[index]) * price_values[index])
+                for index in range(n_units)
+                if fracs[index] < f_max - 1e-9
+            ]
+        else:
+            slots = [
+                (index, (fracs[index] - f_min) * price_values[index])
+                for index in range(n_units)
+                if fracs[index] > f_min + 1e-9
+            ]
+        capacity = sum(room for _, room in slots)
+        if capacity < 1e-9:
+            break
+        for index, room in slots:
+            delta = residual * (room / capacity) / price_values[index]
+            fracs[index] = min(f_max, max(f_min, fracs[index] + delta))
+    return fracs
 
 
 def _role_pool_for(unit_id: int) -> tuple[int, ...]:
@@ -246,6 +361,14 @@ def unit_swap_team(
     return team
 
 
+def layout_enemy_budget_multiplier(layout: str | None) -> float:
+    """Return enemy/ally budget multiplier for a layout, or 1.0 if neutral/unknown."""
+
+    if layout is None:
+        return 1.0
+    return float(LAYOUT_ENEMY_BUDGET_MULTIPLIER.get(layout, 1.0))
+
+
 def cost_matched_team(
     rng: random.Random,
     seed: Sequence[int],
@@ -254,16 +377,17 @@ def cost_matched_team(
     *,
     rel_tol: float = 0.15,
     n_trials: int = 64,
+    target_price: float | None = None,
 ) -> list[int]:
-    """Sample a different archetype roster whose total price is close to the seed."""
+    """Sample a roster whose total price is close to ``target_price`` (or the seed)."""
 
-    target = team_price(seed)
+    target = float(team_price(seed) if target_price is None else target_price)
     seed_key = tuple(sorted(seed))
     best: list[int] | None = None
     best_diff = float("inf")
     for _ in range(max(1, n_trials)):
         candidate = sample_seed_team(rng, archetype, capacity)
-        if tuple(sorted(candidate)) == seed_key:
+        if tuple(sorted(candidate)) == seed_key and abs(target - team_price(seed)) < 1e-6:
             continue
         diff = abs(team_price(candidate) - target) / max(target, 1.0)
         if diff < best_diff:
@@ -280,31 +404,101 @@ def cost_matched_team(
 def derive_opponent_team(
     rng: random.Random,
     seed: Sequence[int],
+    seed_health_fracs: Sequence[float],
     capacity: int,
     archetype: str,
     match_mode: str,
     *,
     price_rel_tol: float = 0.15,
-) -> list[int]:
-    """Build the second team from a seed team using a balance-oriented match mode."""
+    effective_rel_tol: float = 0.15,
+    health_frac_min: float = 0.5,
+    health_frac_max: float = 1.0,
+    n_trials: int = 64,
+    budget_multiplier: float = 1.0,
+) -> tuple[list[int], list[float]]:
+    """Build the second team + HP fractions under price and effective-value constraints.
+
+    ``budget_multiplier`` scales both target price and target effective value for the
+    derived team (used for layout-bias compensation).
+    """
 
     if match_mode not in COMPOSITION_MATCH_MODES:
         raise ValueError(f"Unknown composition match mode: {match_mode!r}.")
-    if match_mode == "mirror":
-        return mirror_team(seed, capacity)
-    if match_mode == "unit_swap":
-        other = unit_swap_team(rng, seed, capacity)
-        seed_price = team_price(seed)
-        rel_diff = abs(team_price(other) - seed_price) / max(seed_price, 1.0)
-        # Multi-swap can still drift; fall back to cost matching when too far.
-        if rel_diff > max(2.0 * price_rel_tol, 0.25):
-            return cost_matched_team(
-                rng, seed, capacity, archetype, rel_tol=price_rel_tol
+    if budget_multiplier <= 0:
+        raise ValueError("budget_multiplier must be positive.")
+    base_price = team_price(seed)
+    base_effective = team_effective_value(seed, seed_health_fracs)
+    target_price = base_price * budget_multiplier
+    target_effective = base_effective * budget_multiplier
+    seed_key = tuple(sorted(seed))
+    needs_budget_shift = abs(budget_multiplier - 1.0) > 1e-6
+
+    def finalize(units: list[int]) -> tuple[list[int], list[float]]:
+        fracs = project_health_fractions(
+            rng,
+            unit_prices_list(units),
+            target_effective,
+            f_min=health_frac_min,
+            f_max=health_frac_max,
+        )
+        return units, fracs
+
+    def cost_match_pair() -> tuple[list[int], list[float]]:
+        best: tuple[list[int], list[float], float] | None = None
+        for _ in range(max(1, n_trials)):
+            candidate = sample_seed_team(rng, archetype, capacity)
+            if tuple(sorted(candidate)) == seed_key and not needs_budget_shift:
+                continue
+            price_diff = abs(team_price(candidate) - target_price) / max(target_price, 1.0)
+            if price_diff > price_rel_tol:
+                continue
+            units, fracs = finalize(candidate)
+            effective_diff = abs(
+                team_effective_value(units, fracs) - target_effective
+            ) / max(target_effective, 1.0)
+            score = price_diff + effective_diff
+            if best is None or score < best[2]:
+                best = (units, fracs, score)
+            if effective_diff <= effective_rel_tol:
+                return units, fracs
+        if best is not None:
+            return best[0], best[1]
+        return finalize(
+            cost_matched_team(
+                rng,
+                seed,
+                capacity,
+                archetype,
+                rel_tol=price_rel_tol,
+                n_trials=n_trials,
+                target_price=target_price,
             )
-        return other
-    return cost_matched_team(
-        rng, seed, capacity, archetype, rel_tol=price_rel_tol
-    )
+        )
+
+    # Layout compensation changes the budget; prefer cost matching over pure mirror.
+    if needs_budget_shift or match_mode == "cost_match":
+        return cost_match_pair()
+
+    if match_mode == "mirror":
+        mirrored = mirror_team(seed, capacity)
+        if len(mirrored) == len(seed):
+            return mirrored, _fit_health_fractions(seed_health_fracs, len(mirrored))
+        return finalize(mirrored)
+
+    # unit_swap
+    swapped = unit_swap_team(rng, seed, capacity)
+    price_diff = abs(team_price(swapped) - target_price) / max(target_price, 1.0)
+    if price_diff > max(2.0 * price_rel_tol, 0.25):
+        swapped = cost_matched_team(
+            rng,
+            seed,
+            capacity,
+            archetype,
+            rel_tol=price_rel_tol,
+            n_trials=n_trials,
+            target_price=target_price,
+        )
+    return finalize(swapped)
 
 
 def sample_compositions(
@@ -315,75 +509,148 @@ def sample_compositions(
     *,
     match_mode: str = "unit_swap",
     price_rel_tol: float = 0.15,
-) -> tuple[list[int], list[int], dict[str, Any]]:
-    """Sample one seed team, then derive a balanced opponent.
+    effective_rel_tol: float = 0.15,
+    health_frac_buckets: Sequence[float] = (0.6, 0.7, 0.8, 0.9, 1.0),
+    health_frac_min: float = 0.5,
+    health_frac_max: float = 1.0,
+    layout: str | None = None,
+) -> tuple[list[int], list[int], list[float], list[float], dict[str, Any]]:
+    """Sample one seed team, then match the other on price and effective value.
 
-    Randomness for roster *structure* lives in the seed + match mode. Scenario-type
-    diversity (layout/zone/distance) should be handled by the outer sampler.
+    When ``layout`` has a significant empirical bias, the *enemy* budget targets are
+    scaled by ``LAYOUT_ENEMY_BUDGET_MULTIPLIER`` (1.2 buff / 0.8 debuff) relative to ally.
     """
 
     if archetype not in COMPOSITION_ARCHETYPES:
         raise ValueError(f"Unknown composition archetype: {archetype!r}.")
     if match_mode not in COMPOSITION_MATCH_MODES:
         raise ValueError(f"Unknown composition match mode: {match_mode!r}.")
+    if not 0.0 < health_frac_min <= health_frac_max <= 1.0:
+        raise ValueError("Require 0 < health_frac_min <= health_frac_max <= 1.")
 
+    enemy_budget_mult = layout_enemy_budget_multiplier(layout)
     ally_is_seed = rng.random() < 0.5
     seed_capacity, other_capacity = (
         (max_n_ally, max_n_enemy) if ally_is_seed else (max_n_enemy, max_n_ally)
     )
+    # Multiplier is defined as enemy/ally. If we derive ally from an enemy seed,
+    # invert it so the final enemy/ally ratio still matches the layout table.
+    derive_mult = enemy_budget_mult if ally_is_seed else (1.0 / enemy_budget_mult)
+
     seed = sample_seed_team(rng, archetype, seed_capacity)
-    other = derive_opponent_team(
+    seed_fracs = sample_health_fractions(rng, len(seed), health_frac_buckets)
+    other, other_fracs = derive_opponent_team(
         rng,
         seed,
+        seed_fracs,
         other_capacity,
         archetype,
         match_mode,
         price_rel_tol=price_rel_tol,
+        effective_rel_tol=effective_rel_tol,
+        health_frac_min=health_frac_min,
+        health_frac_max=health_frac_max,
+        budget_multiplier=derive_mult,
     )
-    ally, enemy = (seed, other) if ally_is_seed else (other, seed)
+    if ally_is_seed:
+        ally, enemy = seed, other
+        ally_fracs, enemy_fracs = seed_fracs, other_fracs
+    else:
+        ally, enemy = other, seed
+        ally_fracs, enemy_fracs = other_fracs, seed_fracs
     ally = _cap_units(ally, max_n_ally)
     enemy = _cap_units(enemy, max_n_enemy)
+    ally_fracs = ally_fracs[: len(ally)]
+    enemy_fracs = enemy_fracs[: len(enemy)]
     if not ally or not enemy:
         raise ValueError("Composition generation produced an empty team.")
 
     ally_price = team_price(ally)
     enemy_price = team_price(enemy)
+    ally_effective = team_effective_value(ally, ally_fracs)
+    enemy_effective = team_effective_value(enemy, enemy_fracs)
     match_info = {
         "match_mode": match_mode,
         "seed_side": "ally" if ally_is_seed else "enemy",
+        "layout": layout,
+        "layout_enemy_budget_multiplier": enemy_budget_mult,
         "ally_price": ally_price,
         "enemy_price": enemy_price,
-        "price_rel_diff": abs(ally_price - enemy_price) / max(max(ally_price, enemy_price), 1.0),
+        "price_rel_diff": abs(ally_price - enemy_price)
+        / max(max(ally_price, enemy_price), 1.0),
         "price_rel_tol": price_rel_tol,
+        "ally_effective": ally_effective,
+        "enemy_effective": enemy_effective,
+        "effective_rel_diff": abs(ally_effective - enemy_effective)
+        / max(max(ally_effective, enemy_effective), 1.0),
+        "effective_rel_tol": effective_rel_tol,
+        "enemy_over_ally_price": enemy_price / max(ally_price, 1.0),
+        "enemy_over_ally_effective": enemy_effective / max(ally_effective, 1.0),
+        "ally_health_fracs": [float(value) for value in ally_fracs],
+        "enemy_health_fracs": [float(value) for value in enemy_fracs],
     }
-    return ally, enemy, match_info
+    return ally, enemy, ally_fracs, enemy_fracs, match_info
 
 
-def composition_features(ally: Sequence[int], enemy: Sequence[int]) -> dict[str, Any]:
+def composition_features(
+    ally: Sequence[int],
+    enemy: Sequence[int],
+    ally_health_fracs: Sequence[float] | None = None,
+    enemy_health_fracs: Sequence[float] | None = None,
+) -> dict[str, Any]:
     """Return interpretable composition metadata."""
 
     prices = _unit_prices()
+    ally_fracs = (
+        [1.0] * len(ally)
+        if ally_health_fracs is None
+        else [float(value) for value in ally_health_fracs]
+    )
+    enemy_fracs = (
+        [1.0] * len(enemy)
+        if enemy_health_fracs is None
+        else [float(value) for value in enemy_health_fracs]
+    )
 
-    def summarize(units: Sequence[int]) -> dict[str, Any]:
+    def summarize(units: Sequence[int], fracs: Sequence[float]) -> dict[str, Any]:
         counts = {name: 0 for name in ALL_UNIT_NAMES}
         for unit_id in units:
             counts[ALL_UNIT_NAMES[unit_id]] += 1
+        total_price = float(prices[np.asarray(units)].sum()) if units else 0.0
+        effective = team_effective_value(units, fracs) if units else 0.0
         return {
             "count": len(units),
             "unit_counts": {name: count for name, count in counts.items() if count},
-            "total_price": float(prices[np.asarray(units)].sum()),
+            "total_price": total_price,
+            "effective_value": effective,
+            "mean_health_frac": float(sum(fracs) / len(fracs)) if fracs else 1.0,
+            "health_fracs": [float(value) for value in fracs],
             "melee_ratio": float(
                 sum(unit in FRONTLINE + (ASSASSIN,) for unit in units) / len(units)
-            ),
-            "ranged_ratio": float(sum(unit in RANGED for unit in units) / len(units)),
-            "healer_ratio": float(sum(unit in HEALERS for unit in units) / len(units)),
+            )
+            if units
+            else 0.0,
+            "ranged_ratio": float(sum(unit in RANGED for unit in units) / len(units))
+            if units
+            else 0.0,
+            "healer_ratio": float(sum(unit in HEALERS for unit in units) / len(units))
+            if units
+            else 0.0,
         }
 
-    features = {"ally": summarize(ally), "enemy": summarize(enemy)}
+    features = {
+        "ally": summarize(ally, ally_fracs),
+        "enemy": summarize(enemy, enemy_fracs),
+    }
     ally_price = features["ally"]["total_price"]
     enemy_price = features["enemy"]["total_price"]
+    ally_effective = features["ally"]["effective_value"]
+    enemy_effective = features["enemy"]["effective_value"]
     features["price_rel_diff"] = abs(ally_price - enemy_price) / max(
         max(ally_price, enemy_price), 1.0
+    )
+    features["effective_rel_diff"] = abs(ally_effective - enemy_effective) / max(
+        max(ally_effective, enemy_effective), 1.0
     )
     return features
 
@@ -542,6 +809,8 @@ def build_scenario(
     distance: str,
     spread: str,
     map_scale: float,
+    ally_health_fracs: Sequence[float] | None = None,
+    enemy_health_fracs: Sequence[float] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build a complete unpadded VectorizedScenario JSON dictionary."""
 
@@ -579,6 +848,22 @@ def build_scenario(
     )
     pos_max = np.column_stack((width / 2 - radii, height / 2 - radii))
     damage = specs["attack_damages"][unit_ids].astype(float)
+    ally_fracs = (
+        np.ones(len(ally_units), dtype=float)
+        if ally_health_fracs is None
+        else np.asarray(ally_health_fracs, dtype=float)
+    )
+    enemy_fracs = (
+        np.ones(len(enemy_units), dtype=float)
+        if enemy_health_fracs is None
+        else np.asarray(enemy_health_fracs, dtype=float)
+    )
+    if len(ally_fracs) != len(ally_units) or len(enemy_fracs) != len(enemy_units):
+        raise ValueError("Health fractions must match each team's unit count.")
+    if np.any(ally_fracs <= 0) or np.any(enemy_fracs <= 0):
+        raise ValueError("Health fractions must be positive.")
+    health_fracs = np.concatenate([ally_fracs, enemy_fracs])
+    healths = specs["healths"][unit_ids].astype(float) * health_fracs
 
     def column(values: np.ndarray) -> list[list[Any]]:
         return np.asarray(values).reshape(-1, 1).tolist()
@@ -592,7 +877,7 @@ def build_scenario(
         "pos_min": (-pos_max).tolist(),
         "pos_max": pos_max.tolist(),
         "unit_ids": column(unit_ids),
-        "healths": column(specs["healths"][unit_ids].astype(float)),
+        "healths": column(healths),
         "attack_damages": column(damage),
         "attack_ranges": column(specs["attack_ranges"][unit_ids].astype(float)),
         "attack_cooldowns": column(specs["attack_cooldown"][unit_ids].astype(float)),
@@ -790,18 +1075,37 @@ def generate_programmatic_task(
     max_n_enemy: int,
     match_mode: str = "unit_swap",
     price_rel_tol: float = 0.15,
+    effective_rel_tol: float = 0.15,
+    health_frac_buckets: Sequence[float] = (0.6, 0.7, 0.8, 0.9, 1.0),
+    health_frac_min: float = 0.5,
+    health_frac_max: float = 1.0,
 ) -> dict[str, Any]:
     """Generate one complete task covering 4.1 A/B/C/D."""
 
-    ally, enemy, match_info = sample_compositions(
+    ally, enemy, ally_fracs, enemy_fracs, match_info = sample_compositions(
         rng,
         composition,
         max_n_ally,
         max_n_enemy,
         match_mode=match_mode,
         price_rel_tol=price_rel_tol,
+        effective_rel_tol=effective_rel_tol,
+        health_frac_buckets=health_frac_buckets,
+        health_frac_min=health_frac_min,
+        health_frac_max=health_frac_max,
+        layout=layout,
     )
-    scenario, grid_info = build_scenario(rng, ally, enemy, layout, distance, spread, map_scale)
+    scenario, grid_info = build_scenario(
+        rng,
+        ally,
+        enemy,
+        layout,
+        distance,
+        spread,
+        map_scale,
+        ally_health_fracs=ally_fracs,
+        enemy_health_fracs=enemy_fracs,
+    )
     zone_scenario = build_relational_zones(scenario, grid_info, zone, zone_intensity, zone_relation)
     return {
         "grid_info": grid_info,
@@ -811,7 +1115,9 @@ def generate_programmatic_task(
             "source": {"kind": "programmatic"},
             "composition_archetype": composition,
             "composition_match": match_info,
-            "composition_features": composition_features(ally, enemy),
+            "composition_features": composition_features(
+                ally, enemy, ally_fracs, enemy_fracs
+            ),
             "layout_archetype": layout,
             "distance_bucket": distance,
             "spread_bucket": spread,
