@@ -394,3 +394,94 @@ class TABXLogWrapper(BaseWrapper):
         info["returned_cumulative_damage_dealts"] = log_state.returned_cumulative_damage_dealts
 
         return obs, next_state | {"log_state": log_state}, reward, done, info
+
+
+
+## 下面是添加的测试平衡性部分
+class TABXBalanceWrapper(BaseWrapper):
+    def __init__(
+        self,
+        env: TABX,
+    ):
+        super().__init__(env)
+
+        self.action_spaces = {
+            agent: action_space_
+            for (agent, action_space_) in self.env.action_spaces.items()
+            if agent in self.env.ally_keys
+        }
+
+        self.observation_spaces = {
+            agent: observation_space
+            for (agent, observation_space) in self.env.observation_spaces.items()
+            if agent in self.env.ally_keys
+        }
+
+        self.agents = self.env.ally_keys
+        self.num_agents = len(self.agents)
+
+    def filter_obs(self, obs):
+        target_obs = {}
+        for obs_key in obs.keys():
+            if obs_key in self.env.enemy_keys:
+                continue
+            target_obs[obs_key] = obs[obs_key]
+        return target_obs
+
+    def reset(self, key, env_params: Dict[str, Any]):
+        if "heuristic_params" not in env_params:
+            raise ValueError("The heuristic_params is not in env_params.")
+        obs, state = self.env.reset(key, env_params)
+        target_obs = self.filter_obs(obs)
+        return target_obs, state | {"heuristic_params": env_params["heuristic_params"]} | {
+            "last_visible_targets": {
+                unit: LastVisibleTarget() 
+                for unit in self.env.ally_keys + self.env.enemy_keys}
+        }
+
+    def step(self, key, state, action):
+        obs = self.env.get_obs(state["state"])
+        new_last_visible_targets = {}
+        # 增加ally的行为基于启发式策略
+        for unit in self.env.ally_keys:
+            heuristic_key, key = jax.random.split(key)
+            action[unit], new_last_visible_targets[unit] = heuristic_policy(
+                heuristic_key,
+                obs[unit],
+                state["last_visible_targets"][unit],
+                self.env.num_agents,
+                self.env.max_n_zone,
+                state["heuristic_params"],
+                state["physics_params"],
+            )
+        # Add enemy actions based on heuristic policy
+        for unit in self.env.enemy_keys:
+            heuristic_key, key = jax.random.split(key)
+            action[unit], new_last_visible_targets[unit] = heuristic_policy(
+                heuristic_key,
+                obs[unit],
+                state["last_visible_targets"][unit],
+                self.env.num_agents,
+                self.env.max_n_zone,
+                state["heuristic_params"],
+                state["physics_params"],
+            )
+        obs, next_state, reward, done, info = self.env.step(key, state, action)
+        target_obs = self.filter_obs(obs)
+        done = self.filter_obs(done) | {"__all__": done["__all__"]}
+        rewards = {agent: reward[0] for agent in self.agents}
+        rewards["__all__"] = reward[0]
+
+        return (
+            target_obs,
+            next_state
+            | {"heuristic_params": state["heuristic_params"]}
+            | {"last_visible_targets": new_last_visible_targets},
+            rewards,
+            done,
+            info,
+        )
+
+    def get_avail_actions(self, state):
+        avail_actions = self.env.get_avail_actions(state)
+        return {agent: avail_actions[agent] for agent in self.env.ally_keys}
