@@ -19,6 +19,12 @@ COMPOSITION_ARCHETYPES = (
     "elite_swarm",
     "mobility_range",
 )
+# How the second team is derived from the first (balance-first diversity).
+COMPOSITION_MATCH_MODES = (
+    "mirror",  # exact copy (trimmed to capacity)
+    "unit_swap",  # copy then replace a few units in-role
+    "cost_match",  # different roster with similar total unit price
+)
 LAYOUT_ARCHETYPES = (
     "face_off",
     "crossfire",
@@ -82,95 +88,275 @@ def _cap_units(units: list[int], capacity: int) -> list[int]:
     return units[:capacity]
 
 
-def sample_compositions(
-    rng: random.Random,
-    archetype: str,
-    max_n_ally: int,
-    max_n_enemy: int,
-) -> tuple[list[int], list[int]]:
-    """Sample two role-structured unit multisets for a composition archetype."""
-
-    if archetype not in COMPOSITION_ARCHETYPES:
-        raise ValueError(f"Unknown composition archetype: {archetype!r}.")
-
-    if archetype == "frontline_backline":
-
-        def make_team(capacity: int) -> list[int]:
-            front = _bounded_count(rng, 2, 4, max(1, capacity - 1))
-            back = _bounded_count(rng, 1, 3, max(1, capacity - front))
-            return _cap_units(
-                _sample_units(rng, FRONTLINE, front) + _sample_units(rng, BACKLINE, back),
-                capacity,
-            )
-
-        ally, enemy = make_team(max_n_ally), make_team(max_n_enemy)
-    elif archetype == "frontline_healer":
-
-        def make_team(capacity: int) -> list[int]:
-            healer_count = 1 if capacity < 5 else rng.randint(1, 2)
-            combat_count = _bounded_count(rng, 2, 5, capacity - healer_count)
-            combat_pool = FRONTLINE + (ASSASSIN,)
-            return _cap_units(
-                _sample_units(rng, combat_pool, combat_count)
-                + _sample_units(rng, HEALERS, healer_count),
-                capacity,
-            )
-
-        ally, enemy = make_team(max_n_ally), make_team(max_n_enemy)
-    elif archetype == "assassin_fragile":
-        ally_is_assassin = rng.random() < 0.5
-        assassin_capacity, fragile_capacity = (
-            (max_n_ally, max_n_enemy) if ally_is_assassin else (max_n_enemy, max_n_ally)
-        )
-        assassins = [ASSASSIN] * _bounded_count(rng, 2, 4, assassin_capacity)
-        if len(assassins) < assassin_capacity and rng.random() < 0.6:
-            assassins.append(rng.choice((FARMER, PALADIN)))
-        fragile = _sample_units(rng, FRAGILE_BACKLINE, _bounded_count(rng, 2, 5, fragile_capacity))
-        ally, enemy = (assassins, fragile) if ally_is_assassin else (fragile, assassins)
-    elif archetype == "ranged_fort":
-
-        def make_team(capacity: int) -> list[int]:
-            n_total = _bounded_count(rng, 3, 7, capacity)
-            n_front = 1 if n_total > 2 else 0
-            return _sample_units(rng, FRONTLINE, n_front) + _sample_units(
-                rng, RANGED, n_total - n_front
-            )
-
-        ally, enemy = make_team(max_n_ally), make_team(max_n_enemy)
-    elif archetype == "elite_swarm":
-        ally_is_elite = rng.random() < 0.5
-        elite_capacity, swarm_capacity = (
-            (max_n_ally, max_n_enemy) if ally_is_elite else (max_n_enemy, max_n_ally)
-        )
-        elite = _sample_units(rng, ELITE, _bounded_count(rng, 1, 3, elite_capacity))
-        swarm = [FARMER] * _bounded_count(rng, 4, 9, swarm_capacity)
-        ally, enemy = (elite, swarm) if ally_is_elite else (swarm, elite)
-    else:
-        ally_is_mobile = rng.random() < 0.5
-        mobile_capacity, ranged_capacity = (
-            (max_n_ally, max_n_enemy) if ally_is_mobile else (max_n_enemy, max_n_ally)
-        )
-        mobile_count = _bounded_count(rng, 3, 7, mobile_capacity)
-        ranged_count = _bounded_count(rng, 3, 7, ranged_capacity)
-        mobile = _sample_units(rng, MOBILE, mobile_count)
-        if mobile:
-            mobile[0] = ASSASSIN
-        ranged = _sample_units(rng, RANGED, ranged_count)
-        ally, enemy = (mobile, ranged) if ally_is_mobile else (ranged, mobile)
-
-    ally = _cap_units(ally, max_n_ally)
-    enemy = _cap_units(enemy, max_n_enemy)
-    if not ally or not enemy:
-        raise ValueError("Composition generation produced an empty team.")
-    return ally, enemy
-
-
 def _unit_specs() -> dict[str, np.ndarray]:
     return {key: np.asarray(value) for key, value in get_all_unit_spec().items()}
 
 
 def _unit_prices() -> np.ndarray:
     return _unit_specs()["prices"]
+
+
+def team_price(units: Sequence[int]) -> float:
+    """Total unit price (environment cost) for a roster."""
+
+    if not units:
+        return 0.0
+    prices = _unit_prices()
+    return float(prices[np.asarray(units, dtype=int)].sum())
+
+
+def _role_pool_for(unit_id: int) -> tuple[int, ...]:
+    if unit_id in ELITE:
+        return ELITE
+    if unit_id in FRONTLINE:
+        return FRONTLINE
+    if unit_id in BACKLINE or unit_id in RANGED:
+        return RANGED
+    if unit_id in HEALERS:
+        return HEALERS
+    if unit_id == ASSASSIN:
+        return MOBILE
+    return tuple(range(9))
+
+
+def _similar_price_alternatives(unit_id: int, *, rel_tol: float = 0.45) -> list[int]:
+    """Prefer replacements with similar unit price, then same role pool."""
+
+    prices = _unit_prices()
+    target = float(prices[unit_id])
+
+    def within(tol: float) -> list[int]:
+        return [
+            other
+            for other in range(9)
+            if other != unit_id
+            and abs(float(prices[other]) - target) / max(target, 1.0) <= tol
+        ]
+
+    similar = within(rel_tol)
+    role = set(_role_pool_for(unit_id))
+    role_similar = [other for other in similar if other in role]
+    if role_similar:
+        return role_similar
+    if similar:
+        return similar
+    loose = within(max(rel_tol, 0.75))
+    if loose:
+        return loose
+    ranked = sorted(
+        (other for other in range(9) if other != unit_id),
+        key=lambda other: abs(float(prices[other]) - target),
+    )
+    return ranked[:3]
+
+
+def sample_seed_team(rng: random.Random, archetype: str, capacity: int) -> list[int]:
+    """Sample one role-structured team for a composition archetype."""
+
+    if archetype not in COMPOSITION_ARCHETYPES:
+        raise ValueError(f"Unknown composition archetype: {archetype!r}.")
+    if capacity < 1:
+        raise ValueError("Team capacity must be at least one.")
+
+    if archetype == "frontline_backline":
+        front = _bounded_count(rng, 2, 4, max(1, capacity - 1))
+        back = _bounded_count(rng, 1, 3, max(1, capacity - front))
+        team = _sample_units(rng, FRONTLINE, front) + _sample_units(rng, BACKLINE, back)
+    elif archetype == "frontline_healer":
+        healer_count = 1 if capacity < 5 else rng.randint(1, 2)
+        combat_count = _bounded_count(rng, 2, 5, capacity - healer_count)
+        combat_pool = FRONTLINE + (ASSASSIN,)
+        team = _sample_units(rng, combat_pool, combat_count) + _sample_units(
+            rng, HEALERS, healer_count
+        )
+    elif archetype == "assassin_fragile":
+        # Seed is either assassin pack or fragile backline; opponent is matched later.
+        if rng.random() < 0.5:
+            team = [ASSASSIN] * _bounded_count(rng, 2, 4, capacity)
+            if len(team) < capacity and rng.random() < 0.6:
+                team.append(rng.choice((FARMER, PALADIN)))
+        else:
+            team = _sample_units(
+                rng, FRAGILE_BACKLINE, _bounded_count(rng, 2, 5, capacity)
+            )
+    elif archetype == "ranged_fort":
+        n_total = _bounded_count(rng, 3, 7, capacity)
+        n_front = 1 if n_total > 2 else 0
+        team = _sample_units(rng, FRONTLINE, n_front) + _sample_units(
+            rng, RANGED, n_total - n_front
+        )
+    elif archetype == "elite_swarm":
+        if rng.random() < 0.5:
+            team = _sample_units(rng, ELITE, _bounded_count(rng, 1, 3, capacity))
+        else:
+            team = [FARMER] * _bounded_count(rng, 4, 9, capacity)
+    else:  # mobility_range
+        if rng.random() < 0.5:
+            team = _sample_units(rng, MOBILE, _bounded_count(rng, 3, 7, capacity))
+            if team:
+                team[0] = ASSASSIN
+        else:
+            team = _sample_units(rng, RANGED, _bounded_count(rng, 3, 7, capacity))
+
+    team = _cap_units(team, capacity)
+    if not team:
+        raise ValueError("Seed team generation produced an empty roster.")
+    return team
+
+
+def _fit_team_size(seed: Sequence[int], capacity: int) -> list[int]:
+    """Trim or lightly pad a seed roster to fit the opposing capacity."""
+
+    if capacity < 1:
+        raise ValueError("Team capacity must be at least one.")
+    team = list(seed[:capacity])
+    if not team:
+        raise ValueError("Cannot fit an empty seed team.")
+    # Prefer keeping similar size; only pad when seed is shorter than capacity and tiny.
+    while len(team) < min(capacity, max(len(seed), 1)) and len(team) < capacity:
+        team.append(team[len(team) % len(seed)])
+    return _cap_units(team, capacity)
+
+
+def mirror_team(seed: Sequence[int], capacity: int) -> list[int]:
+    """Copy the seed roster into the opposing capacity."""
+
+    return _fit_team_size(seed, capacity)
+
+
+def unit_swap_team(
+    rng: random.Random,
+    seed: Sequence[int],
+    capacity: int,
+    *,
+    n_replace: int | None = None,
+) -> list[int]:
+    """Copy the seed roster, then replace a few units within their role pools."""
+
+    team = _fit_team_size(seed, capacity)
+    max_replace = min(3, len(team))
+    if n_replace is None:
+        n_replace = rng.randint(1, max_replace) if max_replace else 0
+    n_replace = max(0, min(n_replace, len(team)))
+    if n_replace == 0:
+        return team
+    for index in rng.sample(range(len(team)), k=n_replace):
+        alternatives = _similar_price_alternatives(team[index])
+        team[index] = rng.choice(alternatives)
+    return team
+
+
+def cost_matched_team(
+    rng: random.Random,
+    seed: Sequence[int],
+    capacity: int,
+    archetype: str,
+    *,
+    rel_tol: float = 0.15,
+    n_trials: int = 64,
+) -> list[int]:
+    """Sample a different archetype roster whose total price is close to the seed."""
+
+    target = team_price(seed)
+    seed_key = tuple(sorted(seed))
+    best: list[int] | None = None
+    best_diff = float("inf")
+    for _ in range(max(1, n_trials)):
+        candidate = sample_seed_team(rng, archetype, capacity)
+        if tuple(sorted(candidate)) == seed_key:
+            continue
+        diff = abs(team_price(candidate) - target) / max(target, 1.0)
+        if diff < best_diff:
+            best_diff = diff
+            best = candidate
+        if diff <= rel_tol:
+            return candidate
+    if best is not None:
+        return best
+    # Fallback: keep balance via light unit swaps when no distinct roster is found.
+    return unit_swap_team(rng, seed, capacity)
+
+
+def derive_opponent_team(
+    rng: random.Random,
+    seed: Sequence[int],
+    capacity: int,
+    archetype: str,
+    match_mode: str,
+    *,
+    price_rel_tol: float = 0.15,
+) -> list[int]:
+    """Build the second team from a seed team using a balance-oriented match mode."""
+
+    if match_mode not in COMPOSITION_MATCH_MODES:
+        raise ValueError(f"Unknown composition match mode: {match_mode!r}.")
+    if match_mode == "mirror":
+        return mirror_team(seed, capacity)
+    if match_mode == "unit_swap":
+        other = unit_swap_team(rng, seed, capacity)
+        seed_price = team_price(seed)
+        rel_diff = abs(team_price(other) - seed_price) / max(seed_price, 1.0)
+        # Multi-swap can still drift; fall back to cost matching when too far.
+        if rel_diff > max(2.0 * price_rel_tol, 0.25):
+            return cost_matched_team(
+                rng, seed, capacity, archetype, rel_tol=price_rel_tol
+            )
+        return other
+    return cost_matched_team(
+        rng, seed, capacity, archetype, rel_tol=price_rel_tol
+    )
+
+
+def sample_compositions(
+    rng: random.Random,
+    archetype: str,
+    max_n_ally: int,
+    max_n_enemy: int,
+    *,
+    match_mode: str = "unit_swap",
+    price_rel_tol: float = 0.15,
+) -> tuple[list[int], list[int], dict[str, Any]]:
+    """Sample one seed team, then derive a balanced opponent.
+
+    Randomness for roster *structure* lives in the seed + match mode. Scenario-type
+    diversity (layout/zone/distance) should be handled by the outer sampler.
+    """
+
+    if archetype not in COMPOSITION_ARCHETYPES:
+        raise ValueError(f"Unknown composition archetype: {archetype!r}.")
+    if match_mode not in COMPOSITION_MATCH_MODES:
+        raise ValueError(f"Unknown composition match mode: {match_mode!r}.")
+
+    ally_is_seed = rng.random() < 0.5
+    seed_capacity, other_capacity = (
+        (max_n_ally, max_n_enemy) if ally_is_seed else (max_n_enemy, max_n_ally)
+    )
+    seed = sample_seed_team(rng, archetype, seed_capacity)
+    other = derive_opponent_team(
+        rng,
+        seed,
+        other_capacity,
+        archetype,
+        match_mode,
+        price_rel_tol=price_rel_tol,
+    )
+    ally, enemy = (seed, other) if ally_is_seed else (other, seed)
+    ally = _cap_units(ally, max_n_ally)
+    enemy = _cap_units(enemy, max_n_enemy)
+    if not ally or not enemy:
+        raise ValueError("Composition generation produced an empty team.")
+
+    ally_price = team_price(ally)
+    enemy_price = team_price(enemy)
+    match_info = {
+        "match_mode": match_mode,
+        "seed_side": "ally" if ally_is_seed else "enemy",
+        "ally_price": ally_price,
+        "enemy_price": enemy_price,
+        "price_rel_diff": abs(ally_price - enemy_price) / max(max(ally_price, enemy_price), 1.0),
+        "price_rel_tol": price_rel_tol,
+    }
+    return ally, enemy, match_info
 
 
 def composition_features(ally: Sequence[int], enemy: Sequence[int]) -> dict[str, Any]:
@@ -193,7 +379,13 @@ def composition_features(ally: Sequence[int], enemy: Sequence[int]) -> dict[str,
             "healer_ratio": float(sum(unit in HEALERS for unit in units) / len(units)),
         }
 
-    return {"ally": summarize(ally), "enemy": summarize(enemy)}
+    features = {"ally": summarize(ally), "enemy": summarize(enemy)}
+    ally_price = features["ally"]["total_price"]
+    enemy_price = features["enemy"]["total_price"]
+    features["price_rel_diff"] = abs(ally_price - enemy_price) / max(
+        max(ally_price, enemy_price), 1.0
+    )
+    return features
 
 
 def _formation_offsets(count: int, spread: str, axis: str = "vertical") -> np.ndarray:
@@ -596,10 +788,19 @@ def generate_programmatic_task(
     map_scale: float,
     max_n_ally: int,
     max_n_enemy: int,
+    match_mode: str = "unit_swap",
+    price_rel_tol: float = 0.15,
 ) -> dict[str, Any]:
     """Generate one complete task covering 4.1 A/B/C/D."""
 
-    ally, enemy = sample_compositions(rng, composition, max_n_ally, max_n_enemy)
+    ally, enemy, match_info = sample_compositions(
+        rng,
+        composition,
+        max_n_ally,
+        max_n_enemy,
+        match_mode=match_mode,
+        price_rel_tol=price_rel_tol,
+    )
     scenario, grid_info = build_scenario(rng, ally, enemy, layout, distance, spread, map_scale)
     zone_scenario = build_relational_zones(scenario, grid_info, zone, zone_intensity, zone_relation)
     return {
@@ -609,6 +810,7 @@ def generate_programmatic_task(
         "metadata": {
             "source": {"kind": "programmatic"},
             "composition_archetype": composition,
+            "composition_match": match_info,
             "composition_features": composition_features(ally, enemy),
             "layout_archetype": layout,
             "distance_bucket": distance,
@@ -620,5 +822,15 @@ def generate_programmatic_task(
             "zone_archetype": zone,
             "zone_intensity": zone_intensity,
             "zone_relation": zone_relation,
+            "scenario_bucket": {
+                "composition": composition,
+                "layout": layout,
+                "distance": distance,
+                "spread": spread,
+                "zone": zone,
+                "zone_intensity": zone_intensity,
+                "zone_relation": zone_relation,
+                "match_mode": match_mode,
+            },
         },
     }

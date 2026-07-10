@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import random
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -33,6 +34,7 @@ from src.tabx.scenarios.utils import (
 )
 from src.tabx.task_generators import (
     COMPOSITION_ARCHETYPES,
+    COMPOSITION_MATCH_MODES,
     DISTANCE_BUCKETS,
     LAYOUT_ARCHETYPES,
     SPREAD_BUCKETS,
@@ -59,6 +61,8 @@ class SampleConfig:
     max_n_enemy: int = 10
     max_n_zone: int = 4
     composition_archetypes: tuple[str, ...] = COMPOSITION_ARCHETYPES
+    composition_match_modes: tuple[str, ...] = COMPOSITION_MATCH_MODES
+    composition_price_rel_tol: float = 0.15
     layout_archetypes: tuple[str, ...] = LAYOUT_ARCHETYPES
     distance_buckets: tuple[str, ...] = DISTANCE_BUCKETS
     spread_buckets: tuple[str, ...] = SPREAD_BUCKETS
@@ -69,9 +73,26 @@ class SampleConfig:
     transforms: tuple[str, ...] = SUPPORTED_TRANSFORMS
     map_scales: tuple[float, ...] = (0.85, 1.0, 1.15)
     stat_scales: tuple[float, ...] = (0.9, 1.0, 1.1)
+    # Keep ally/enemy stat scales coupled so balance comes from roster matching,
+    # while scenario-type buckets carry most of the diversity.
+    couple_stat_scales: bool = True
     zone_strength_scales: tuple[float, ...] = (0.75, 1.0, 1.25)
+    # Prefer under-covered (composition, layout, distance, spread, zone, ...) buckets.
+    bucket_coverage: bool = True
+    bucket_coverage_candidates: int = 16
     physics: str = "default"
     heuristic: str = "expert"
+    # Keep only tasks whose both-team heuristic win rate falls in this band.
+    # With epsilon=0 the policy is nearly deterministic, so win rates collapse to
+    # 0/1; use a small positive filter_epsilon so intermediate rates are possible.
+    filter_by_win_rate: bool = True
+    win_rate_min: float = 0.4
+    win_rate_max: float = 0.6
+    filter_num_seeds: int = 16
+    filter_epsilon: float = 0.05
+    filter_max_episode_steps: int = 512
+    filter_reject_all_truncated: bool = True
+    filter_max_attempts: int = 20
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -124,6 +145,7 @@ def save_task_bank(
     max_n_ally: int | None = None,
     max_n_enemy: int | None = None,
     max_n_zone: int | None = None,
+    filter_protocol: dict[str, Any] | None = None,
 ) -> Path:
     """Save sampled tasks and their manifest into one JSON file."""
 
@@ -141,20 +163,23 @@ def save_task_bank(
         raise ValueError(
             f"Task-bank schema {requested} is smaller than required limits {inferred}."
         )
+    manifest: dict[str, Any] = {
+        "generator": "src.tabx.sample_task",
+        "seed": seed,
+        "n_tasks": len(tasks),
+        "physics": physics,
+        "heuristic": heuristic,
+        "schema": {
+            "max_n_ally": max_n_ally,
+            "max_n_enemy": max_n_enemy,
+            "max_n_zone": max_n_zone,
+        },
+    }
+    if filter_protocol is not None:
+        manifest["filter_protocol"] = filter_protocol
     bank = {
         "schema_version": TASK_BANK_VERSION,
-        "manifest": {
-            "generator": "src.tabx.sample_task",
-            "seed": seed,
-            "n_tasks": len(tasks),
-            "physics": physics,
-            "heuristic": heuristic,
-            "schema": {
-                "max_n_ally": max_n_ally,
-                "max_n_enemy": max_n_enemy,
-                "max_n_zone": max_n_zone,
-            },
-        },
+        "manifest": manifest,
         "tasks": list(tasks),
     }
     output_path = Path(path)
@@ -441,6 +466,129 @@ def validate_task(task: dict[str, Any], *, collision_margin: float = 1e-5) -> No
                 raise ValueError("An active unit intersects programmatic lava at spawn.")
 
 
+def _progress_bar(current: int, total: int, width: int = 24) -> str:
+    filled = int(width * current / max(total, 1))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _scenario_bucket_key(
+    composition: str,
+    layout: str,
+    distance: str,
+    spread: str,
+    zone: str,
+    zone_intensity: str,
+    zone_relation: str,
+    match_mode: str,
+) -> tuple[str, ...]:
+    return (
+        composition,
+        layout,
+        distance,
+        spread,
+        zone,
+        zone_intensity,
+        zone_relation,
+        match_mode,
+    )
+
+
+def _pick_scenario_buckets(
+    rng: random.Random,
+    config: SampleConfig,
+    coverage: Counter[tuple[str, ...]],
+) -> tuple[str, ...]:
+    """Pick scenario-type buckets, preferring under-covered combinations."""
+
+    def draw() -> tuple[str, ...]:
+        return _scenario_bucket_key(
+            rng.choice(config.composition_archetypes),
+            rng.choice(config.layout_archetypes),
+            rng.choice(config.distance_buckets),
+            rng.choice(config.spread_buckets),
+            rng.choice(config.zone_archetypes),
+            rng.choice(config.zone_intensity_buckets),
+            rng.choice(config.zone_relation_buckets),
+            rng.choice(config.composition_match_modes),
+        )
+
+    if not config.bucket_coverage:
+        return draw()
+
+    best = draw()
+    best_count = coverage[best]
+    n_draw = max(1, config.bucket_coverage_candidates)
+    for _ in range(n_draw - 1):
+        candidate = draw()
+        count = coverage[candidate]
+        if count < best_count or (count == best_count and rng.random() < 0.5):
+            best = candidate
+            best_count = count
+    return best
+
+
+def _sample_coupled_stat_scales(
+    rng: random.Random, scales: Sequence[float], *, coupled: bool
+) -> tuple[float, float]:
+    """Sample ally/enemy stat scales; coupled mode keeps them equal or one step apart."""
+
+    if not coupled:
+        return rng.choice(tuple(scales)), rng.choice(tuple(scales))
+    ordered = sorted(scales)
+    base = rng.choice(ordered)
+    if len(ordered) == 1 or rng.random() < 0.75:
+        return base, base
+    index = ordered.index(base)
+    neighbors = []
+    if index > 0:
+        neighbors.append(ordered[index - 1])
+    if index + 1 < len(ordered):
+        neighbors.append(ordered[index + 1])
+    other = rng.choice(neighbors) if neighbors else base
+    if rng.random() < 0.5:
+        return base, other
+    return other, base
+
+
+def _passes_win_rate_filter(
+    task: dict[str, Any],
+    *,
+    physics: str,
+    heuristic: str,
+    num_seeds: int,
+    seed: int,
+    epsilon: float,
+    max_episode_steps: int,
+    win_rate_min: float,
+    win_rate_max: float,
+    reject_all_truncated: bool,
+) -> tuple[bool, dict[str, Any]]:
+    """Evaluate one candidate and decide whether its win rate is balanced enough."""
+
+    # Lazy import avoids a circular dependency with eval_task.
+    from src.tabx.eval_task import evaluate_tasks
+
+    result = evaluate_tasks(
+        [task],
+        physics=physics,
+        heuristic=heuristic,
+        num_seeds=num_seeds,
+        seed=seed,
+        epsilon_override=epsilon,
+        max_episode_steps=max_episode_steps,
+    )[0]
+    win_rate = float(result["win_rate"])
+    accepted = win_rate_min <= win_rate <= win_rate_max
+    reject_reason = None
+    if reject_all_truncated and result["quality_flags"]["all_truncated"]:
+        accepted = False
+        reject_reason = "all_truncated"
+    elif not accepted:
+        reject_reason = "win_rate_out_of_band"
+    result["reject_reason"] = reject_reason
+    return accepted, result
+
+
 def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
     """Sample unique low-cost task variants from existing TABX assets."""
 
@@ -452,8 +600,29 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
         raise ValueError("max_n_ally/max_n_enemy must be positive and max_n_zone non-negative.")
     if not config.transforms or not config.map_scales or not config.stat_scales:
         raise ValueError("Transform and scale buckets must not be empty.")
+    if not config.composition_match_modes:
+        raise ValueError("composition_match_modes must not be empty.")
+    if config.composition_price_rel_tol < 0.0:
+        raise ValueError("composition_price_rel_tol must be non-negative.")
+    if config.bucket_coverage_candidates <= 0:
+        raise ValueError("bucket_coverage_candidates must be positive.")
+    if not 0.0 <= config.win_rate_min <= config.win_rate_max <= 1.0:
+        raise ValueError("Require 0 <= win_rate_min <= win_rate_max <= 1.")
+    if config.filter_by_win_rate:
+        if config.filter_num_seeds <= 0:
+            raise ValueError("filter_num_seeds must be positive when filtering.")
+        if not 0.0 <= config.filter_epsilon <= 1.0:
+            raise ValueError("filter_epsilon must be in [0, 1].")
+        if config.filter_epsilon <= 0.0:
+            raise ValueError(
+                "filter_epsilon must be > 0 when filtering by win rate; "
+                "epsilon=0 makes expert vs expert nearly deterministic (win rates collapse to 0/1)."
+            )
+        if config.filter_max_attempts <= 0:
+            raise ValueError("filter_max_attempts must be positive when filtering.")
     generator_buckets = (
         config.composition_archetypes,
+        config.composition_match_modes,
         config.layout_archetypes,
         config.distance_buckets,
         config.spread_buckets,
@@ -468,6 +637,7 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
         raise ValueError(f"Unsupported transforms: {sorted(unknown)}.")
     supported_buckets = (
         (config.composition_archetypes, COMPOSITION_ARCHETYPES, "composition"),
+        (config.composition_match_modes, COMPOSITION_MATCH_MODES, "composition match"),
         (config.layout_archetypes, LAYOUT_ARCHETYPES, "layout"),
         (config.distance_buckets, DISTANCE_BUCKETS, "distance"),
         (config.spread_buckets, SPREAD_BUCKETS, "spread"),
@@ -483,34 +653,88 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
     rng = random.Random(config.seed)
     tasks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    max_attempts = max(1_000, config.n_tasks * 100)
+    bucket_coverage: Counter[tuple[str, ...]] = Counter()
+    if config.filter_by_win_rate:
+        # filter_max_attempts is a per-accepted-task budget.
+        max_attempts = config.filter_max_attempts * config.n_tasks
+    else:
+        max_attempts = max(1_000, config.n_tasks * 100)
+    n_candidates = 0
+    n_rejected_by_win_rate = 0
+    n_generation_failures = 0
 
-    for _ in range(max_attempts):
+    if config.filter_by_win_rate:
+        print(
+            "Win-rate filter enabled: "
+            f"target={config.n_tasks}, band=[{config.win_rate_min:.2f}, {config.win_rate_max:.2f}], "
+            f"seeds={config.filter_num_seeds}, epsilon={config.filter_epsilon}, "
+            f"max_attempts_per_task={config.filter_max_attempts}, "
+            f"max_attempts_total={max_attempts}"
+        )
+    print(
+        "Balance-first sampling: "
+        f"match_modes={list(config.composition_match_modes)}, "
+        f"price_rel_tol={config.composition_price_rel_tol}, "
+        f"couple_stat_scales={config.couple_stat_scales}, "
+        f"bucket_coverage={config.bucket_coverage}"
+    )
+
+    for attempt in range(1, max_attempts + 1):
         is_programmatic = rng.random() < config.programmatic_ratio
         map_scale = rng.choice(config.map_scales)
-        ally_stat_scale = rng.choice(config.stat_scales)
-        enemy_stat_scale = rng.choice(config.stat_scales)
+        ally_stat_scale, enemy_stat_scale = _sample_coupled_stat_scales(
+            rng, config.stat_scales, coupled=config.couple_stat_scales
+        )
         transform = rng.choice(config.transforms)
 
         if is_programmatic:
+            (
+                composition,
+                layout,
+                distance,
+                spread,
+                zone,
+                zone_intensity,
+                zone_relation,
+                match_mode,
+            ) = _pick_scenario_buckets(rng, config, bucket_coverage)
             try:
                 task = generate_programmatic_task(
                     rng,
-                    composition=rng.choice(config.composition_archetypes),
-                    layout=rng.choice(config.layout_archetypes),
-                    distance=rng.choice(config.distance_buckets),
-                    spread=rng.choice(config.spread_buckets),
-                    zone=rng.choice(config.zone_archetypes),
-                    zone_intensity=rng.choice(config.zone_intensity_buckets),
-                    zone_relation=rng.choice(config.zone_relation_buckets),
+                    composition=composition,
+                    layout=layout,
+                    distance=distance,
+                    spread=spread,
+                    zone=zone,
+                    zone_intensity=zone_intensity,
+                    zone_relation=zone_relation,
                     map_scale=map_scale,
                     max_n_ally=config.max_n_ally,
                     max_n_enemy=config.max_n_enemy,
+                    match_mode=match_mode,
+                    price_rel_tol=config.composition_price_rel_tol,
                 )
-            except ValueError:
+            except ValueError as exc:
+                n_generation_failures += 1
+                if config.filter_by_win_rate:
+                    print(
+                        f"try {attempt}/{max_attempts} {_progress_bar(attempt, max_attempts)} "
+                        f"GENERATE_FAIL accepted={len(tasks)}/{config.n_tasks} "
+                        f"reason={exc}"
+                    )
                 continue
             source = task["metadata"]["source"]
             zone_strength_scale = 1.0
+            scenario_key = _scenario_bucket_key(
+                composition,
+                layout,
+                distance,
+                spread,
+                zone,
+                zone_intensity,
+                zone_relation,
+                match_mode,
+            )
         else:
             use_challenge = config.include_challenges and rng.random() < 0.25
             if use_challenge:
@@ -524,21 +748,40 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
                 source = {"kind": "composed", "unit": unit_name, "zone": zone_name}
             _scale_map(task, map_scale)
             zone_strength_scale = rng.choice(config.zone_strength_scales)
+            scenario_key = None
 
         _transform_task(task, transform)
         _scale_team_stats(task, ally_stat_scale, enemy_stat_scale)
         _scale_zone_strength(task, zone_strength_scale)
         try:
             validate_task(task)
-        except ValueError:
+        except ValueError as exc:
+            n_generation_failures += 1
+            if config.filter_by_win_rate:
+                print(
+                    f"try {attempt}/{max_attempts} {_progress_bar(attempt, max_attempts)} "
+                    f"INVALID accepted={len(tasks)}/{config.n_tasks} reason={exc}"
+                )
             continue
         if int(task["zone_scenario"]["n_zone"]) > config.max_n_zone:
+            n_generation_failures += 1
+            if config.filter_by_win_rate:
+                print(
+                    f"try {attempt}/{max_attempts} {_progress_bar(attempt, max_attempts)} "
+                    f"INVALID accepted={len(tasks)}/{config.n_tasks} reason=too_many_zones"
+                )
             continue
 
         digest = _task_hash(task)
         if digest in seen:
+            if config.filter_by_win_rate:
+                print(
+                    f"try {attempt}/{max_attempts} {_progress_bar(attempt, max_attempts)} "
+                    f"DUPLICATE accepted={len(tasks)}/{config.n_tasks}"
+                )
             continue
         seen.add(digest)
+        n_candidates += 1
         task["task_id"] = f"task_{len(tasks):06d}_{digest[:10]}"
         metadata = task.get("metadata", {})
         metadata.update(
@@ -553,12 +796,82 @@ def sample_tasks(config: SampleConfig) -> list[dict[str, Any]]:
             }
         )
         task["metadata"] = metadata
+
+        if config.filter_by_win_rate:
+            match_info = metadata.get("composition_match") or {}
+            print(
+                f"try {attempt}/{max_attempts} {_progress_bar(attempt, max_attempts)} "
+                f"EVALUATING accepted={len(tasks)}/{config.n_tasks} "
+                f"comp={metadata.get('composition_archetype')} "
+                f"match={match_info.get('match_mode')} "
+                f"price_diff={match_info.get('price_rel_diff', float('nan')):.3f} "
+                f"layout={metadata.get('layout_archetype')} "
+                f"zone={metadata.get('zone_archetype')} ..."
+            )
+            accepted, eval_result = _passes_win_rate_filter(
+                task,
+                physics=config.physics,
+                heuristic=config.heuristic,
+                num_seeds=config.filter_num_seeds,
+                seed=config.seed + n_candidates,
+                epsilon=config.filter_epsilon,
+                max_episode_steps=config.filter_max_episode_steps,
+                win_rate_min=config.win_rate_min,
+                win_rate_max=config.win_rate_max,
+                reject_all_truncated=config.filter_reject_all_truncated,
+            )
+            task["metadata"]["filter_eval"] = {
+                "win_rate": eval_result["win_rate"],
+                "win_rate_ci95": eval_result["win_rate_ci95"],
+                "episode_length": eval_result["episode_length"],
+                "truncation_rate": eval_result["truncation_rate"],
+                "hp_margin": eval_result["hp_margin"],
+                "quality_flags": eval_result["quality_flags"],
+                "n_rollouts": eval_result["n_rollouts"],
+                "accepted": accepted,
+                "reject_reason": eval_result.get("reject_reason"),
+            }
+            status = "ACCEPT" if accepted else "REJECT"
+            print(
+                f"try {attempt}/{max_attempts} {_progress_bar(attempt, max_attempts)} "
+                f"{status} win_rate={eval_result['win_rate']:.3f} "
+                f"ci95=[{eval_result['win_rate_ci95'][0]:.3f}, {eval_result['win_rate_ci95'][1]:.3f}] "
+                f"len={eval_result['episode_length']['mean']:.1f} "
+                f"trunc={eval_result['truncation_rate']:.3f} "
+                f"hp_margin={eval_result['hp_margin']['mean']:.3f} "
+                f"accepted={len(tasks) + int(accepted)}/{config.n_tasks}"
+                + (
+                    f" reason={eval_result.get('reject_reason')}"
+                    if not accepted and eval_result.get("reject_reason")
+                    else ""
+                )
+            )
+            if not accepted:
+                n_rejected_by_win_rate += 1
+                # Keep the hash reserved so we do not re-evaluate the same candidate.
+                continue
+
         tasks.append(task)
+        if scenario_key is not None:
+            bucket_coverage[scenario_key] += 1
         if len(tasks) == config.n_tasks:
+            if config.filter_by_win_rate:
+                print(
+                    f"Done. Accepted {len(tasks)}/{n_candidates} unique candidates "
+                    f"(rejected_by_win_rate={n_rejected_by_win_rate}, "
+                    f"generation_failures={n_generation_failures}, "
+                    f"covered_buckets={len(bucket_coverage)})."
+                )
+            elif config.bucket_coverage:
+                print(
+                    f"Done. Sampled {len(tasks)} tasks across {len(bucket_coverage)} scenario buckets."
+                )
             return tasks
 
     raise RuntimeError(
-        f"Could only produce {len(tasks)} valid unique tasks after {max_attempts} attempts."
+        f"Could only produce {len(tasks)} valid unique tasks after {max_attempts} attempts "
+        f"(unique_candidates={n_candidates}, rejected_by_win_rate={n_rejected_by_win_rate}, "
+        f"generation_failures={n_generation_failures})."
     )
 
 
@@ -571,6 +884,19 @@ def task_ids(tasks: Iterable[dict[str, Any]]) -> list[str]:
 def main() -> None:
     config = tyro.cli(SampleConfig)
     tasks = sample_tasks(config)
+    filter_protocol = None
+    if config.filter_by_win_rate:
+        filter_protocol = {
+            "enabled": True,
+            "win_rate_min": config.win_rate_min,
+            "win_rate_max": config.win_rate_max,
+            "num_seeds": config.filter_num_seeds,
+            "epsilon": config.filter_epsilon,
+            "max_episode_steps": config.filter_max_episode_steps,
+            "reject_all_truncated": config.filter_reject_all_truncated,
+            "heuristic": config.heuristic,
+            "physics": config.physics,
+        }
     output = save_task_bank(
         config.output,
         tasks,
@@ -580,6 +906,7 @@ def main() -> None:
         max_n_ally=config.max_n_ally if config.programmatic_ratio > 0 else None,
         max_n_enemy=config.max_n_enemy if config.programmatic_ratio > 0 else None,
         max_n_zone=config.max_n_zone if config.programmatic_ratio > 0 else None,
+        filter_protocol=filter_protocol,
     )
     saved_bank = load_task_bank(output)
     schema = saved_bank["manifest"]["schema"]

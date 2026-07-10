@@ -426,6 +426,14 @@ conda run -n tabx python -m src.tabx.sample_task \
   --seed 0
 ```
 
+默认会开启胜率筛选：双方 `expert` heuristic、`filter_epsilon=0.05`、
+`filter_num_seeds=16`，只保留 ally win rate ∈ `[0.4, 0.6]` 的 task。
+若只想快速生成候选、不做评测筛选，可加 `--no-filter-by-win-rate`。
+
+注意：`eval_task` 默认 `epsilon_override=0.0` 时 expert 几乎是确定性策略，
+胜率会塌缩到 0/1；采样筛选必须使用 `filter_epsilon > 0`，否则几乎筛不出
+中间胜率 task。
+
 ### 4.2 第二层：扩展现有 level generator
 
 可以为 `FREE_PARAM_TYPES` 增加：
