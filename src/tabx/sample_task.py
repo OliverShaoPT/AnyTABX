@@ -92,8 +92,8 @@ class SampleConfig:
     # With epsilon=0 the policy is nearly deterministic, so win rates collapse to
     # 0/1; use a small positive filter_epsilon so intermediate rates are possible.
     filter_by_win_rate: bool = True
-    win_rate_min: float = 0.4
-    win_rate_max: float = 0.6
+    win_rate_min: float = 0.25
+    win_rate_max: float = 0.75
     filter_num_seeds: int = 16
     filter_epsilon: float = 0.05
     filter_max_episode_steps: int = 512
