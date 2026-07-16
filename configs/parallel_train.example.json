@@ -1,0 +1,31 @@
+{
+  "algorithm": "mappo",
+  "task_file_path": "../task_outputs/tasks_20.json",
+  "save_path": "../outputs/parallel_train",
+  "gpu_ids": "0,1,2,3",
+  "marl_per_gpu": 2,
+  "task_indices": null,
+  "seed_base": 1000,
+  "NUM_ENVS": 128,
+  "NUM_STEPS": 512,
+  "TOTAL_TIMESTEPS": 20000000,
+  "early_stop": {
+    "enabled": true,
+    "host_chunk_updates": 10,
+    "window": 10,
+    "patience": 20,
+    "min_delta": 0.001,
+    "warmup": 1
+  },
+  "wandb": {
+    "mode": "online",
+    "project": "anytabx-parallel",
+    "run_name": null
+  },
+  "algorithm_args": {
+    "LR": 0.004,
+    "UPDATE_EPOCHS": 4,
+    "NUM_MINIBATCHES": 4,
+    "GAMMA": 0.99
+  }
+}

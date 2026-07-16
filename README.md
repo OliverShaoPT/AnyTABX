@@ -88,6 +88,59 @@ We provide implementations of five MARL algorithms and five UED algorithms, avai
 
 Configuration files are managed using Tyro. Every files include `wandb` logging by default. Logging can be disabled through the configuration file.
 
+## Parallel fixed-task MARL training
+
+`src/baseline/marl_baseline.py` provides standalone, chunkable trainers for
+`ippo`, `mappo`, `mappo_rnd`, `iql`, `vdn`, and `qmix`. The existing baseline
+files are unchanged. Each task-bank entry is assigned to one trainer process;
+inside that process, `NUM_ENVS` copies of the same task collect experience in
+parallel.
+
+Copy and edit `configs/parallel_train.example.json`, then launch all selected
+tasks:
+
+```bash
+./launch_trainer.sh configs/parallel_train.example.json
+```
+
+If the default `python3` does not contain the project dependencies, select the
+environment explicitly:
+
+```bash
+PYTHON=/path/to/environment/bin/python \
+  ./launch_trainer.sh configs/parallel_train.example.json
+```
+
+Use `--dry-run` to generate the per-task commands and manifest without starting
+training:
+
+```bash
+./launch_trainer.sh configs/parallel_train.example.json --dry-run
+```
+
+Important configuration fields:
+
+- `algorithm`: one of the six algorithms above.
+- `task_file_path`, `task_indices`: task bank and optional subset.
+- `gpu_ids`, `marl_per_gpu`: physical GPU IDs and concurrent trainers per GPU.
+- `NUM_ENVS`, `NUM_STEPS`, `TOTAL_TIMESTEPS`: environments per trainer,
+  rollout length, and maximum environment-step budget.
+- `algorithm_args`: algorithm-specific hyperparameter overrides such as `LR`,
+  `UPDATE_EPOCHS`, or `TARGET_UPDATE_INTERVAL`.
+- `early_stop`: rolling-return `window`, `patience`, `min_delta`, and `warmup`.
+- `wandb`: logging mode, project, and run name.
+
+Each child process sets `CUDA_VISIBLE_DEVICES` and disables JAX's full-device
+memory preallocation. Start with 2 trainers per 80 GB GPU, inspect actual memory
+usage, and increase `marl_per_gpu` gradually. Outputs are isolated by task and
+seed; `manifest.json` records scheduling and failures, while every trainer saves
+`best.safetensors` and `final.safetensors`.
+
+The new trainers use feed-forward policy/value networks and continuous
+host-controlled updates. They implement the six algorithm families but are not
+checkpoint-compatible or line-for-line equivalent to the existing RNN
+baselines.
+
 # Citing TABX
 If you use TABX in your work, please cite us as follows:
 ```
