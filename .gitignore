@@ -30,3 +30,13 @@ ckpt*/
 *.npy
 *.npz
 *.gif
+
+# Generated task/scenario exports
+initial_scenes.png
+challenge_eval.json
+challenge_tasks.json
+tasks.json
+tasks_balanced.json
+tasks_evl.json
+training_scenarios_20.json
+training_scenarios_20_eval.json

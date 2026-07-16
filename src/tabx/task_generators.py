@@ -655,12 +655,16 @@ def composition_features(
     return features
 
 
-def _formation_offsets(count: int, spread: str, axis: str = "vertical") -> np.ndarray:
+def _formation_offsets(
+    count: int, spread: str, axis: str = "vertical", spread_scale: float = 1.0
+) -> np.ndarray:
     """Generate deterministic centered offsets for one team formation."""
 
     if count <= 0:
         return np.zeros((0, 2))
-    spacing = {"compact": 5.5, "line": 7.5, "dispersed": 10.0}[spread]
+    if spread_scale <= 0:
+        raise ValueError("spread_scale must be positive.")
+    spacing = {"compact": 5.5, "line": 7.5, "dispersed": 10.0}[spread] * spread_scale
     offsets = []
     if spread == "compact":
         columns = max(1, math.ceil(math.sqrt(count)))
@@ -697,17 +701,21 @@ def _layout_targets(
     n_enemy: int,
     width: float,
     height: float,
+    distance_scale: float = 1.0,
+    spread_scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate desired centers before collision-safe placement."""
 
+    if distance_scale <= 0:
+        raise ValueError("distance_scale must be positive.")
     separation = {
         "close": width * 0.20,
         "medium": width * 0.36,
         "far": width * 0.52,
-    }[distance]
+    }[distance] * distance_scale
     vertical_span = min(height * 0.30, 18.0 * width / 121.0)
-    ally_offsets = _formation_offsets(n_ally, spread)
-    enemy_offsets = _formation_offsets(n_enemy, spread)
+    ally_offsets = _formation_offsets(n_ally, spread, spread_scale=spread_scale)
+    enemy_offsets = _formation_offsets(n_enemy, spread, spread_scale=spread_scale)
 
     if layout == "face_off":
         ally = ally_offsets + np.array([-separation / 2, 0.0])
@@ -811,6 +819,8 @@ def build_scenario(
     map_scale: float,
     ally_health_fracs: Sequence[float] | None = None,
     enemy_health_fracs: Sequence[float] | None = None,
+    distance_scale: float = 1.0,
+    spread_scale: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build a complete unpadded VectorizedScenario JSON dictionary."""
 
@@ -827,7 +837,16 @@ def build_scenario(
     width = DEFAULT_GRID_INFO["max_field_width"] * map_scale
     height = DEFAULT_GRID_INFO["max_field_height"] * map_scale
     ally_targets, enemy_targets = _layout_targets(
-        rng, layout, distance, spread, len(ally_units), len(enemy_units), width, height
+        rng,
+        layout,
+        distance,
+        spread,
+        len(ally_units),
+        len(enemy_units),
+        width,
+        height,
+        distance_scale,
+        spread_scale,
     )
     occupied: list[tuple[np.ndarray, float]] = []
     # Large units are placed collision-safely across both teams.
@@ -1079,6 +1098,8 @@ def generate_programmatic_task(
     health_frac_buckets: Sequence[float] = (0.6, 0.7, 0.8, 0.9, 1.0),
     health_frac_min: float = 0.5,
     health_frac_max: float = 1.0,
+    distance_scale: float = 1.0,
+    spread_scale: float = 1.0,
 ) -> dict[str, Any]:
     """Generate one complete task covering 4.1 A/B/C/D."""
 
@@ -1105,6 +1126,8 @@ def generate_programmatic_task(
         map_scale,
         ally_health_fracs=ally_fracs,
         enemy_health_fracs=enemy_fracs,
+        distance_scale=distance_scale,
+        spread_scale=spread_scale,
     )
     zone_scenario = build_relational_zones(scenario, grid_info, zone, zone_intensity, zone_relation)
     return {
@@ -1120,7 +1143,9 @@ def generate_programmatic_task(
             ),
             "layout_archetype": layout,
             "distance_bucket": distance,
+            "distance_scale": distance_scale,
             "spread_bucket": spread,
+            "spread_scale": spread_scale,
             "map_bucket": {0.85: "small", 1.0: "medium", 1.15: "large"}.get(
                 map_scale, f"scale_{map_scale:g}"
             ),
@@ -1140,3 +1165,221 @@ def generate_programmatic_task(
             },
         },
     }
+
+
+def _free_positions_and_rotations(
+    rng: random.Random,
+    scenario: dict[str, Any],
+    width: float,
+    height: float,
+) -> None:
+    """Replace template geometry with collision-safe continuous free placement."""
+
+    radii = np.asarray(scenario["body_radiuss"], dtype=float).reshape(-1)
+    desired = np.asarray(
+        [
+            [
+                rng.uniform(-width * 0.42, width * 0.42),
+                rng.uniform(-height * 0.42, height * 0.42),
+            ]
+            for _ in radii
+        ],
+        dtype=float,
+    )
+    positions = _place_without_overlap(rng, desired, radii, width, height, [])
+    scenario["positions"] = positions.tolist()
+    scenario["rotations"] = [[rng.uniform(-math.pi, math.pi)] for _ in radii]
+
+
+def build_free_zones(
+    rng: random.Random,
+    scenario: dict[str, Any],
+    grid_info: dict[str, Any],
+    max_n_zone: int,
+) -> dict[str, Any]:
+    """Sample a variable number of continuous zones independent of archetypes."""
+
+    if max_n_zone < 0:
+        raise ValueError("max_n_zone must be non-negative.")
+    n_zone = rng.randint(0, max_n_zone)
+    width = float(grid_info["max_field_width"])
+    height = float(grid_info["max_field_height"])
+    positions = np.asarray(scenario["positions"], dtype=float)
+    radii = np.asarray(scenario["body_radiuss"], dtype=float).reshape(-1)
+    zone_types: list[list[int]] = []
+    centers: list[list[float]] = []
+    axes_values: list[list[float]] = []
+    effects: list[list[float]] = []
+    for _ in range(n_zone):
+        zone_type = rng.choice((1, 2, 3))
+        axes = np.array(
+            [rng.uniform(2.0, width * 0.18), rng.uniform(2.0, height * 0.22)], dtype=float
+        )
+        center = None
+        for _attempt in range(64):
+            candidate = np.array(
+                [
+                    rng.uniform(-width / 2 + axes[0], width / 2 - axes[0]),
+                    rng.uniform(-height / 2 + axes[1], height / 2 - axes[1]),
+                ]
+            )
+            if zone_type != 1:
+                center = candidate
+                break
+            normalized = ((positions - candidate) / (axes + radii[:, None])) ** 2
+            if np.all(normalized.sum(axis=1) > 1.0):
+                center = candidate
+                break
+        if center is None:
+            continue
+        zone_types.append([zone_type])
+        centers.append(center.tolist())
+        axes_values.append(axes.tolist())
+        if zone_type == 1:
+            effect = rng.uniform(4.0, 16.0)
+        elif zone_type == 3:
+            effect = rng.uniform(0.1, 0.5)
+        else:
+            effect = 0.0
+        effects.append([effect])
+    return {
+        "n_zone": len(zone_types),
+        "zone_type": zone_types,
+        "position": centers,
+        "axes": axes_values,
+        "effect_value": effects,
+    }
+
+
+def generate_free_task(
+    rng: random.Random,
+    *,
+    max_n_ally: int,
+    max_n_enemy: int,
+    max_n_zone: int,
+    map_scale: float,
+    ally_units: Sequence[int] | None = None,
+    enemy_units: Sequence[int] | None = None,
+    source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Generate an unconstrained roster, geometry, orientation, and zone task."""
+
+    ally = list(ally_units) if ally_units is not None else _sample_units(
+        rng, tuple(range(9)), rng.randint(1, max_n_ally)
+    )
+    enemy = list(enemy_units) if enemy_units is not None else _sample_units(
+        rng, tuple(range(9)), rng.randint(1, max_n_enemy)
+    )
+    ally = _cap_units(ally, max_n_ally)
+    enemy = _cap_units(enemy, max_n_enemy)
+    ally_fracs = [rng.uniform(0.5, 1.0) for _ in ally]
+    enemy_fracs = [rng.uniform(0.5, 1.0) for _ in enemy]
+    scenario, grid_info = build_scenario(
+        rng,
+        ally,
+        enemy,
+        "face_off",
+        "medium",
+        "dispersed",
+        map_scale,
+        ally_health_fracs=ally_fracs,
+        enemy_health_fracs=enemy_fracs,
+    )
+    _free_positions_and_rotations(
+        rng,
+        scenario,
+        float(grid_info["max_field_width"]),
+        float(grid_info["max_field_height"]),
+    )
+    zones = build_free_zones(rng, scenario, grid_info, max_n_zone)
+    return {
+        "grid_info": grid_info,
+        "scenario": scenario,
+        "zone_scenario": zones,
+        "metadata": {
+            "source": source or {"kind": "free"},
+            "composition_features": composition_features(
+                ally, enemy, ally_fracs, enemy_fracs
+            ),
+            "layout_archetype": "free",
+            "zone_archetype": "free",
+            "free_geometry": True,
+        },
+    }
+
+
+def mutate_parent_task(
+    rng: random.Random,
+    parent: dict[str, Any],
+    *,
+    max_n_ally: int,
+    max_n_enemy: int,
+    max_n_zone: int,
+    map_scale: float,
+) -> dict[str, Any]:
+    """Mutate roster size/types, then freely rebuild geometry and zones."""
+
+    teams = np.asarray(parent["scenario"]["teams"], dtype=int).reshape(-1)
+    unit_ids = np.asarray(parent["scenario"]["unit_ids"], dtype=int).reshape(-1)
+    rosters = [unit_ids[teams == team].tolist() for team in (0, 1)]
+    capacities = (max_n_ally, max_n_enemy)
+    operations: list[str] = []
+    for team in (0, 1):
+        operation = rng.choice(("add", "delete", "replace", "keep"))
+        if operation == "add" and len(rosters[team]) < capacities[team]:
+            rosters[team].append(rng.randrange(9))
+        elif operation == "delete" and len(rosters[team]) > 1:
+            rosters[team].pop(rng.randrange(len(rosters[team])))
+        elif operation == "replace":
+            rosters[team][rng.randrange(len(rosters[team]))] = rng.randrange(9)
+        else:
+            operation = "keep"
+        operations.append(operation)
+    return generate_free_task(
+        rng,
+        max_n_ally=max_n_ally,
+        max_n_enemy=max_n_enemy,
+        max_n_zone=max_n_zone,
+        map_scale=map_scale,
+        ally_units=rosters[0],
+        enemy_units=rosters[1],
+        source={
+            "kind": "mutation",
+            "parent": parent.get("task_id"),
+            "operations": operations,
+        },
+    )
+
+
+def crossover_parent_tasks(
+    rng: random.Random,
+    first: dict[str, Any],
+    second: dict[str, Any],
+    *,
+    max_n_ally: int,
+    max_n_enemy: int,
+    max_n_zone: int,
+    map_scale: float,
+) -> dict[str, Any]:
+    """Combine team rosters from two archived parents and freely rebuild the task."""
+
+    def roster(task: dict[str, Any], team: int) -> list[int]:
+        teams = np.asarray(task["scenario"]["teams"], dtype=int).reshape(-1)
+        ids = np.asarray(task["scenario"]["unit_ids"], dtype=int).reshape(-1)
+        return ids[teams == team].tolist()
+
+    ally = roster(first, 0) if rng.random() < 0.5 else roster(second, 0)
+    enemy = roster(second, 1) if rng.random() < 0.5 else roster(first, 1)
+    return generate_free_task(
+        rng,
+        max_n_ally=max_n_ally,
+        max_n_enemy=max_n_enemy,
+        max_n_zone=max_n_zone,
+        map_scale=map_scale,
+        ally_units=ally,
+        enemy_units=enemy,
+        source={
+            "kind": "crossover",
+            "parents": [first.get("task_id"), second.get("task_id")],
+        },
+    )
