@@ -7,8 +7,10 @@ logging boundaries only: no prefix is replayed and every update runs once.
 
 from __future__ import annotations
 
+import csv
 import json
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -50,6 +52,7 @@ class MARLConfig:
     TOTAL_TIMESTEPS: int = 2_000_000
     host_chunk_updates: int = 10
     early_stop_enabled: bool = True
+    early_stop_debug_mode: bool = False
     early_stop_window: int = 10
     early_stop_patience: int = 5
     early_stop_min_delta: float = 0.0
@@ -101,6 +104,7 @@ class MARLConfig:
             "host_chunk_updates": self.host_chunk_updates,
             "early_stop_window": self.early_stop_window,
             "early_stop_patience": self.early_stop_patience,
+            "REW_SCALE": self.REW_SCALE,
         }
         invalid = [name for name, value in values.items() if value <= 0]
         if invalid:
@@ -123,9 +127,23 @@ class TrainingSummary:
     completed_timesteps: int
     best_score: float
     stopped_early: bool
+    early_stop_trigger_count: int
     output_dir: str
+    metrics_path: str
+    early_stop_events_path: str
     best_checkpoint: str
     final_checkpoint: str
+
+
+@dataclass(frozen=True)
+class EarlyStopStatus:
+    score: float
+    best: float
+    improved: bool
+    ready: bool
+    bad_updates: int
+    triggered: bool
+    would_stop: bool
 
 
 class EarlyStopper:
@@ -140,21 +158,57 @@ class EarlyStopper:
         self.returns: list[float] = []
         self.best = -float("inf")
         self.bad_updates = 0
+        self.trigger_active = False
+        self.trigger_count = 0
 
-    def update(self, episode_return: float, update: int) -> tuple[float, bool, bool]:
+    def update(self, episode_return: float, update: int) -> EarlyStopStatus:
         self.returns.append(float(episode_return))
         score = float(np.mean(self.returns[-self.window :]))
         ready = update >= self.warmup and len(self.returns) >= self.window
         if not ready:
-            return score, False, False
+            return EarlyStopStatus(
+                score, self.best, False, False, self.bad_updates, False, False
+            )
         improved = score > self.best + self.min_delta
         if improved:
             self.best = score
             self.bad_updates = 0
+            self.trigger_active = False
         else:
             self.bad_updates += 1
-        stop = self.enabled and self.bad_updates >= self.patience
-        return score, improved, stop
+        would_stop = self.enabled and self.bad_updates >= self.patience
+        triggered = would_stop and not self.trigger_active
+        if triggered:
+            self.trigger_active = True
+            self.trigger_count += 1
+        return EarlyStopStatus(
+            score,
+            self.best,
+            improved,
+            True,
+            self.bad_updates,
+            triggered,
+            would_stop,
+        )
+
+
+class MetricRecorder:
+    """Append and flush one CSV record per update for live inspection."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.stream = path.open("w", encoding="utf-8", newline="")
+        self.writer: csv.DictWriter[str] | None = None
+
+    def write(self, record: dict[str, Any]) -> None:
+        if self.writer is None:
+            self.writer = csv.DictWriter(self.stream, fieldnames=list(record))
+            self.writer.writeheader()
+        self.writer.writerow(record)
+        self.stream.flush()
+
+    def close(self) -> None:
+        self.stream.close()
 
 
 class PolicyNetwork(nn.Module):
@@ -326,6 +380,8 @@ class BaseMARLTrainer(ABC):
         )
         self.best_path = self.output / "best.safetensors"
         self.final_path = self.output / "final.safetensors"
+        self.metrics_path = self.output / "training_metrics.csv"
+        self.early_stop_events_path = self.output / "early_stop_events.jsonl"
         self._compiled_update = jax.jit(self.update_once) if config.jit else self.update_once
 
     def _agents(self, values: dict[str, jax.Array]) -> jax.Array:
@@ -379,9 +435,12 @@ class BaseMARLTrainer(ABC):
             config=asdict(self.config),
         )
         stopper = EarlyStopper(self.config)
+        recorder = MetricRecorder(self.metrics_path)
+        self.early_stop_events_path.write_text("", encoding="utf-8")
         session = self.initialize(jax.random.key(self.config.seed))
         stopped = False
         completed = 0
+        started_at = time.monotonic()
         try:
             while completed < self.total_updates and not stopped:
                 chunk_end = min(
@@ -392,13 +451,19 @@ class BaseMARLTrainer(ABC):
                     session, metrics = _tree_ready((session, metrics))
                     completed += 1
                     episode_return = float(np.asarray(metrics["episode_returns"]))
-                    score, improved, stopped = stopper.update(episode_return, completed)
+                    status = stopper.update(episode_return, completed)
+                    stopped = status.triggered and not self.config.early_stop_debug_mode
                     host_metrics = {
                         key: float(np.asarray(value)) for key, value in metrics.items()
                     }
                     host_metrics.update(
                         {
-                            "early_stop/window_return": score,
+                            "early_stop/window_return": status.score,
+                            "early_stop/best_return": status.best,
+                            "early_stop/bad_updates": status.bad_updates,
+                            "early_stop/triggered": int(status.triggered),
+                            "early_stop/would_stop": int(status.would_stop),
+                            "early_stop/trigger_count": stopper.trigger_count,
                             "update_steps": completed,
                             "env_steps": (
                                 completed
@@ -408,7 +473,48 @@ class BaseMARLTrainer(ABC):
                         }
                     )
                     wandb.log(host_metrics)
-                    if improved:
+                    recorder.write(
+                        {
+                            "elapsed_seconds": time.monotonic() - started_at,
+                            **host_metrics,
+                            "early_stop/enabled": int(self.config.early_stop_enabled),
+                            "early_stop/debug_mode": int(
+                                self.config.early_stop_debug_mode
+                            ),
+                            "early_stop/window": self.config.early_stop_window,
+                            "early_stop/patience": self.config.early_stop_patience,
+                            "early_stop/min_delta": self.config.early_stop_min_delta,
+                            "early_stop/warmup": self.config.early_stop_warmup,
+                        }
+                    )
+                    if status.triggered:
+                        event = {
+                            "update_steps": completed,
+                            "env_steps": host_metrics["env_steps"],
+                            "episode_returns": episode_return,
+                            "rolling_return": status.score,
+                            "best_return": status.best,
+                            "bad_updates": status.bad_updates,
+                            "trigger_count": stopper.trigger_count,
+                            "debug_mode": self.config.early_stop_debug_mode,
+                            "continued_training": self.config.early_stop_debug_mode,
+                            "window": self.config.early_stop_window,
+                            "patience": self.config.early_stop_patience,
+                            "min_delta": self.config.early_stop_min_delta,
+                            "warmup": self.config.early_stop_warmup,
+                        }
+                        with self.early_stop_events_path.open(
+                            "a", encoding="utf-8"
+                        ) as stream:
+                            stream.write(json.dumps(event, sort_keys=True) + "\n")
+                        wandb.log(
+                            {
+                                f"early_stop_event/{key}": value
+                                for key, value in event.items()
+                                if isinstance(value, (bool, int, float))
+                            }
+                        )
+                    if status.improved:
                         save_params(self.checkpoint_params(session), self.best_path)
                     if stopped:
                         break
@@ -417,6 +523,7 @@ class BaseMARLTrainer(ABC):
                 save_params(self.checkpoint_params(session), self.best_path)
                 stopper.best = float(np.mean(stopper.returns[-stopper.window :]))
         finally:
+            recorder.close()
             run.finish()
         return TrainingSummary(
             algorithm=self.config.algorithm,
@@ -429,7 +536,10 @@ class BaseMARLTrainer(ABC):
             ),
             best_score=stopper.best,
             stopped_early=stopped,
+            early_stop_trigger_count=stopper.trigger_count,
             output_dir=str(self.output),
+            metrics_path=str(self.metrics_path),
+            early_stop_events_path=str(self.early_stop_events_path),
             best_checkpoint=str(self.best_path),
             final_checkpoint=str(self.final_path),
         )
@@ -545,7 +655,8 @@ class PPOTrainer(BaseMARLTrainer):
             env_step, carry, None, self.config.NUM_STEPS
         )
         actor, critic, env_state, obs, dones, rng = carry
-        reward = trajectory.reward
+        extrinsic_reward = trajectory.reward
+        reward = extrinsic_reward
         rnd_predictor = session.rnd_predictor
         rnd_loss = jnp.asarray(0.0)
         if self.use_rnd:
@@ -656,6 +767,7 @@ class PPOTrainer(BaseMARLTrainer):
         )
         return new_session, {
             "episode_returns": episode_return,
+            "rollout_reward_mean": extrinsic_reward.mean(),
             "loss/actor": losses[1].mean(),
             "loss/critic": losses[3].mean(),
             "loss/entropy": losses[2].mean(),
@@ -858,6 +970,7 @@ class ValueBasedTrainer(BaseMARLTrainer):
         )
         return new_session, {
             "episode_returns": episode_return,
+            "rollout_reward_mean": trajectory.reward.mean() / self.config.REW_SCALE,
             "loss/td": losses[0].mean(),
             "q/mean": losses[1].mean(),
             "epsilon": self._epsilon(next_update),

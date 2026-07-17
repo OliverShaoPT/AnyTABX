@@ -27,6 +27,7 @@ TRAINER_TOP_LEVEL_KEYS = {
     "TOTAL_TIMESTEPS",
     "host_chunk_updates",
     "early_stop_enabled",
+    "early_stop_debug_mode",
     "early_stop_window",
     "early_stop_patience",
     "early_stop_min_delta",
@@ -174,6 +175,7 @@ def make_trainer_config(
     early_stop = config.get("early_stop", {})
     early_aliases = {
         "enabled": "early_stop_enabled",
+        "debug_mode": "early_stop_debug_mode",
         "window": "early_stop_window",
         "patience": "early_stop_patience",
         "min_delta": "early_stop_min_delta",

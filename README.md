@@ -127,7 +127,8 @@ Important configuration fields:
   rollout length, and maximum environment-step budget.
 - `algorithm_args`: algorithm-specific hyperparameter overrides such as `LR`,
   `UPDATE_EPOCHS`, or `TARGET_UPDATE_INTERVAL`.
-- `early_stop`: rolling-return `window`, `patience`, `min_delta`, and `warmup`.
+- `early_stop`: rolling-return `window`, `patience`, `min_delta`, `warmup`, and
+  `debug_mode`.
 - `wandb`: logging mode, project, and run name.
 
 Each child process sets `CUDA_VISIBLE_DEVICES` and disables JAX's full-device
@@ -135,6 +136,33 @@ memory preallocation. Start with 2 trainers per 80 GB GPU, inspect actual memory
 usage, and increase `marl_per_gpu` gradually. Outputs are isolated by task and
 seed; `manifest.json` records scheduling and failures, while every trainer saves
 `best.safetensors` and `final.safetensors`.
+
+For early-stop tuning, set `"enabled": true` and `"debug_mode": true`. The
+criterion is still evaluated, but a trigger is logged instead of terminating
+training. Every update is flushed to `training_metrics.csv`, including episode
+return, rollout reward, rolling/best return, patience state, trigger flags, and
+the active early-stop parameters. Trigger events are also appended to
+`early_stop_events.jsonl`.
+
+Generate a convergence plot at any time while training is running:
+
+```bash
+python scripts/plot_training_metrics.py \
+  /path/to/training_metrics.csv --no-show
+```
+
+This writes `training_curve.png` beside the CSV. For an automatically refreshing
+interactive view:
+
+```bash
+python scripts/plot_training_metrics.py \
+  /path/to/training_metrics.csv --watch --interval 5
+```
+
+After choosing suitable thresholds, set `"debug_mode": false` so a trigger
+actually stops training. Increase `window` to smooth noisy rewards, increase
+`patience` to tolerate longer plateaus, increase `min_delta` to require more
+meaningful improvement, and increase `warmup` to prevent early decisions.
 
 The new trainers use feed-forward policy/value networks and continuous
 host-controlled updates. They implement the six algorithm families but are not

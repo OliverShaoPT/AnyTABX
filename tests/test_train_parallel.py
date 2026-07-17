@@ -41,7 +41,7 @@ class TrainParallelTest(unittest.TestCase):
             "NUM_ENVS": 8,
             "NUM_STEPS": 16,
             "TOTAL_TIMESTEPS": 1024,
-            "early_stop": {"enabled": True, "patience": 5},
+            "early_stop": {"enabled": True, "debug_mode": True, "patience": 5},
             "wandb": {"enabled": False},
             "algorithm_args": {"LR": 0.001},
         }
@@ -83,6 +83,7 @@ class TrainParallelTest(unittest.TestCase):
             self.assertNotIn("gpu_ids", trainer_config)
             self.assertEqual(trainer_config["LR"], 0.001)
             self.assertTrue(trainer_config["early_stop_enabled"])
+            self.assertTrue(trainer_config["early_stop_debug_mode"])
             self.assertEqual(trainer_config["early_stop_patience"], 5)
             self.assertEqual(trainer_config["wandb_mode"], "disabled")
 

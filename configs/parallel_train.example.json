@@ -11,6 +11,7 @@
   "TOTAL_TIMESTEPS": 20000000,
   "early_stop": {
     "enabled": true,
+    "debug_mode": true,
     "host_chunk_updates": 10,
     "window": 10,
     "patience": 20,
