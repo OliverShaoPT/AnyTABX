@@ -94,6 +94,89 @@ def _positive_int(config: dict[str, Any], name: str) -> int:
     return value
 
 
+def _non_negative_int(config: dict[str, Any], name: str) -> int:
+    value = config.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def concurrent_coach_slots(config: dict[str, Any]) -> int:
+    return len(config["gpu_ids"]) * config["marl_per_gpu"]
+
+
+def resolve_threads_per_coach(config: dict[str, Any]) -> int:
+    """Return the per-coach CPU thread budget.
+
+    Explicit ``threads_per_coach`` wins. Otherwise use
+    ``max(1, floor((cpu_cores - cpu_core_reserve) / concurrent_slots))``.
+    """
+
+    configured = config.get("threads_per_coach")
+    if configured is not None:
+        if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
+            raise ValueError("threads_per_coach must be a positive integer or null")
+        return configured
+
+    cpu_cores = config.get("cpu_cores")
+    if cpu_cores is None:
+        detected = os.cpu_count()
+        if detected is None or detected <= 0:
+            raise ValueError(
+                "cpu_cores could not be detected; set cpu_cores or threads_per_coach"
+            )
+        cpu_cores = detected
+    elif isinstance(cpu_cores, bool) or not isinstance(cpu_cores, int) or cpu_cores <= 0:
+        raise ValueError("cpu_cores must be a positive integer")
+
+    reserve = config.get("cpu_core_reserve", 8)
+    if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0:
+        raise ValueError("cpu_core_reserve must be a non-negative integer")
+    usable = max(1, cpu_cores - reserve)
+    return max(1, usable // concurrent_coach_slots(config))
+
+
+def merge_xla_flags(existing: str | None) -> str:
+    """Merge CPU thread caps into XLA_FLAGS without dropping existing flags."""
+
+    ordered = [
+        "--xla_cpu_multi_thread_eigen=false",
+        "--xla_force_host_platform_device_count=1",
+    ]
+    managed = {
+        "--xla_cpu_multi_thread_eigen",
+        "--xla_force_host_platform_device_count",
+    }
+    if not existing or not existing.strip():
+        return " ".join(ordered)
+
+    parts = [
+        token
+        for token in existing.split()
+        if token.split("=", 1)[0] not in managed
+    ]
+    parts.extend(ordered)
+    return " ".join(parts)
+
+
+def child_process_env(config: dict[str, Any], gpu_id: str) -> dict[str, str]:
+    """Build the subprocess environment with GPU visibility and CPU thread caps."""
+
+    threads = str(config["threads_per_coach"])
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+    env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    env["OMP_NUM_THREADS"] = threads
+    env["MKL_NUM_THREADS"] = threads
+    env["OPENBLAS_NUM_THREADS"] = threads
+    env["NUMEXPR_NUM_THREADS"] = threads
+    env["VECLIB_MAXIMUM_THREADS"] = threads
+    env["TF_NUM_INTRAOP_THREADS"] = threads
+    env["TF_NUM_INTEROP_THREADS"] = "1"
+    env["XLA_FLAGS"] = merge_xla_flags(env.get("XLA_FLAGS"))
+    return env
+
+
 def load_config(config_path: Path) -> dict[str, Any]:
     try:
         with config_path.open(encoding="utf-8") as stream:
@@ -122,6 +205,12 @@ def load_config(config_path: Path) -> dict[str, Any]:
     for name in ("NUM_ENVS", "NUM_STEPS", "TOTAL_TIMESTEPS"):
         if name in config:
             _positive_int(config, name)
+    if "cpu_cores" in config and config["cpu_cores"] is not None:
+        _positive_int(config, "cpu_cores")
+    if "cpu_core_reserve" in config:
+        _non_negative_int(config, "cpu_core_reserve")
+    else:
+        config["cpu_core_reserve"] = 8
     for name in ("algorithm_args", "early_stop", "wandb"):
         if name in config and not isinstance(config[name], dict):
             raise ValueError(f"{name} must be a JSON object")
@@ -150,6 +239,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
     if invalid:
         raise ValueError(f"task_indices out of range for {task_count} tasks: {invalid}")
     config["task_indices"] = task_indices
+    config["threads_per_coach"] = resolve_threads_per_coach(config)
     return config
 
 
@@ -242,6 +332,7 @@ def build_job(
         "seed": seed,
         "gpu_id": gpu_id,
         "slot_index": slot_index,
+        "threads_per_coach": config["threads_per_coach"],
         "output_dir": str(job_dir),
         "config_path": str(job_config_path),
         "stdout_path": str(stdout_path),
@@ -276,6 +367,13 @@ def run(
         for gpu_id in config["gpu_ids"]
         for slot_index in range(config["marl_per_gpu"])
     ]
+    print(
+        "CPU thread budget: "
+        f"{config['threads_per_coach']} threads/coach × "
+        f"{len(slots)} concurrent slots "
+        f"(≈{config['threads_per_coach'] * len(slots)} threads)",
+        flush=True,
+    )
     available_slots = deque(slots)
     pending_tasks = deque(config["task_indices"])
     running: list[RunningJob] = []
@@ -287,6 +385,10 @@ def run(
         "save_path": config["save_path"],
         "gpu_ids": config["gpu_ids"],
         "marl_per_gpu": config["marl_per_gpu"],
+        "threads_per_coach": config["threads_per_coach"],
+        "cpu_cores": config.get("cpu_cores"),
+        "cpu_core_reserve": config.get("cpu_core_reserve"),
+        "concurrent_slots": concurrent_coach_slots(config),
         "dry_run": dry_run,
         "created_at": utc_now(),
         "updated_at": None,
@@ -331,9 +433,7 @@ def run(
                 write_json(Path(record["config_path"]), trainer_config)
                 stdout = Path(record["stdout_path"]).open("w", encoding="utf-8")
                 stderr = Path(record["stderr_path"]).open("w", encoding="utf-8")
-                env = os.environ.copy()
-                env["CUDA_VISIBLE_DEVICES"] = gpu_id
-                env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+                env = child_process_env(config, gpu_id)
                 try:
                     process = subprocess.Popen(
                         record["command"],

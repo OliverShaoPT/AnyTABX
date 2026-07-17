@@ -123,6 +123,13 @@ Important configuration fields:
 - `algorithm`: one of the six algorithms above.
 - `task_file_path`, `task_indices`: task bank and optional subset.
 - `gpu_ids`, `marl_per_gpu`: physical GPU IDs and concurrent trainers per GPU.
+  For CPU-only runs, use a single synthetic id such as `"cpu"` and set
+  `marl_per_gpu` to the desired concurrent coach count.
+- `threads_per_coach`: per-process CPU thread budget. Set an integer to force
+  it, or `null` to auto-compute
+  `floor((cpu_cores - cpu_core_reserve) / (len(gpu_ids) * marl_per_gpu))`.
+- `cpu_cores`, `cpu_core_reserve`: used only for auto thread budgeting.
+  `cpu_cores=null` means detect from the host; reserve defaults to `8`.
 - `NUM_ENVS`, `NUM_STEPS`, `TOTAL_TIMESTEPS`: environments per trainer,
   rollout length, and maximum environment-step budget.
 - `algorithm_args`: algorithm-specific hyperparameter overrides such as `LR`,
@@ -131,10 +138,23 @@ Important configuration fields:
   `debug_mode`.
 - `wandb`: logging mode, project, and run name.
 
-Each child process sets `CUDA_VISIBLE_DEVICES` and disables JAX's full-device
-memory preallocation. Start with 2 trainers per 80 GB GPU, inspect actual memory
-usage, and increase `marl_per_gpu` gradually. Outputs are isolated by task and
-seed; `manifest.json` records scheduling and failures, while every trainer saves
+Each child process sets `CUDA_VISIBLE_DEVICES`, disables JAX's full-device
+memory preallocation, and caps CPU threads via `OMP_NUM_THREADS`,
+`MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and related `XLA_FLAGS`. On a
+256-core CPU host, a practical starting point is 32 coaches with about 7–8
+threads each, for example:
+
+```json
+"gpu_ids": "cpu",
+"marl_per_gpu": 32,
+"threads_per_coach": null,
+"cpu_cores": 256,
+"cpu_core_reserve": 8
+```
+
+Start with 2 trainers per 80 GB GPU, inspect actual memory usage, and increase
+`marl_per_gpu` gradually. Outputs are isolated by task and seed;
+`manifest.json` records scheduling and failures, while every trainer saves
 `best.safetensors` and `final.safetensors`.
 
 For early-stop tuning, set `"enabled": true` and `"debug_mode": true`. The

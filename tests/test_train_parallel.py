@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -57,6 +58,44 @@ class TrainParallelTest(unittest.TestCase):
         self.assertEqual(config["task_indices"], [3, 1])
         self.assertEqual(config["task_file_path"], str(self.task_path.resolve()))
         self.assertEqual(config["save_path"], str((self.root / "runs").resolve()))
+        self.assertEqual(config["cpu_core_reserve"], 8)
+        self.assertIsInstance(config["threads_per_coach"], int)
+        self.assertGreaterEqual(config["threads_per_coach"], 1)
+
+    def test_threads_per_coach_auto_from_cpu_cores(self) -> None:
+        config = train_parallel.load_config(
+            self.write_config(
+                gpu_ids="cpu",
+                marl_per_gpu=32,
+                threads_per_coach=None,
+                cpu_cores=256,
+                cpu_core_reserve=8,
+            )
+        )
+
+        # floor((256 - 8) / 32) = 7
+        self.assertEqual(config["threads_per_coach"], 7)
+
+    def test_threads_per_coach_explicit_override(self) -> None:
+        config = train_parallel.load_config(
+            self.write_config(threads_per_coach=4, cpu_cores=256, marl_per_gpu=64)
+        )
+        self.assertEqual(config["threads_per_coach"], 4)
+
+    def test_child_process_env_sets_thread_caps(self) -> None:
+        config = train_parallel.load_config(self.write_config(threads_per_coach=3))
+        with mock.patch.dict(os.environ, {"XLA_FLAGS": "--xla_dump_to=/tmp"}, clear=False):
+            env = train_parallel.child_process_env(config, "7")
+
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "7")
+        self.assertEqual(env["OMP_NUM_THREADS"], "3")
+        self.assertEqual(env["MKL_NUM_THREADS"], "3")
+        self.assertEqual(env["OPENBLAS_NUM_THREADS"], "3")
+        self.assertEqual(env["TF_NUM_INTRAOP_THREADS"], "3")
+        self.assertEqual(env["TF_NUM_INTEROP_THREADS"], "1")
+        self.assertIn("--xla_cpu_multi_thread_eigen=false", env["XLA_FLAGS"])
+        self.assertIn("--xla_force_host_platform_device_count=1", env["XLA_FLAGS"])
+        self.assertIn("--xla_dump_to=/tmp", env["XLA_FLAGS"])
 
     def test_dry_run_writes_job_configs_logs_and_manifest(self) -> None:
         config = train_parallel.load_config(self.write_config(task_indices=[0, 2, 3]))
@@ -120,6 +159,9 @@ class TrainParallelTest(unittest.TestCase):
                 launch["env"]["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
                 for launch in launches
             )
+        )
+        self.assertTrue(
+            all(launch["env"]["OMP_NUM_THREADS"] == str(config["threads_per_coach"]) for launch in launches)
         )
         manifest = json.loads((self.root / "runs" / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "failed")
