@@ -1,0 +1,51 @@
+{
+  "name": "tabx_fov_tokenizer_v0",
+  "description": "Rule-based tokenizer for TABX FOV agent-centered sequence.",
+  "special_tokens": {
+    "PAD": 0,
+    "MASK": 1,
+    "BOS": 2,
+    "EOS": 3,
+    "UNSEEN": 4,
+    "DEAD": 5,
+    "EMPTY_ZONE": 6
+  },
+  "unit_categorical": {
+    "is_self": 2,
+    "is_ally": 2,
+    "is_enemy": 2,
+    "is_alive": 2,
+    "is_visible": 2,
+    "is_attackable": 2
+  },
+  "unit_continuous": {
+    "rel_x": {"min": -20.0, "max": 20.0, "bins": 64},
+    "rel_y": {"min": -20.0, "max": 20.0, "bins": 64},
+    "dist": {"min": 0.0, "max": 40.0, "bins": 64},
+    "health_ratio": {"min": 0.0, "max": 1.0, "bins": 16},
+    "speed": {"min": 0.0, "max": 10.0, "bins": 16},
+    "attack_range": {"min": 0.0, "max": 20.0, "bins": 16},
+    "attack_damage": {"min": 0.0, "max": 20.0, "bins": 16},
+    "cooldown": {"min": 0.0, "max": 10.0, "bins": 16},
+    "body_radius": {"min": 0.0, "max": 5.0, "bins": 16}
+  },
+  "zone_categorical": {
+    "zone_type": 8
+  },
+  "zone_continuous": {
+    "rel_x": {"min": -20.0, "max": 20.0, "bins": 64},
+    "rel_y": {"min": -20.0, "max": 20.0, "bins": 64},
+    "dist": {"min": 0.0, "max": 40.0, "bins": 64},
+    "axis_x": {"min": 0.0, "max": 20.0, "bins": 16},
+    "axis_y": {"min": 0.0, "max": 20.0, "bins": 16},
+    "effect_value": {"min": -5.0, "max": 5.0, "bins": 16}
+  },
+  "action": {
+    "num_actions": 8
+  },
+  "reward": {
+    "min": -2.0,
+    "max": 2.0,
+    "bins": 21
+  }
+}
