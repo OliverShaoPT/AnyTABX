@@ -51,6 +51,9 @@ A/B 建议：
 | A 纯 team | 不接 wrapper，或 `enabled=False` |
 | B hybrid（默认） | 使用上表默认系数 |
 | C 更强个体 | 适当增大 `damage_coef` / `heal_coef`（如 `0.1`），观察是否伤胜率 |
+| D 降权 team | `team_coef∈{0.5, 0.75}`（其余个体系数沿用默认） |
+
+实测结论见第 8 节：`team_coef=0.75` 在 hard5 平均最好，但对 easy/medium 不稳；整体仍偏 task-dependent。
 
 ---
 
@@ -216,3 +219,43 @@ python -m unittest tests.test_individual_reward -v
 ```
 
 覆盖：伤害计入、治疗只给治疗者、承伤/死亡惩罚、kill 仅日志不进 reward。
+
+---
+
+## 8. Online Eval 结论（hard5 + stratified4）
+
+协议：对各 task 取 **best checkpoint** 做 online eval；主指标为 **mean online / eval return**（team return）。对比组在默认个体系数上扫 `team_coef`。
+
+### 8.1 Hard5（20 best ckpt / task）
+
+四组平均 online return：
+
+| 设置 | mean online return | 备注 |
+|---|---|---|
+| baseline（无 individual） | **-1.304** | 在 **3/5** task 上仍最好（含 task256） |
+| `team_coef=1.0` | -1.745 | 平均最差 |
+| `team_coef=0.5` | -1.222 | 介于中间 |
+| `team_coef=0.75` | **-1.133** | tested variants 里 **平均最好** |
+
+- `team_coef=0.75` 的提升 **高度 task-dependent**：主要靠 **task72**（baseline **-1.98 → -0.46**）。
+- 并非普适：baseline 仍在多数 hard task 上更优。
+
+### 8.2 Stratified4 easy/medium（task `[38, 59, 79, 189]`）
+
+| 设置 | mean_eval_return | wins（best task 数） |
+|---|---|---|
+| baseline | **-1.248** | **3/4** |
+| `team_coef=0.5` | -1.377 | 1/4（仅 task59） |
+| `team_coef=0.75` | -1.833 | 0/4 |
+
+- task38 / 79 / 189：baseline 最好；仅 task59 上 `team_coef=0.5` 最好。
+- 与 hard5 相反：easy/medium 上 baseline 更稳，`team_coef=0.75` 明显变差。
+
+### 8.3 综合判断
+
+1. **Individual reward 有信号**，但 **不是稳定普适提升**，而是 **task-dependent**。
+2. 可能帮助 **部分 hard task**（如 task72 + `team_coef=0.75`），但对 **easy/medium** 可能破坏原本较好的纯 team-reward policy。
+3. **整体最稳仍是 baseline**。
+4. 在已测 individual 变体中：hard5 平均最佳为 **`team_coef=0.75`**；跨难度看 **`team_coef=0.5` 更保守**，但仍未稳定超过 baseline。
+5. 实践建议：默认训练继续用 **baseline team reward**；对已知受益的 hard task 再开 individual（优先试 `team_coef=0.75`，保守用 `0.5`），不要全局默认打开。
+6. **Offline / OmniRL**：`generate/` 会把 `reward_individual` **落盘供消融**，但不应用它做默认 credit assignment；采集与 oracle 仍以 team reward 为准（见 [`generate_record.md`](generate_record.md)）。

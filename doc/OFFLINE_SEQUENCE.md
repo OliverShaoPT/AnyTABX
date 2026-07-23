@@ -2,13 +2,15 @@
 
 本文整理「以环境为中心」的 offline 轨迹存储方案，以及如何对照现有 RL 观测接口转换成「以 agent 为中心」的序列，并说明 obs/action 的离散性与 OmniRL 词表化可行性。
 
+**实现入口**（采集 + 拆分）：[`generate/`](../generate/)，说明见 [`generate_record.md`](generate_record.md)。
+
 参考实现主要位于：
 
-- [`src/tabx/tabx.py`](src/tabx/tabx.py)：`get_obs` / `step` / `get_avail_actions` / `world_state`
-- [`src/tabx/constants.py`](src/tabx/constants.py)：`UnitAction` / `ACTION_TABLE`
-- [`src/tabx/wrappers/wrappers.py`](src/tabx/wrappers/wrappers.py)：敌方 heuristic、ally reward 过滤
-- [`src/baseline/marl_baseline.py`](src/baseline/marl_baseline.py)：当前 RL 如何消费 obs/action
-
+- [`generate/`](../generate/)：env-centric 并行采集、agent-centric 拆分
+- [`src/tabx/tabx.py`](../src/tabx/tabx.py)：`get_obs` / `step` / `get_avail_actions` / `world_state`
+- [`src/tabx/constants.py`](../src/tabx/constants.py)：`UnitAction` / `ACTION_TABLE`
+- [`src/tabx/wrappers/wrappers.py`](../src/tabx/wrappers/wrappers.py)：敌方 heuristic、ally reward 过滤
+- [`src/baseline/marl_baseline.py`](../src/baseline/marl_baseline.py)：当前 RL 如何消费 obs/action
 ---
 
 ## 1. 环境为中心：每个 step 建议保存什么
@@ -245,9 +247,11 @@ for each agent i in controllable units:
 [GLOBAL_STATE tokens] [ACT_ally0] ... [ACT_allyN] [REW]
 ```
 
-### 4.3 Observation：需要离散化，但不能假装已经离散
+### 4.3 Observation：两条路——硬离散，或 encoder 压成 latent token
 
-当前 RL 直接吃 float32 Box，**没有官方离散观测词表**。做 OmniRL 时建议：
+当前 RL 直接吃 float32 Box，**没有官方离散观测词表**。
+
+**路径 A：硬离散词表**（OmniRL 检索式接口直接可用，但 token 数易膨胀）：
 
 1. **结构性字段先离散**  
    `unit_id, team, is_alive, is_ally, is_attackable, zone_type, attack_type`
@@ -261,6 +265,8 @@ for each agent i in controllable units:
 4. **固定槽位 vs 变长集合**  
    - 对齐现有 RL：固定 `N-1` 个 other slots + `max_n_zone`  
    - OmniRL 也可改成变长 token 集合（仅输出可见实体），但那是新接口，不再等价于现网 obs
+
+**路径 B：连续 latent token（推荐）**：用 Static / Dynamic encoder 压成少数 `z_*`，不必整词表；见 **第 6 节**。需要离散时再对 latent 做 VQ。
 
 ### 4.4 环境中心序列如何服务两类训练
 
@@ -287,19 +293,219 @@ Env-centric offline dump
 
 ### Phase 1（做序列模型 / OmniRL）
 
-1. Action：8 类词表直接用。
-2. Obs：离散字段 + 连续字段分箱；不可见用 `UNSEEN`。
-3. 转换器：`env_centric_step -> agent_centric_tokens`，内部调用或复刻 `get_obs` 的 FOV 逻辑。
+两条可选路径（可并行探索）：
+
+1. **离散词表路径**：Action 8 类直接词表化；Obs 分箱 + `UNSEEN`（见第 4 节）。
+2. **连续 latent token 路径（推荐缓解 token 爆炸）**：静态/动态双 encoder 压缩观测，动作 encoder 出 `a_token`；配套 decoder 重建/预测，不必强行整词表（见第 6 节）。
+
+转换器：`env_centric_step -> agent_centric features`，内部复用 `get_obs` 的 FOV 逻辑，再送入 encoder。
 
 ### Phase 2（可选消融）
 
 1. FOV+距离截断、KNN-k、全知全局三种观测变体。
 2. 比较「固定槽位 obs」与「变长实体 token 序列」。
+3. 比较「纯离散词表」vs「连续 latent token」vs「latent + VQ 二次离散」。
 
 ---
 
-## 6. 一句话结论
+## 6. 连续 Latent Token 方案（缓解每步 token 过多）
+
+### 6.1 结论：可行
+
+**可行，而且更契合 TABX 的观测结构。**
+
+全特征离散分箱会导致每步 token 数爆炸（自身 + 可见单位 × 多字段 + zone × 多字段）。更合适的做法是：
+
+```text
+原始连续/类别特征
+  → Encoder 压成少数 d 维 latent（当作 soft token）
+  → 时序骨干（Transformer 等）在 token 序列上建模
+  → Decoder 重建观测 / 预测下一观测 / 解出动作分布
+```
+
+这样：
+
+- **不必**先做巨型离散词表；
+- 仍保持「一个实体 ≈ 一个 token」的集合语义；
+- 动作本身已是 8 类离散，可直接 embed，也可用小 encoder 映到同维度 `a_token`；
+- 以后若要接 OmniRL 式离散接口，可对 latent 再做 VQ，而不必从原始高维特征硬分箱。
+
+### 6.2 观测拆分（对齐 TABX）
+
+以 **agent-centric** 一步为例：
+
+| 类型 | 内容（TABX） | Token 设计 |
+|---|---|---|
+| **Static** | 自身状态 + 全部 zone（zone 本就不走 FOV） | 1 个 `z_static`（或 self / zone 再拆成 2 个） |
+| **Dynamic** | FOV 内可见友军/敌军（`visible_matrix`） | 变长：`z_dyn_1 … z_dyn_M`，每可见单位 1 token |
+| **Action** | 自身离散动作 `a ∈ {0..7}` | 1 个 `z_act`（embedding 或小 MLP） |
+| **Reward（可选）** | `r_team` / `r_j` | 1 个标量投影，或仅作训练标签不进序列 |
+
+推荐一步序列形态：
+
+```text
+[ z_static_t , z_dyn_t,1 , … , z_dyn_t,M_t , z_act_t ]  (+ 可选 z_rew_t)
+```
+
+不可见单位 **不生成 token**（变长），比固定 `N-1` 槽全填 0 更省。
+
+### 6.3 框架图
+
+```mermaid
+flowchart LR
+  subgraph inputs [AgentCentricRaw]
+    Self[self_features]
+    Zones[zone_features]
+    Dyn[visible_unit_features]
+    Act[discrete_action]
+  end
+
+  subgraph encoders [Encoders]
+    EncS[StaticEncoder]
+    EncD[DynamicObjectEncoder_shared]
+    EncA[ActionEncoder]
+  end
+
+  subgraph seq [TokenSequence]
+    Zs[z_static]
+    Zd["z_dyn_1..M"]
+    Za[z_act]
+  end
+
+  Backbone[TemporalBackbone_Transformer]
+  subgraph decoders [Decoders]
+    DecS[StaticDecoder]
+    DecD[DynamicDecoder_shared]
+    DecA[ActionDecoder_logits]
+  end
+
+  Self --> EncS
+  Zones --> EncS
+  EncS --> Zs
+  Dyn --> EncD
+  EncD --> Zd
+  Act --> EncA
+  EncA --> Za
+  Zs --> Backbone
+  Zd --> Backbone
+  Za --> Backbone
+  Backbone --> DecS
+  Backbone --> DecD
+  Backbone --> DecA
+```
+
+训练时常见目标（可组合）：
+
+```mermaid
+flowchart TB
+  Tokens[latent_token_sequence]
+  Backbone[Transformer]
+  Tokens --> Backbone
+  Backbone --> Rec[Reconstruction_AE]
+  Backbone --> Pred[NextStepPrediction]
+  Backbone --> Policy[ActionPrediction_CE]
+  Backbone --> Value[ReturnPrediction_optional]
+```
+
+### 6.4 伪代码
+
+```python
+# ---------- feature packing (from env-centric dump) ----------
+def pack_agent_step(global_t, agent_i):
+    self_f = own_features(global_t, agent_i)          # continuous + small categoricals
+    zone_f = zone_features_relative(global_t, agent_i)  # always included
+    dyn_list = []
+    for j in units_except(agent_i):
+        if visible(global_t, agent_i, j):             # FOV (+ bush), not KNN
+            dyn_list.append(other_features_rel(global_t, agent_i, j))
+    a = action[agent_i]                               # int in [0, 7]
+    r = reward_agent[agent_i]                         # label; optional in sequence
+    return self_f, zone_f, dyn_list, a, r
+
+
+# ---------- encoders / decoders ----------
+class StaticEncoder(nn.Module):
+    def __call__(self, self_f, zone_f):
+        x = concat([self_f, flatten(zone_f)])
+        return MLP(x)                                 # -> [D]
+
+class DynamicObjectEncoder(nn.Module):
+    """Shared across all visible units."""
+    def __call__(self, unit_f):
+        # unit_f may include: rel_xy, hp_ratio, is_ally, is_attackable, specs...
+        return MLP(unit_f)                            # -> [D]
+
+class ActionEncoder(nn.Module):
+    def __call__(self, a):
+        return Embed(num_actions=8, D)(a)             # or MLP(one_hot(a))
+
+
+class StaticDecoder(nn.Module):
+    def __call__(self, z):
+        return head_self(z), head_zones(z)            # reconstruct continuous fields
+
+class DynamicDecoder(nn.Module):
+    def __call__(self, z):
+        return head_unit(z)                           # reconstruct one object
+
+class ActionDecoder(nn.Module):
+    def __call__(self, z_ctx):
+        return logits_8(z_ctx)                        # CE over discrete actions
+
+
+# ---------- encode one step ----------
+def encode_step(self_f, zone_f, dyn_list, a, enc_s, enc_d, enc_a):
+    tokens = [enc_s(self_f, zone_f)]
+    for u in dyn_list:
+        tokens.append(enc_d(u))
+    tokens.append(enc_a(a))
+    # optional type embeddings: STATIC / DYN / ACTION
+    return stack(tokens)                              # [1+M+1, D]
+
+
+# ---------- sequence model ----------
+def loss_on_trajectory(steps, model):
+    all_tokens, segment_ids = [], []
+    for t, step in enumerate(steps):
+        tok = encode_step(*step.raw, *model.encoders)
+        all_tokens.append(tok)
+        segment_ids.append(full(tok.shape[0], t))
+    x = concat(all_tokens, axis=0)                    # variable length
+    h = Transformer(x, key_padding_mask=...)
+
+    # example objectives
+    L_rec = recon_static(h, steps) + recon_dynamic(h, steps)
+    L_act = cross_entropy(action_decoder(h_at_obs_tokens), actions)
+    L_next = predict_next_latent(h, encode_step(steps[t+1]))  # optional
+    return L_rec + L_act + L_next
+```
+
+### 6.5 设计要点
+
+1. **Dynamic encoder 权重共享**：所有可见单位共用 `DynamicObjectEncoder`，用 `is_ally` 等字段区分敌我，而不是敌/友两套大网。
+2. **变长序列 + mask**：`M_t` 随 FOV 变化；padding 到 `max_visible` 仅为了 batch，loss 里 mask 掉 pad。
+3. **Token type embedding**：`STATIC / DYN / ACT / REW`，避免三类向量混同。
+4. **动作**：环境动作已是离散 8 类——`ActionEncoder=Embedding(8,D)` 通常足够；decoder 用 CE。不必把动作再连续化。
+5. **Reward**：训练标签可继续用 `r_team` / 个体 shaping；是否把 `z_rew` 编进序列取决于你是否做 return-conditioned 生成。
+6. **与词表路线关系**：
+   - 现在：连续 latent soft-token，无词表；
+   - 以后：对 `z_*` 做 VQ-VAE / FSQ，得到真正离散 code，再接 OmniRL 检索式接口。
+7. **每步 token 预算（粗算）**：`1 static + M visible + 1 action`。若 `M≈0–8`，每步约 **2–10** 个 token，远小于「每字段一 token」的分箱方案。
+
+### 6.6 和全离散词表的取舍
+
+| | 全离散分箱 | 连续 latent token（本节） |
+|---|---|---|
+| 每步长度 | 很容易几十～上百 | `O(可见单位数)` |
+| 词表 | 必须维护多字段 bins | 非必须 |
+| 训练 | CE / 检索友好 | AE+CE / 回归；可加 VQ 后离散化 |
+| 与 TABX FOV | 需大量 `UNSEEN` 槽 | 不可见直接不建 token |
+| OmniRL 兼容 | 直接 | 先 latent，必要时再 VQ |
+
+---
+
+## 7. 一句话结论
 
 - **每个 step 先以环境为中心存**：全体单位/zone 的绝对状态 + 全体动作 + team reward/done/info，并建议附带 `visible_matrix`。  
 - **转 agent 中心时**：按现有实现做 **扇形 FOV 遮罩（非 KNN、无显式视距）**，相对坐标填充可见单位，zone 始终相对给出。  
-- **动作已是 8 类离散，可直接词表化；观测整体是连续 Box，OmniRL 必须对几何/数值特征做离散化，不能直接当离散 token 用。**
+- **动作已是 8 类离散**；观测若强行全分箱会导致 token 爆炸。更推荐 **Static / Dynamic 双 encoder + Action encoder** 压成少量连续 latent token，并用 decoder 重建/预测；需要词表时再对 latent 做 VQ，而不是从原始高维 obs 硬离散化。
