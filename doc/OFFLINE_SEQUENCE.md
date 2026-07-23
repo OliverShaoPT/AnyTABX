@@ -424,33 +424,60 @@ def pack_agent_step(global_t, agent_i):
 
 
 # ---------- encoders / decoders ----------
+# Pattern aligned with airsoul `MLPEncoder` / `ResidualMLPDecoder`
+# (airsoul/modules/mlp_layers.py):
+#   - continuous encoder: Linear / MLP + GELU + Dropout  (no LayerNorm)
+#   - discrete encoder:   Embedding
+#   - decoder:            LayerNorm(input) -> MLP(+optional residual) -> head
+
+def mlp_encoder_continuous(x, hidden_sizes, dropout):
+    """Like airsoul MLPEncoder(input_type=continuous)."""
+    for h in hidden_sizes[:-1]:
+        x = Dropout(dropout)(GELU(Linear(x, h)))
+    return Linear(x, hidden_sizes[-1])                # -> [D]
+
+
 class StaticEncoder(nn.Module):
     def __call__(self, self_f, zone_f):
         x = concat([self_f, flatten(zone_f)])
-        return MLP(x)                                 # -> [D]
+        return mlp_encoder_continuous(x, hidden_s, dropout)
 
 class DynamicObjectEncoder(nn.Module):
     """Shared across all visible units."""
     def __call__(self, unit_f):
-        # unit_f may include: rel_xy, hp_ratio, is_ally, is_attackable, specs...
-        return MLP(unit_f)                            # -> [D]
+        # unit_f: rel_xy, hp_ratio, is_ally, is_attackable, specs...
+        return mlp_encoder_continuous(unit_f, hidden_d, dropout)
 
 class ActionEncoder(nn.Module):
     def __call__(self, a):
-        return Embed(num_actions=8, D)(a)             # or MLP(one_hot(a))
+        # discrete path = airsoul Embedding encoder
+        return Embed(num_actions=8, D)(a)
+
+
+class ResidualMLPDecoder(nn.Module):
+    """Like airsoul ResidualMLPDecoder: LN -> pre-MLP -> (+ residual) -> post."""
+    def __call__(self, z, out_dim):
+        src = LayerNorm(z)                            # LN on decoder input (default on)
+        h = mlp_blocks(src, hidden_pre, dropout)      # GELU + Dropout
+        if residual_connect:
+            h = Linear(h + src, out_dim)              # residual in latent dim
+        else:
+            h = Linear(h, out_dim)
+        return h
 
 
 class StaticDecoder(nn.Module):
     def __call__(self, z):
-        return head_self(z), head_zones(z)            # reconstruct continuous fields
+        return ResidualMLPDecoder(z, dim_self), ResidualMLPDecoder(z, dim_zones)
 
 class DynamicDecoder(nn.Module):
     def __call__(self, z):
-        return head_unit(z)                           # reconstruct one object
+        return ResidualMLPDecoder(z, dim_unit)
 
 class ActionDecoder(nn.Module):
     def __call__(self, z_ctx):
-        return logits_8(z_ctx)                        # CE over discrete actions
+        # discrete: LN -> MLP -> logits (Softmax/CE outside or temperature T)
+        return ResidualMLPDecoder(z_ctx, 8)           # CE over discrete actions
 
 
 # ---------- encode one step ----------
@@ -486,11 +513,14 @@ def loss_on_trajectory(steps, model):
 2. **变长序列 + mask**：`M_t` 随 FOV 变化；padding 到 `max_visible` 仅为了 batch，loss 里 mask 掉 pad。
 3. **Token type embedding**：`STATIC / DYN / ACT / REW`，避免三类向量混同。
 4. **动作**：环境动作已是离散 8 类——`ActionEncoder=Embedding(8,D)` 通常足够；decoder 用 CE。不必把动作再连续化。
-5. **Reward**：训练标签可继续用 `r_team` / 个体 shaping；是否把 `z_rew` 编进序列取决于你是否做 return-conditioned 生成。
-6. **与词表路线关系**：
+5. **LayerNorm 放哪（对齐 airsoul）**：
+   - **Encoder 不加 LN**：连续特征走 `Linear / (Linear→GELU→Dropout)* → Linear`；离散动作走 `Embedding`。
+   - **Decoder 入口加 LN**：`ResidualMLPDecoder` 先 `LayerNorm(z)`，再 MLP；可选 `residual_connect`（残差支路要求 hidden 列表至少两层，与 airsoul 一致）。
+6. **Reward**：训练标签可继续用 `r_team` / 个体 shaping；是否把 `z_rew` 编进序列取决于你是否做 return-conditioned 生成。
+7. **与词表路线关系**：
    - 现在：连续 latent soft-token，无词表；
    - 以后：对 `z_*` 做 VQ-VAE / FSQ，得到真正离散 code，再接 OmniRL 检索式接口。
-7. **每步 token 预算（粗算）**：`1 static + M visible + 1 action`。若 `M≈0–8`，每步约 **2–10** 个 token，远小于「每字段一 token」的分箱方案。
+8. **每步 token 预算（粗算）**：`1 static + M visible + 1 action`。若 `M≈0–8`，每步约 **2–10** 个 token，远小于「每字段一 token」的分箱方案。
 
 ### 6.6 和全离散词表的取舍
 
