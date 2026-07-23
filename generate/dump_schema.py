@@ -18,6 +18,8 @@ ENV_CENTRIC_ARRAYS = (
     "reward_team",
     "reward_individual",
     "done",
+    "truncation",
+    "is_win",
     "reset",
     "episode_id",
     "behavior_policy_id",

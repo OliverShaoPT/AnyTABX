@@ -65,6 +65,8 @@ class AgentCentricSplitTest(unittest.TestCase):
             "reward_team": np.zeros((t, n_ally), dtype=np.float32),
             "reward_individual": np.zeros((t, n_ally), dtype=np.float32),
             "done": np.array([0, 0, 1, 0, 0], dtype=np.uint8),
+            "truncation": np.array([0, 0, 1, 0, 0], dtype=np.uint8),
+            "is_win": np.array([0, 0, 0, 0, 0], dtype=np.uint8),
             "reset": np.array([1, 0, 0, 1, 0], dtype=np.uint8),
             "episode_id": np.array([0, 0, 0, 1, 1], dtype=np.int32),
             "behavior_policy_id": np.zeros((t,), dtype=np.int32),
@@ -87,8 +89,12 @@ class AgentCentricSplitTest(unittest.TestCase):
             ally0 = record_dir / "agent_centric" / "ally_0"
             reset = np.load(ally0 / "reset.npy")
             done = np.load(ally0 / "done.npy")
+            trunc = np.load(ally0 / "truncation.npy")
+            is_win = np.load(ally0 / "is_win.npy")
             self.assertTrue(np.array_equal(reset, arrays["reset"]))
             self.assertTrue(np.array_equal(done, arrays["done"]))
+            self.assertTrue(np.array_equal(trunc, arrays["truncation"]))
+            self.assertTrue(np.array_equal(is_win, arrays["is_win"]))
             self.assertEqual(np.load(ally0 / "behavior_action.npy").shape, (t,))
 
 

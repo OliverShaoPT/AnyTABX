@@ -133,6 +133,8 @@ def generate_one_record(
         "reward_team": [],
         "reward_individual": [],
         "done": [],
+        "truncation": [],
+        "is_win": [],
         "reset": [],
         "episode_id": [],
         "behavior_policy_id": [],
@@ -202,6 +204,10 @@ def generate_one_record(
         )
 
         ep_done = bool(_to_numpy(dones["__all__"]))
+        # info["truncation"]: timed out at max_episode_steps
+        # info["is_win"]: per-team; index 0 is ally (team 0); non-terminal steps are 0
+        trunc = bool(_to_numpy(info["truncation"]).reshape(-1)[0])
+        ally_win = bool(_to_numpy(info["is_win"]).reshape(-1)[0])
         buffers["actions_behavior"].append(
             np.asarray([int(behavior[a]) for a in ally_keys], dtype=np.int32)
         )
@@ -215,12 +221,20 @@ def generate_one_record(
             np.asarray([float(_to_numpy(shaped[a])) for a in ally_keys], dtype=np.float32)
         )
         buffers["done"].append(np.uint8(ep_done))
+        buffers["truncation"].append(np.uint8(trunc))
+        buffers["is_win"].append(np.uint8(ally_win))
         buffers["reset"].append(np.uint8(is_reset_step))
         buffers["episode_id"].append(np.int32(episode_id))
         buffers["behavior_policy_id"].append(np.int32(shared.spec.policy_id))
         buffers["visible_matrix"].append(visible)
         buffers["obs_flat"].append(
-            np.stack([_to_numpy(obs[a]).astype(np.float32) for a in ally_keys], axis=0)
+            np.stack(
+                [
+                    np.nan_to_num(_to_numpy(obs[a]).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                    for a in ally_keys
+                ],
+                axis=0,
+            )
         )
         for name, value in unit_pack.items():
             buffers[name].append(value)
@@ -242,6 +256,8 @@ def generate_one_record(
         "reward_team": np.stack(buffers["reward_team"], axis=0),
         "reward_individual": np.stack(buffers["reward_individual"], axis=0),
         "done": np.asarray(buffers["done"], dtype=np.uint8),
+        "truncation": np.asarray(buffers["truncation"], dtype=np.uint8),
+        "is_win": np.asarray(buffers["is_win"], dtype=np.uint8),
         "reset": np.asarray(buffers["reset"], dtype=np.uint8),
         "episode_id": np.asarray(buffers["episode_id"], dtype=np.int32),
         "behavior_policy_id": np.asarray(buffers["behavior_policy_id"], dtype=np.int32),

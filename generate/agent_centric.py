@@ -30,6 +30,8 @@ def split_one_record(record_dir: Path) -> list[Path]:
         "reward_team",
         "reward_individual",
         "done",
+        "truncation",
+        "is_win",
         "reset",
         "episode_id",
         "behavior_policy_id",
@@ -64,6 +66,8 @@ def split_one_record(record_dir: Path) -> list[Path]:
         save_npy(agent_dir / "reward_team.npy", arrays["reward_team"][:, ally_index])
         save_npy(agent_dir / "reward_individual.npy", arrays["reward_individual"][:, ally_index])
         save_npy(agent_dir / "done.npy", arrays["done"])
+        save_npy(agent_dir / "truncation.npy", arrays["truncation"])
+        save_npy(agent_dir / "is_win.npy", arrays["is_win"])
         save_npy(agent_dir / "reset.npy", arrays["reset"])
         save_npy(agent_dir / "episode_id.npy", arrays["episode_id"])
         save_npy(agent_dir / "behavior_policy_id.npy", arrays["behavior_policy_id"])
@@ -85,6 +89,8 @@ def split_one_record(record_dir: Path) -> list[Path]:
             "notes": {
                 "reset": "1 marks the first step after env.reset (episode boundary jump)",
                 "done": "1 marks the step whose transition ended the episode",
+                "truncation": "1 if episode ended by hitting max_episode_steps",
+                "is_win": "1 if team 0 (ally) won on this terminal step; else 0",
                 "alignment": "All arrays share the same time index t",
             },
         }

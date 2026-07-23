@@ -289,14 +289,18 @@ class ParsedState:
     @classmethod
     def from_state(cls, state, keys) -> "ParsedState":
         healths = jnp.stack([state[unit].status.health for unit in keys])
-        max_healths = healths / jnp.stack([state[unit].status.max_health for unit in keys])
+        max_hp = jnp.stack([state[unit].status.max_health for unit in keys])
+        # Padded / disabled slots often have max_health=0; avoid 0/0 -> NaN
+        # (NaN * visibility_mask is still NaN, which poisons obs dumps).
+        max_healths = jnp.where(max_hp > 0, healths / max_hp, jnp.zeros_like(healths))
         positions = jnp.stack([state[unit].transform.position for unit in keys])
         rotations = jnp.stack([state[unit].transform.rotation for unit in keys]) / (jnp.pi * 2)
         attack_ranges = jnp.stack([state[unit].status.attack_range for unit in keys])
         attack_damages = jnp.stack([state[unit].status.attack_damage for unit in keys])
         cooldowns = jnp.stack([state[unit].status.cooldown for unit in keys])
-        attack_cooldowns = cooldowns / jnp.stack(
-            [state[unit].status.attack_cooldown for unit in keys]
+        attack_cd = jnp.stack([state[unit].status.attack_cooldown for unit in keys])
+        attack_cooldowns = jnp.where(
+            attack_cd > 0, cooldowns / attack_cd, jnp.zeros_like(cooldowns)
         )
 
         body_radiuss = jnp.stack([state[unit].collider.radius for unit in keys])

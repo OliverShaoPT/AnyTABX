@@ -89,7 +89,11 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 |---|---|
 | `reset.npy` | 该步是新 episode 的**首步**（reset 后） |
 | `done.npy` | 该步 transition **结束后** episode 结束 |
+| `truncation.npy` | 是否因达到 `max_episode_steps` **超时**终止（非超时终局为 0） |
+| `is_win.npy` | team 0（ally）是否在该步获胜；**非终止步为 0** |
 | `episode_id.npy` | 同 record 内第几个 episode |
+
+说明：`done=1` 且 `truncation=0` 多为正常胜负终局；`done=1` 且 `truncation=1` 为超时（超时仍可能按 HP 判 `is_win`）。
 
 ### 3.5 输出布局
 
@@ -100,7 +104,8 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
   actions_reference.npy     # (T, n_ally)
   reward_team.npy           # (T, n_ally) team 广播标量
   reward_individual.npy     # (T, n_ally) 消融用 hybrid
-  done.npy, reset.npy, episode_id.npy, behavior_policy_id.npy
+  done.npy, truncation.npy, is_win.npy
+  reset.npy, episode_id.npy, behavior_policy_id.npy
   visible_matrix.npy        # (T, N, N)
   obs_flat.npy              # (T, n_ally, obs_dim) 便于第二步拆分
   unit_*.npy                # 全局单位快照
@@ -119,7 +124,7 @@ python -m generate.agent_centric --record_dir ./data/records/task_00000_xxx/reco
 ```
 
 ```text
-record-XXXXXX/agent_centric/ally_{i}/
+record-XXXXXX/agent_centric/{ally_key}/
   obs_static.npy
   obs_dynamic.npy
   obs_dynamic_mask.npy
@@ -128,13 +133,17 @@ record-XXXXXX/agent_centric/ally_{i}/
   reward_team.npy
   reward_individual.npy
   done.npy
+  truncation.npy            # 超时终止
+  is_win.npy                # team0 胜；非终止步为 0
   reset.npy                 # 透传，提示 episode 跳变
   episode_id.npy
   behavior_policy_id.npy
   meta.json
 ```
 
-同一 `ally_i` 下各文件第 `t` 行对齐。`obs_static` = own(14) + zones；`obs_dynamic` = 其他单位槽 (N−1, 16)，`mask` 标可见非零槽。
+目录名与环境 `ally_keys` 一致（常见为 `unit_00`…，不是 `ally_0`）。同一 agent 下各文件第 `t` 行对齐。`obs_static` = own(14) + zones；`obs_dynamic` = 其他单位槽 (N−1, 16)，`mask` 标可见非零槽。
+
+> **NaN 说明**：padding 单位曾在 `ParsedState` 里对 `max_health=0` / `attack_cooldown=0` 做除法得到 NaN，再与 visibility 相乘仍为 NaN（`NaN*0=NaN`）。已在 `ParsedState.from_state` 改为安全除法；`env_centric` 落盘时额外 `nan_to_num` 兜底（与 `marl_baseline` 训练侧一致）。
 
 ---
 
