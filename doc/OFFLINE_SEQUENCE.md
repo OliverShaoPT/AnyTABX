@@ -310,6 +310,19 @@ Env-centric offline dump
 
 ## 6. 连续 Latent Token 方案（缓解每步 token 过多）
 
+**实现（按本节 encoder/decoder；可见 dyn 先 pack，序列长 `1+K+1`，K=`max_visible`；暂无 Transformer）**：[`latent_token/offline_sequence_latent_ae.py`](../latent_token/offline_sequence_latent_ae.py)  
+对比训练（v1 固定槽 / v2 visible-pool / **doc** packed）：[`latent_token/prototype_mlp_encoder_decoder_v1_v2_compare_jax.py`](../latent_token/prototype_mlp_encoder_decoder_v1_v2_compare_jax.py)
+
+```bash
+# 单独训练文档版
+python -m latent_token.offline_sequence_latent_ae \
+  --records_root ./data/records --epochs 200 --out_csv outputs/doc_ae.csv
+
+# 与 v1/v2/flat 对比（含 latent 加噪 reconstruct）
+python -m latent_token.prototype_mlp_encoder_decoder_v1_v2_compare_jax \
+  --records_root ./data/records --models v1,v2,doc,flat --epochs 200
+```
+
 ### 6.1 结论：可行
 
 **可行，而且更契合 TABX 的观测结构。**
