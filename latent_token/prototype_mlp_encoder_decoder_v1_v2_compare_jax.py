@@ -13,10 +13,9 @@ import optax
 from flax.training import train_state
 
 from latent_token.offline_sequence_latent_ae import (
-    OfflineSequenceLatentAE,
-    evaluate as evaluate_doc,
-    infer_max_visible,
-    make_train_step as make_doc_train_step,
+    load_agent_data as load_doc_agent_data,
+    normalize_arrays as normalize_doc_arrays,
+    train_doc_model,
 )
 
 
@@ -395,78 +394,31 @@ def train_model(name, model, arrays, train_idx, test_idx, args):
     return rows
 
 
-def train_doc_offline_sequence(arrays, train_idx, test_idx, args):
-    """Doc §6 OfflineSequenceLatentAE (packed visible tokens + type embed)."""
+def train_doc_offline_sequence(records_root: Path, args):
+    """Doc model with token order obs→action→reward_team→[rind]→done."""
 
-    max_visible = infer_max_visible(
-        arrays["mask"], getattr(args, "max_visible", None)
+    raw = load_doc_agent_data(
+        records_root, use_individual_reward=bool(args.use_individual_reward)
     )
-    print(
-        f"[doc_offline_sequence] pack visibles: "
-        f"dump_M={arrays['dyn'].shape[1]} -> K={max_visible}, "
-        f"token_len={1 + max_visible + 1}"
-    )
-    model = OfflineSequenceLatentAE(
-        static_dim=arrays["static"].shape[-1],
-        dyn_dim=arrays["dyn"].shape[-1],
-        max_visible=max_visible,
-        latent_dim=args.latent_dim,
-        hidden_dim=args.hidden_dim,
-        dropout=0.0,
-        residual_decode=False,
-    )
-    key = jax.random.PRNGKey(args.seed)
-    init_idx = train_idx[: min(4, len(train_idx))]
-    init_batch = {
-        "static": jnp.asarray(arrays["static"][init_idx]),
-        "dyn": jnp.asarray(arrays["dyn"][init_idx]),
-        "mask": jnp.asarray(arrays["mask"][init_idx]),
-        "action": jnp.asarray(arrays["action"][init_idx]),
-    }
-    variables = model.init(
-        {
-            "params": key,
-            "dropout": key,
-            "noise_s": key,
-            "noise_d": key,
-            "noise_a": key,
-        },
-        init_batch["static"],
-        init_batch["dyn"],
-        init_batch["mask"],
-        init_batch["action"],
-        0.0,
-        train=True,
-    )
-    state = TrainState.create(
-        apply_fn=model,
-        params=variables["params"],
-        tx=optax.adam(args.lr),
-    )
-    step_fn = make_doc_train_step(0.2)
+    n = len(raw["action"])
     rng = np.random.default_rng(args.seed)
-    key = jax.random.PRNGKey(args.seed + 1)
-    name = "doc_offline_sequence"
-
-    for epoch in range(1, args.epochs + 1):
-        for batch in batch_iter(arrays, train_idx, args.batch_size, rng):
-            key, subkey = jax.random.split(key)
-            state, metrics = step_fn(state, batch, subkey)
-        if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
-            print(
-                f"[{name}] epoch={epoch:04d} "
-                f"loss={float(metrics['loss']):.6f} "
-                f"static={float(metrics['static_mse']):.6f} "
-                f"dyn={float(metrics['dynamic_masked_mse']):.6f} "
-                f"act_acc={float(metrics['action_acc']):.4f} "
-                f"reward={float(metrics['reward_mse']):.6f}",
-                flush=True,
-            )
-
-    noise_stds = [float(x) for x in args.noise_stds.split(",")]
-    rows = evaluate_doc(state, arrays, test_idx, args.batch_size, noise_stds, 0.2)
-    for r in rows:
-        r["model"] = name
+    perm = rng.permutation(n)
+    split = max(1, int(0.8 * n))
+    train_idx = perm[:split]
+    test_idx = perm[split:] if split < n else perm[:split]
+    arrays = normalize_doc_arrays(raw, train_idx, Path(args.stats_out).with_name(
+        Path(args.stats_out).stem + "_doc.npz"
+    ))
+    # Ensure CLI fields expected by train_doc_model
+    if not hasattr(args, "reward_team_coef"):
+        args.reward_team_coef = 0.2
+    if not hasattr(args, "reward_ind_coef"):
+        args.reward_ind_coef = 0.2
+    if not hasattr(args, "dropout"):
+        args.dropout = 0.0
+    if not hasattr(args, "residual_decode"):
+        args.residual_decode = False
+    _, rows = train_doc_model(arrays, train_idx, test_idx, args)
     return rows
 
 
@@ -494,6 +446,15 @@ def main():
         default=None,
         help="Doc model: max packed visible dyn tokens (default: data max)",
     )
+    ap.add_argument(
+        "--use_individual_reward",
+        action="store_true",
+        help="Doc model: include optional reward_individual token",
+    )
+    ap.add_argument("--reward_team_coef", type=float, default=0.2)
+    ap.add_argument("--reward_ind_coef", type=float, default=0.2)
+    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--residual_decode", action="store_true")
     args = ap.parse_args()
 
     records_root = Path(args.records_root)
@@ -585,7 +546,7 @@ def main():
             train_model("visible_token_v2", visible_model, arrays, train_idx, test_idx, args)
         )
     if "doc" in wanted:
-        all_rows.extend(train_doc_offline_sequence(arrays, train_idx, test_idx, args))
+        all_rows.extend(train_doc_offline_sequence(records_root, args))
     if "flat" in wanted:
         all_rows.extend(
             train_model(
