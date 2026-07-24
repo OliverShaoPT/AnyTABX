@@ -9,6 +9,8 @@ Per-timestep token order (OFFLINE_SEQUENCE + generate fields):
   combat_end (done & ~truncation).
 - Visible dyn objects are packed (length K=max_visible); dump may still store M slots.
 - No Transformer backbone: encode tokens → ResidualMLPDecoder heads.
+- This module is a **per-token autoencoder** (encode→noise→decode the same field),
+  not an obs→action policy / BC head.
 """
 
 from __future__ import annotations
@@ -236,14 +238,8 @@ class OfflineSequenceLatentAE(nn.Module):
         tokens = jnp.concatenate(parts, axis=1)
         tok_mask = jnp.concatenate(mask_parts, axis=1)
 
-        # Action CE from obs tokens only (no action / reward / done leak).
-        obs_mask = jnp.concatenate(
-            [jnp.ones((bsz, 1), dtype=mask_p.dtype), mask_p], axis=1
-        )
-        z_obs = tokens[:, : 1 + k, :]
-        obs_denom = jnp.maximum(jnp.sum(obs_mask, axis=1, keepdims=True), 1.0)
-        z_obs_ctx = jnp.sum(z_obs * obs_mask[..., None], axis=1) / obs_denom
-
+        # Per-token AE reconstruct: encode→(+noise)→decode the same field.
+        # Action is NOT predicted from obs (policy / BC); that belongs elsewhere.
         pred_static = ResidualMLPDecoder(
             self.static_dim, dec_sizes, self.dropout, self.residual_decode
         )(z_static, train=train)
@@ -252,7 +248,7 @@ class OfflineSequenceLatentAE(nn.Module):
         )(z_dyn, train=train)
         action_logits = ResidualMLPDecoder(
             self.action_dim, dec_sizes, self.dropout, self.residual_decode
-        )(z_obs_ctx, train=train)
+        )(z_act, train=train)
         pred_reward_team = ResidualMLPDecoder(
             1, dec_sizes, self.dropout, False
         )(z_rew_team, train=train).squeeze(-1)
