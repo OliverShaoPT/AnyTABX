@@ -16,7 +16,7 @@ import numpy as np
 from generate.behavior_mix import BehaviorSwitcher, DEFAULT_BEHAVIOR_MIX
 from generate.dump_schema import ensure_dir, write_env_centric_record
 from generate.oracle_loader import load_oracle_coach
-from generate.policies import SharedAllyPolicy, reference_actions
+from generate.policies import SharedAllyPolicy, reference_labels
 from generate.task_package import TaskPackage, discover_task_packages, load_package_task_bank
 from src.tabx import TABX
 from src.tabx.sample_task import build_batched_env_params_from_tasks
@@ -130,6 +130,7 @@ def generate_one_record(
     buffers: dict[str, list] = {
         "actions_behavior": [],
         "actions_reference": [],
+        "actions_reference_distribution": [],
         "reward_team": [],
         "reward_individual": [],
         "done": [],
@@ -165,7 +166,7 @@ def generate_one_record(
             )
 
         avail = env.get_avail_actions(state)
-        key, bkey, rkey, skey = jax.random.split(key, 4)
+        key, bkey, skey = jax.random.split(key, 3)
         behavior = shared.act(
             key=bkey,
             obs_by_agent=obs,
@@ -173,9 +174,8 @@ def generate_one_record(
             ally_keys=ally_keys,
             physics_params=state["physics_params"],
         )
-        ref = reference_actions(
+        ref, ref_dist = reference_labels(
             oracle,
-            key=rkey,
             obs_by_agent=obs,
             avail_by_agent=avail,
             ally_keys=ally_keys,
@@ -213,6 +213,9 @@ def generate_one_record(
         )
         buffers["actions_reference"].append(
             np.asarray([int(ref[a]) for a in ally_keys], dtype=np.int32)
+        )
+        buffers["actions_reference_distribution"].append(
+            np.asarray(ref_dist, dtype=np.float32)
         )
         buffers["reward_team"].append(
             np.asarray([float(_to_numpy(team_by_agent[a])) for a in ally_keys], dtype=np.float32)
@@ -253,6 +256,10 @@ def generate_one_record(
     arrays = {
         "actions_behavior": np.stack(buffers["actions_behavior"], axis=0),
         "actions_reference": np.stack(buffers["actions_reference"], axis=0),
+        # Soft oracle policy π_ref(a|o); HVAC-style label_action_distribution.
+        "actions_reference_distribution": np.stack(
+            buffers["actions_reference_distribution"], axis=0
+        ),
         "reward_team": np.stack(buffers["reward_team"], axis=0),
         "reward_individual": np.stack(buffers["reward_individual"], axis=0),
         "done": np.asarray(buffers["done"], dtype=np.uint8),

@@ -59,9 +59,13 @@ class AgentCentricSplitTest(unittest.TestCase):
             + OTHER_FEATURE_DIM * (n_units - 1)
             + ZONE_FEATURE_DIM * max_n_zone
         )
+        action_dim = 8
+        dist = np.zeros((t, n_ally, action_dim), dtype=np.float32)
+        dist[..., 1] = 1.0
         arrays = {
             "actions_behavior": np.zeros((t, n_ally), dtype=np.int32),
             "actions_reference": np.ones((t, n_ally), dtype=np.int32),
+            "actions_reference_distribution": dist,
             "reward_team": np.zeros((t, n_ally), dtype=np.float32),
             "reward_individual": np.zeros((t, n_ally), dtype=np.float32),
             "done": np.array([0, 0, 1, 0, 0], dtype=np.uint8),
@@ -96,6 +100,15 @@ class AgentCentricSplitTest(unittest.TestCase):
             self.assertTrue(np.array_equal(trunc, arrays["truncation"]))
             self.assertTrue(np.array_equal(is_win, arrays["is_win"]))
             self.assertEqual(np.load(ally0 / "behavior_action.npy").shape, (t,))
+            ref_dist = np.load(ally0 / "reference_action_distribution.npy")
+            self.assertEqual(ref_dist.shape, (t, action_dim))
+            self.assertTrue(np.allclose(ref_dist.sum(axis=-1), 1.0))
+            self.assertTrue(
+                np.array_equal(
+                    np.argmax(ref_dist, axis=-1),
+                    np.load(ally0 / "reference_action.npy"),
+                )
+            )
 
 
 if __name__ == "__main__":

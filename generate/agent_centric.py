@@ -27,6 +27,7 @@ def split_one_record(record_dir: Path) -> list[Path]:
         "obs_flat",
         "actions_behavior",
         "actions_reference",
+        "actions_reference_distribution",
         "reward_team",
         "reward_individual",
         "done",
@@ -63,6 +64,11 @@ def split_one_record(record_dir: Path) -> list[Path]:
         save_npy(agent_dir / "obs_dynamic_mask.npy", np.stack(mask_list, axis=0))
         save_npy(agent_dir / "behavior_action.npy", arrays["actions_behavior"][:, ally_index])
         save_npy(agent_dir / "reference_action.npy", arrays["actions_reference"][:, ally_index])
+        # Soft oracle π(a|o); HVAC label_action_distribution equivalent, shape (T, A).
+        save_npy(
+            agent_dir / "reference_action_distribution.npy",
+            arrays["actions_reference_distribution"][:, ally_index],
+        )
         save_npy(agent_dir / "reward_team.npy", arrays["reward_team"][:, ally_index])
         save_npy(agent_dir / "reward_individual.npy", arrays["reward_individual"][:, ally_index])
         save_npy(agent_dir / "done.npy", arrays["done"])
@@ -91,6 +97,11 @@ def split_one_record(record_dir: Path) -> list[Path]:
                 "done": "1 marks the step whose transition ended the episode",
                 "truncation": "1 if episode ended by hitting max_episode_steps",
                 "is_win": "1 if team 0 (ally) won on this terminal step; else 0",
+                "reference_action": "argmax of oracle RL policy (hard label)",
+                "reference_action_distribution": (
+                    "oracle RL softmax probs (T, action_dim); KL soft target "
+                    "(HVAC label_action_distribution)"
+                ),
                 "alignment": "All arrays share the same time index t",
             },
         }

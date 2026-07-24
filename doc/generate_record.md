@@ -62,7 +62,8 @@ python -m generate.env_centric \
 | 序列 | 含义 |
 |---|---|
 | `actions_behavior` | 行为策略动作，**进入** `env.step` |
-| `actions_reference` | 同一 obs 上 **纯 oracle** 动作，只作标签 |
+| `actions_reference` | 同一 obs 上 **纯 oracle** 硬标签（argmax） |
+| `actions_reference_distribution` | 同一 obs 上 oracle RL 的 soft 分布 `(T, n_ally, A)`，供 KL（HVAC `label_action_distribution`） |
 
 Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank manifest）。
 
@@ -101,7 +102,8 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 {output_root}/task_{index:05d}_{task_id}/record-{id:06d}/
   meta.json
   actions_behavior.npy      # (T, n_ally)
-  actions_reference.npy     # (T, n_ally)
+  actions_reference.npy     # (T, n_ally) hard argmax
+  actions_reference_distribution.npy  # (T, n_ally, A) oracle softmax
   reward_team.npy           # (T, n_ally) team 广播标量
   reward_individual.npy     # (T, n_ally) 消融用 hybrid
   done.npy, truncation.npy, is_win.npy
@@ -129,7 +131,8 @@ record-XXXXXX/agent_centric/{ally_key}/
   obs_dynamic.npy
   obs_dynamic_mask.npy
   behavior_action.npy
-  reference_action.npy
+  reference_action.npy                 # hard argmax of oracle
+  reference_action_distribution.npy    # (T, A) oracle softmax; KL soft target
   reward_team.npy
   reward_individual.npy
   done.npy

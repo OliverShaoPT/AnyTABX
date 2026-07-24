@@ -15,6 +15,7 @@ ZONE_FEATURE_DIM = 6
 ENV_CENTRIC_ARRAYS = (
     "actions_behavior",
     "actions_reference",
+    "actions_reference_distribution",
     "reward_team",
     "reward_individual",
     "done",

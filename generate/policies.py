@@ -92,6 +92,31 @@ class SharedAllyPolicy:
         }
 
 
+def reference_labels(
+    oracle: OracleCoach,
+    *,
+    obs_by_agent: dict[str, Any],
+    avail_by_agent: dict[str, Any],
+    ally_keys: list[str],
+) -> tuple[dict[str, jnp.ndarray], np.ndarray]:
+    """Hard + soft oracle labels from one forward pass.
+
+    Returns:
+      actions: dict agent -> int32 scalar
+      distribution: (n_ally, action_dim) float32, HVAC-style soft KL target
+    """
+
+    obs = np.stack([np.asarray(obs_by_agent[a], dtype=np.float32) for a in ally_keys], axis=0)
+    avail = np.stack([np.asarray(avail_by_agent[a], dtype=bool) for a in ally_keys], axis=0)
+    dist = oracle.action_distribution(obs, avail)
+    flat = np.argmax(dist, axis=-1).astype(np.int32)
+    actions = {
+        agent: jnp.asarray(flat[i], dtype=jnp.int32).reshape(())
+        for i, agent in enumerate(ally_keys)
+    }
+    return actions, dist
+
+
 def reference_actions(
     oracle: OracleCoach,
     *,
@@ -100,10 +125,29 @@ def reference_actions(
     avail_by_agent: dict[str, Any],
     ally_keys: list[str],
 ) -> dict[str, jnp.ndarray]:
-    obs = np.stack([np.asarray(obs_by_agent[a], dtype=np.float32) for a in ally_keys], axis=0)
-    avail = np.stack([np.asarray(avail_by_agent[a], dtype=bool) for a in ally_keys], axis=0)
-    flat = oracle.act(obs, avail, key=key, epsilon=0.0)
-    return {
-        agent: jnp.asarray(flat[i], dtype=jnp.int32).reshape(())
-        for i, agent in enumerate(ally_keys)
-    }
+    del key  # greedy reference; kept for call-site compatibility
+    actions, _ = reference_labels(
+        oracle,
+        obs_by_agent=obs_by_agent,
+        avail_by_agent=avail_by_agent,
+        ally_keys=ally_keys,
+    )
+    return actions
+
+
+def reference_action_distribution(
+    oracle: OracleCoach,
+    *,
+    obs_by_agent: dict[str, Any],
+    avail_by_agent: dict[str, Any],
+    ally_keys: list[str],
+) -> np.ndarray:
+    """Oracle soft labels for KL. Shape (n_ally, action_dim)."""
+
+    _, dist = reference_labels(
+        oracle,
+        obs_by_agent=obs_by_agent,
+        avail_by_agent=avail_by_agent,
+        ally_keys=ally_keys,
+    )
+    return dist

@@ -41,6 +41,41 @@ class OracleCoach:
     params: Any
     apply_fn: Any
 
+    def _masked_scores(
+        self,
+        obs: np.ndarray | jax.Array,
+        avail: np.ndarray | jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Return (masked logits-or-Q, avail) with batch dim. Shape (A, action_dim)."""
+
+        obs_j = jnp.asarray(obs, dtype=jnp.float32)
+        avail_j = jnp.asarray(avail, dtype=bool)
+        if obs_j.ndim == 1:
+            obs_j = obs_j[None]
+            avail_j = avail_j[None]
+
+        if self.family == "ppo":
+            # PolicyNetwork already masks unavailable actions with -1e10.
+            scores = self.apply_fn(self.params, obs_j, avail_j)
+        else:
+            q_values = self.apply_fn(self.params, obs_j)
+            scores = jnp.where(avail_j, q_values, -1e10)
+        return scores, avail_j
+
+    def action_distribution(
+        self,
+        obs: np.ndarray | jax.Array,
+        avail: np.ndarray | jax.Array,
+        *,
+        temperature: float = 1.0,
+    ) -> np.ndarray:
+        """Soft action probs for KL targets. Shape (A, action_dim), sums to 1 on avail."""
+
+        scores, _ = self._masked_scores(obs, avail)
+        temp = max(float(temperature), 1e-6)
+        probs = jax.nn.softmax(scores / temp, axis=-1)
+        return np.asarray(probs, dtype=np.float32)
+
     def act(
         self,
         obs: np.ndarray | jax.Array,
@@ -51,19 +86,8 @@ class OracleCoach:
     ) -> np.ndarray:
         """Return actions for a batch of agents. obs/avail: (A, ...)."""
 
-        obs_j = jnp.asarray(obs, dtype=jnp.float32)
-        avail_j = jnp.asarray(avail, dtype=bool)
-        if obs_j.ndim == 1:
-            obs_j = obs_j[None]
-            avail_j = avail_j[None]
-
-        if self.family == "ppo":
-            logits = self.apply_fn(self.params, obs_j, avail_j)
-            greedy = jnp.argmax(logits, axis=-1)
-        else:
-            q_values = self.apply_fn(self.params, obs_j)
-            q_values = jnp.where(avail_j, q_values, -1e10)
-            greedy = jnp.argmax(q_values, axis=-1)
+        scores, avail_j = self._masked_scores(obs, avail)
+        greedy = jnp.argmax(scores, axis=-1)
 
         if epsilon <= 0.0 or key is None:
             return np.asarray(greedy, dtype=np.int32)
