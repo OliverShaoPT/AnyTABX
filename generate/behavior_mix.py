@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -29,6 +30,33 @@ DEFAULT_BEHAVIOR_MIX: tuple[BehaviorSpec, ...] = (
     BehaviorSpec(6, "oracle_eps0.1", "oracle_eps", 0.12, epsilon=0.1),
     BehaviorSpec(7, "oracle_pure", "oracle", 0.10, epsilon=0.0),
 )
+
+
+def behavior_mix_from_config(entries: Sequence[dict[str, Any]] | None) -> tuple[BehaviorSpec, ...]:
+    """Build a behavior mix from YAML/JSON dict entries."""
+
+    if not entries:
+        return DEFAULT_BEHAVIOR_MIX
+    mix: list[BehaviorSpec] = []
+    for index, entry in enumerate(entries):
+        kind = str(entry["kind"])
+        if kind not in {"heuristic", "oracle", "oracle_eps"}:
+            raise ValueError(f"Unknown behavior kind: {kind!r}")
+        mix.append(
+            BehaviorSpec(
+                policy_id=int(entry.get("policy_id", index)),
+                name=str(entry.get("name", f"policy_{index}")),
+                kind=kind,
+                weight=float(entry["weight"]),
+                heuristic=entry.get("heuristic"),
+                epsilon=None if entry.get("epsilon") is None else float(entry["epsilon"]),
+            )
+        )
+    if not mix:
+        raise ValueError("behavior_mix must not be empty")
+    if sum(spec.weight for spec in mix) <= 0:
+        raise ValueError("behavior mix weights must be positive")
+    return tuple(mix)
 
 
 @dataclass

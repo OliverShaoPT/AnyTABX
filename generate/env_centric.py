@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
+import random
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from generate.behavior_mix import BehaviorSwitcher, DEFAULT_BEHAVIOR_MIX
+from generate.behavior_mix import (
+    BehaviorSwitcher,
+    DEFAULT_BEHAVIOR_MIX,
+    BehaviorSpec,
+    behavior_mix_from_config,
+)
 from generate.dump_schema import ensure_dir, write_env_centric_record
 from generate.oracle_loader import load_oracle_coach
 from generate.policies import SharedAllyPolicy, reference_labels
@@ -22,6 +29,29 @@ from src.tabx import TABX
 from src.tabx.sample_task import build_batched_env_params_from_tasks
 from src.tabx.wrappers.individual_reward import IndividualRewardConfig, compute_shaped_rewards
 from src.tabx.wrappers.wrappers import TABXEnemyHeuristicWrapper
+
+
+def sample_record_seed(explicit: int | None = None, *, salt: int = 0) -> int:
+    """Sample a per-record seed from wall-clock time and process id.
+
+    Matches the requested formula::
+
+        seed = int(time.time() * 1000) % (2**32 - 1) + pid
+
+    ``salt`` (typically ``record_id``) avoids collisions when multiple records
+    are generated in the same millisecond by one process. Pass ``explicit`` to
+    override for reproducible debugging.
+    """
+
+    if explicit is not None:
+        seed = int(explicit)
+    else:
+        pid = os.getpid()
+        seed = int(time.time() * 1000) % (2**32 - 1) + pid + int(salt)
+    # Keep Python/NumPy global RNGs aligned with the sampled seed.
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    return seed
 
 
 def _to_numpy(x: Any) -> np.ndarray:
@@ -92,10 +122,13 @@ def generate_one_record(
     record_id: int,
     output_root: Path,
     total_timesteps: int,
-    seed: int,
+    seed: int | None,
     min_behavior_steps: int,
     behavior_switch_prob: float,
+    behavior_mix: tuple[BehaviorSpec, ...] | None = None,
 ) -> Path:
+    seed = sample_record_seed(seed, salt=record_id)
+    mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
     env, env_params, task, manifest = build_env_and_params(package)
     ally_keys = list(env.agents)
     unit_keys = list(env.unit_keys)
@@ -105,16 +138,16 @@ def generate_one_record(
 
     oracle = load_oracle_coach(package.oracle_dir, obs_dim=obs_dim, action_dim=action_dim)
     switcher = BehaviorSwitcher(
-        mix=DEFAULT_BEHAVIOR_MIX,
+        mix=mix,
         min_behavior_steps=min_behavior_steps,
         behavior_switch_prob=behavior_switch_prob,
-        rng=np.random.default_rng(seed + record_id),
+        rng=np.random.default_rng(seed),
     )
     indiv_cfg = IndividualRewardConfig()
     # heuristic_policy parses obs with total unit count (allies + enemies).
     n_units_total = len(unit_keys)
 
-    key = jax.random.key(seed + 17 * record_id)
+    key = jax.random.key(seed % (2**32))
     key, reset_key = jax.random.split(key)
     obs, state = env.reset(reset_key, env_params)
 
@@ -302,7 +335,7 @@ def generate_one_record(
         "behavior_switch_prob": behavior_switch_prob,
         "shared_ally_policy": True,
         "individual_reward_config": asdict(indiv_cfg),
-        "behavior_mix": [asdict(s) for s in DEFAULT_BEHAVIOR_MIX],
+        "behavior_mix": [asdict(s) for s in mix],
         "oracle": {
             "algorithm": oracle.algorithm,
             "ckpt": str(package.oracle_ckpt),
@@ -365,7 +398,7 @@ def run_parallel(
     records_per_task: int,
     start_index: int,
     workers: int,
-    seed: int,
+    seed: int | None,
     min_behavior_steps: int,
     behavior_switch_prob: float,
     task_filter: list[int] | None = None,
@@ -411,7 +444,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--records_per_task", type=int, default=1)
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional fixed seed for reproducibility. Default: sample from time+pid per record.",
+    )
     parser.add_argument("--min_behavior_steps", type=int, default=64)
     parser.add_argument("--behavior_switch_prob", type=float, default=0.2)
     parser.add_argument(

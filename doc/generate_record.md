@@ -53,8 +53,14 @@ python -m generate.env_centric \
   --records_per_task 2 \
   --workers 4 \
   --min_behavior_steps 64 \
-  --behavior_switch_prob 0.2 \
-  --seed 0
+  --behavior_switch_prob 0.2
+```
+
+默认每条 record 用 `time + pid` 采样 seed（写入 `meta.json`）。需要复现时再加 `--seed <int>`。
+
+```bash
+# optional reproducibility
+python -m generate.env_centric ... --seed 0
 ```
 
 ### 3.1 Behavior / Reference
@@ -113,7 +119,26 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
   unit_*.npy                # 全局单位快照
 ```
 
-并行：按 task package 分 worker；子进程默认 `JAX_PLATFORMS=cpu`。
+并行：改配置后一键启动（均匀分 task、预分配 `record-*`、CPU/GPU）：
+
+```bash
+# 编辑 generate/configs/record_gen.yaml，然后：
+./generate/generate_records.sh
+
+# 或指定另一份配置：
+./generate/generate_records.sh generate/configs/my_run.yaml
+```
+
+配置里已包含：`task_bank` / `ckpt_root` / `task_packages_root` / `output_root`、
+`total_records` / `total_timesteps`、`device` / `gpu_ids` / `workers_per_gpu`、
+`behavior_mix` 等。
+
+- `total_records` 在 tasks 间均分（100 task × 1000 record → 每 task 10 条）。
+- Worker 按 `record_id % n_workers` 分片（worker0: `record-000000,000004,…`）。
+- 启动前预创建全部 `record-XXXXXX/` 目录。
+- 也可用 `python -m generate.parallel_records --config ...`。
+
+旧入口 `python -m generate.env_centric` 仍可用；子进程默认 `JAX_PLATFORMS=cpu`。
 
 ---
 
@@ -169,7 +194,11 @@ record-XXXXXX/agent_centric/{ally_key}/
 | 模块 | 作用 |
 |---|---|
 | `generate/pack_task_packages.py` | bank + ckpt → task packages |
-| `generate/env_centric.py` | Step 1 并行采集 |
+| `generate/configs/record_gen.yaml` | 全部生产参数（路径、产量、设备、behavior 比例） |
+| `generate/parallel_records.py` | 均匀分片 + CPU/GPU 并行编排 |
+| `generate/record_worker.py` | spawn worker（先设 CUDA 再 import JAX） |
+| `generate/generate_records.sh` | 加载 config 一键启动 |
+| `generate/env_centric.py` | Step 1 单条/旧并行采集 |
 | `generate/agent_centric.py` | Step 2 拆分 |
 | `generate/behavior_mix.py` | 加权 mix + 冷却切换 |
 | `generate/oracle_loader.py` | 加载 safetensors coach |

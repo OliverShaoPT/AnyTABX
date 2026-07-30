@@ -1,0 +1,85 @@
+# Parallel env-centric record generation.
+# Launch: ./generate/generate_records.sh
+# Or:     ./generate/generate_records.sh path/to/other.yaml
+
+# --- I/O ---
+# If task_packages_root has no task_* yet and task_bank+ckpt_root are set,
+# packages are packed automatically before generation.
+task_bank: ./task_outputs/tasks_20.json
+ckpt_root: ./ckpt/marl_baseline
+task_packages_root: ./data/task_packages
+algorithm: mappo              # used when packing packages
+pack_seed: null               # optional ckpt seed filter when packing
+output_root: ./data/records
+task_index: null              # e.g. [0, 1, 2]; null = all tasks in packages
+
+# --- Volume (even split across tasks) ---
+# records_per_task = total_records // n_tasks
+# Require divisible unless allow_uneven is true.
+total_records: 1000
+total_timesteps: 4096
+start_index: 0                # first record id per task → record-000000
+allow_uneven: false           # leftover records go to the first tasks if true
+
+# --- Parallelism ---
+# device: cpu | gpu
+device: gpu
+cpu_workers: 8                # used when device=cpu
+# GPU: n_workers = len(gpu_ids) * workers_per_gpu
+# Worker w owns ids where (record_id - start_index) % n_workers == w
+# e.g. 4 workers → 0,4,8… / 1,5,9… / 2,6,… / 3,7,…
+gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+workers_per_gpu: 8
+jax_platform: cuda            # JAX_PLATFORMS for GPU workers
+
+# --- RNG ---
+# null → per-record time+pid sampling (generate.env_centric.sample_record_seed)
+seed: null
+
+# --- Behavior switching ---
+min_behavior_steps: 64
+behavior_switch_prob: 0.2
+
+# --- Behavior policy mixture (weights renormalized) ---
+behavior_mix:
+  - policy_id: 0
+    name: heuristic_random
+    kind: heuristic
+    weight: 0.12
+    heuristic: random
+  - policy_id: 1
+    name: heuristic_novice
+    kind: heuristic
+    weight: 0.14
+    heuristic: novice
+  - policy_id: 2
+    name: heuristic_medium
+    kind: heuristic
+    weight: 0.16
+    heuristic: medium
+  - policy_id: 3
+    name: heuristic_advanced
+    kind: heuristic
+    weight: 0.12
+    heuristic: advanced
+  - policy_id: 4
+    name: heuristic_medium_eps0.5
+    kind: heuristic
+    weight: 0.10
+    heuristic: medium
+    epsilon: 0.5
+  - policy_id: 5
+    name: oracle_eps0.3
+    kind: oracle_eps
+    weight: 0.14
+    epsilon: 0.3
+  - policy_id: 6
+    name: oracle_eps0.1
+    kind: oracle_eps
+    weight: 0.12
+    epsilon: 0.1
+  - policy_id: 7
+    name: oracle_pure
+    kind: oracle
+    weight: 0.10
+    epsilon: 0.0
