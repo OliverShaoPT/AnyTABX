@@ -119,7 +119,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
   unit_*.npy                # 全局单位快照
 ```
 
-并行：改配置后一键启动（均匀分 task、预分配 `record-*`、CPU/GPU）：
+并行：改配置后一键启动（均匀分 task、CPU/GPU）：
 
 ```bash
 # 编辑 generate/configs/record_gen.yaml，然后：
@@ -135,7 +135,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 
 - `total_records` 在 tasks 间均分（100 task × 1000 record → 每 task 10 条）。
 - Worker 按 `record_id % n_workers` 分片（worker0: `record-000000,000004,…`）。
-- 启动前预创建全部 `record-XXXXXX/` 目录。
+- 目录在 **写完一条 record 落盘时** 再创建（不预建空文件夹）。
 - 也可用 `python -m generate.parallel_records --config ...`。
 
 旧入口 `python -m generate.env_centric` 仍可用；子进程默认 `JAX_PLATFORMS=cpu`。

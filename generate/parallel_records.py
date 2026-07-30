@@ -104,26 +104,6 @@ def stripe_record_ids(
     ]
 
 
-def preallocate_record_dirs(
-    output_root: Path,
-    packages: list[Any],
-    counts: list[int],
-    start_index: int,
-) -> list[Path]:
-    """Create empty record-* directories before workers start."""
-
-    created: list[Path] = []
-    for package, count in zip(packages, counts):
-        safe_id = package.task_id.replace("/", "_")
-        task_dir = output_root / f"task_{package.task_index:05d}_{safe_id}"
-        task_dir.mkdir(parents=True, exist_ok=True)
-        for record_id in range(start_index, start_index + count):
-            record_dir = task_dir / f"record-{record_id:06d}"
-            record_dir.mkdir(parents=True, exist_ok=True)
-            created.append(record_dir)
-    return created
-
-
 def plan_jobs(
     *,
     packages_root: Path,
@@ -219,7 +199,6 @@ def run_from_config(config: dict[str, Any]) -> None:
     )
 
     ensure_dir(output_root)
-    created = preallocate_record_dirs(output_root, packages, counts, start_index)
     jobs = plan_jobs(
         packages_root=packages_root,
         output_root=output_root,
@@ -238,8 +217,7 @@ def run_from_config(config: dict[str, Any]) -> None:
     print(
         f"[parallel_records] tasks={len(packages)} total_records={total_records} "
         f"per_task={counts[0] if len(set(counts)) == 1 else counts} "
-        f"workers={len(slots)} device={slots[0].device} "
-        f"preallocated_dirs={len(created)} jobs={len(jobs)}",
+        f"workers={len(slots)} device={slots[0].device} jobs={len(jobs)}",
         flush=True,
     )
     for slot in slots:
