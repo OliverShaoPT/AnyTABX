@@ -284,7 +284,15 @@ def generate_one_record(
             obs, state = env.reset(reset_key, env_params)
             episode_id += 1
             is_reset_step = True
-            # Keep shared policy across reset (cooldown still governs switches).
+            # Every episode reset resamples the shared behavior policy.
+            spec = switcher.force_sample()
+            shared = SharedAllyPolicy.from_spec(
+                spec,
+                oracle=oracle,
+                ally_keys=ally_keys,
+                n_agents=n_units_total,
+                max_n_zone=env.max_n_zone,
+            )
 
     arrays = {
         "actions_behavior": np.stack(buffers["actions_behavior"], axis=0),

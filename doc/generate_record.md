@@ -84,7 +84,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `--min_behavior_steps` | 64 | 至少连续这么多步才允许切换 |
 | `--behavior_switch_prob` | 0.2 | 冷却满足后，每步以该概率重采样 |
 
-默认 **reset 不强制换 policy**（仍受冷却约束）。
+默认 **每次 env reset 都会强制重采样** behavior policy；同一 episode 内仍受冷却约束（`min_behavior_steps` + `behavior_switch_prob`）。
 
 ### 3.4 总 timestep + 多次 reset
 
