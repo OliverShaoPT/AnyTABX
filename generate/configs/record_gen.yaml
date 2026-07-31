@@ -3,23 +3,20 @@
 # Or:     ./generate/generate_records.sh path/to/other.yaml
 
 # --- I/O ---
-# If task_packages_root has no task_* yet and task_bank+ckpt_root are set,
-# packages are packed automatically before generation.
-task_bank: ./task_outputs/tasks_20.json
-ckpt_root: ./ckpt/marl_baseline
-task_packages_root: ./data/task_packages
-algorithm: mappo              # used when packing packages
-pack_seed: null               # optional ckpt seed filter when packing
+# Single root: recursively find coach leaves that each contain
+#   task.json + config.json + best/final.safetensors
+# (written by marl_baseline / train_parallel).
+coach_root: ./ckpt/marl_baseline
+# Optional: keep only leaves whose meta.json seed matches.
+coach_seed: null
 output_root: ./data/records
-task_index: null              # e.g. [0, 1, 2]; null = all tasks in packages
+task_index: null              # e.g. [0, 1, 2]; null = all discovered tasks
 
 # --- Volume (even split across tasks) ---
-# records_per_task = total_records // n_tasks
-# Require divisible unless allow_uneven is true.
+# Everyone gets total_records // n_tasks; remainder (+1) goes to the first tasks.
 total_records: 1000
-total_timesteps: 4096
+total_timesteps: 3000
 start_index: 0                # first record id per task → record-000000
-allow_uneven: false           # leftover records go to the first tasks if true
 
 # --- Parallelism ---
 # device: cpu | gpu

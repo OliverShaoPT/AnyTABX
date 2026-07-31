@@ -446,7 +446,18 @@ def run_parallel(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Generate env-centric TABX records")
-    parser.add_argument("--task_packages_root", type=str, required=True)
+    parser.add_argument(
+        "--coach_root",
+        type=str,
+        default=None,
+        help="Root of self-contained coach leaves (task.json + safetensors)",
+    )
+    parser.add_argument(
+        "--task_packages_root",
+        type=str,
+        default=None,
+        help="Alias for --coach_root (legacy name)",
+    )
     parser.add_argument("--output_root", type=str, required=True)
     parser.add_argument("--total_timesteps", type=int, default=512)
     parser.add_argument("--records_per_task", type=int, default=1)
@@ -468,8 +479,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional subset of task indices",
     )
     args = parser.parse_args(argv)
+    coach_root = args.coach_root or args.task_packages_root
+    if not coach_root:
+        parser.error("one of --coach_root / --task_packages_root is required")
     run_parallel(
-        task_packages_root=Path(args.task_packages_root),
+        task_packages_root=Path(coach_root),
         output_root=Path(args.output_root),
         total_timesteps=args.total_timesteps,
         records_per_task=args.records_per_task,

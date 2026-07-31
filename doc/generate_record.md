@@ -17,29 +17,27 @@
 
 ---
 
-## 2. Task Package 输入
+## 2. Coach root 输入（单路径）
 
-每个 task 一个子目录：
+`marl_baseline` / `train_parallel` 每个 task 的训练叶子目录自带 task + RL：
 
 ```text
-{task_packages_root}/task_{index:05d}_{task_id}/
-  task.json                 # mini task bank（schema_version=1.0，tasks 长度 1）
-  oracle/
-    config.json             # 含 algorithm, HIDDEN_SIZE, …
-    best.safetensors        # 或 final.safetensors
-  meta.json                 # 可选
+{coach_root}/.../{algorithm}/task-{index:06d}-{task_id}/seed-{seed}/
+  task.json                 # mini task bank（tasks 长度 1）
+  meta.json                 # task_index / task_id / seed / algorithm
+  config.json
+  best.safetensors
+  final.safetensors
 ```
 
-从现有 task bank + `train_parallel` / `marl_baseline` ckpt 树打包：
+Generate record **只需要** `coach_root`：递归发现上述叶子，每个子文件夹对应一个环境。
 
 ```bash
-python -m generate.pack_task_packages \
-  --task_bank task_outputs/tasks_20.json \
-  --ckpt_root ./ckpt/marl_baseline \
-  --output_root ./data/task_packages \
-  --algorithm mappo \
-  --seed 0
+# 编辑 generate/configs/record_gen.yaml 里的 coach_root，然后：
+./generate/generate_records.sh
 ```
+
+旧版「先 pack 再生成」仍可用：提供 `task_bank` + `ckpt_root`，并在空的 `coach_root`/`task_packages_root` 下自动打包（`python -m generate.pack_task_packages`）。
 
 ---
 
@@ -47,7 +45,7 @@ python -m generate.pack_task_packages \
 
 ```bash
 python -m generate.env_centric \
-  --task_packages_root ./data/task_packages \
+  --task_packages_root ./ckpt/marl_baseline \
   --output_root ./data/records \
   --total_timesteps 4096 \
   --records_per_task 2 \
@@ -55,6 +53,8 @@ python -m generate.env_centric \
   --min_behavior_steps 64 \
   --behavior_switch_prob 0.2
 ```
+
+（`--task_packages_root` 可直接指向 `coach_root`。）
 
 默认每条 record 用 `time + pid` 采样 seed（写入 `meta.json`）。需要复现时再加 `--seed <int>`。
 
@@ -129,14 +129,21 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 ./generate/generate_records.sh generate/configs/my_run.yaml
 ```
 
-配置里已包含：`task_bank` / `ckpt_root` / `task_packages_root` / `output_root`、
+配置里已包含：`coach_root` / `output_root`、
 `total_records` / `total_timesteps`、`device` / `gpu_ids` / `workers_per_gpu`、
 `behavior_mix` 等。
 
-- `total_records` 在 tasks 间均分（100 task × 1000 record → 每 task 10 条）。
+- `total_records` 在 tasks 间均分（`// n_tasks`，余数补给前面的 task）。
 - Worker 按 `record_id % n_workers` 分片（worker0: `record-000000,000004,…`）。
 - 目录在 **写完一条 record 落盘时** 再创建（不预建空文件夹）。
 - 也可用 `python -m generate.parallel_records --config ...`。
+
+进度监控：
+
+- 终端进度条：`completed/total`、`rec/s`、`ETA`、最近完成的 worker/task/record。
+- 快照：`{output_root}/generation_progress.json`（可 `watch -n 2 cat ...`）。
+- 明细：`{output_root}/generation_progress.jsonl`（每完成一条追加一行）。
+- 结束时打印 summary（elapsed / rate / status）。
 
 旧入口 `python -m generate.env_centric` 仍可用；子进程默认 `JAX_PLATFORMS=cpu`。
 
@@ -193,8 +200,8 @@ record-XXXXXX/agent_centric/{ally_key}/
 
 | 模块 | 作用 |
 |---|---|
-| `generate/pack_task_packages.py` | bank + ckpt → task packages |
-| `generate/configs/record_gen.yaml` | 全部生产参数（路径、产量、设备、behavior 比例） |
+| `generate/pack_task_packages.py` | （legacy）bank + ckpt → packages |
+| `generate/configs/record_gen.yaml` | 全部生产参数（`coach_root`、产量、设备、behavior） |
 | `generate/parallel_records.py` | 均匀分片 + CPU/GPU 并行编排 |
 | `generate/record_worker.py` | spawn worker（先设 CUDA 再 import JAX） |
 | `generate/generate_records.sh` | 加载 config 一键启动 |

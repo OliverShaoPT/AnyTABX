@@ -1,4 +1,22 @@
-"""Discover and pack per-task packages (task.json + oracle checkpoint)."""
+"""Discover and pack per-task packages (task.json + oracle checkpoint).
+
+Preferred layout (written by ``marl_baseline``): each coach run leaf is
+self-contained::
+
+    {coach_root}/.../task-000000-<id>/seed-<seed>/
+      task.json
+      meta.json
+      config.json
+      best.safetensors
+      final.safetensors
+
+Legacy packed layout still works::
+
+    {root}/task_00000_<id>/
+      task.json
+      oracle/{config.json, best.safetensors}
+      meta.json
+"""
 
 from __future__ import annotations
 
@@ -15,6 +33,7 @@ from src.tabx.sample_task import load_task_bank, save_task_bank
 @dataclass(frozen=True)
 class TaskPackage:
     path: Path
+    root: Path
     task_index: int
     task_id: str
     task_json: Path
@@ -24,7 +43,10 @@ class TaskPackage:
 
     @property
     def name(self) -> str:
-        return self.path.name
+        """Unique id under ``root`` (stable for worker lookup / jobs)."""
+
+        rel = self.path.resolve().relative_to(self.root.resolve())
+        return "__".join(rel.parts) if rel.parts else self.path.name
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -42,34 +64,78 @@ def _find_ckpt(oracle_dir: Path) -> Path:
     return matches[0]
 
 
-def discover_task_packages(root: str | Path) -> list[TaskPackage]:
-    """Scan ``root`` for task packages with task.json + oracle/."""
+def _oracle_dir_for(path: Path) -> Path | None:
+    """Return directory that holds coach weights + config, if any."""
+
+    nested = path / "oracle"
+    if nested.is_dir() and (
+        list(nested.glob("*.safetensors")) or (nested / "config.json").exists()
+    ):
+        return nested
+    if list(path.glob("*.safetensors")):
+        return path
+    return None
+
+
+def _is_package_leaf(path: Path) -> bool:
+    return (path / "task.json").is_file() and _oracle_dir_for(path) is not None
+
+
+def _iter_package_dirs(root: Path) -> Iterator[Path]:
+    """Yield self-contained package directories under ``root`` (recursive)."""
+
+    # Prefer deeper leaves: skip a dir if a descendant is also a package leaf.
+    candidates = [
+        path
+        for path in sorted(root.rglob("task.json"))
+        if path.is_file() and _is_package_leaf(path.parent)
+    ]
+    dirs = [path.parent.resolve() for path in candidates]
+    for directory in dirs:
+        if any(
+            other != directory and directory in other.parents for other in dirs
+        ):
+            continue
+        yield directory
+
+
+def discover_task_packages(
+    root: str | Path,
+    *,
+    seed: int | None = None,
+) -> list[TaskPackage]:
+    """Scan ``root`` for self-contained task+coach packages."""
 
     root = Path(root)
     if not root.is_dir():
-        raise FileNotFoundError(f"task_packages_root not found: {root}")
+        raise FileNotFoundError(f"coach_root / task_packages_root not found: {root}")
 
     packages: list[TaskPackage] = []
-    for path in sorted(root.iterdir()):
-        if not path.is_dir():
-            continue
+    for path in _iter_package_dirs(root):
         task_json = path / "task.json"
-        oracle_dir = path / "oracle"
-        if not task_json.exists() or not oracle_dir.is_dir():
-            continue
+        oracle_dir = _oracle_dir_for(path)
+        assert oracle_dir is not None
         meta_path = path / "meta.json"
         meta = _read_json(meta_path) if meta_path.exists() else {}
+        if seed is not None:
+            meta_seed = meta.get("seed")
+            if meta_seed is not None and int(meta_seed) != int(seed):
+                continue
+            # Flat coach leaf named seed-N / nested seed dir.
+            if meta_seed is None and f"seed-{seed}" not in path.name and f"seed_{seed}" not in str(path):
+                continue
         bank = _read_json(task_json)
         tasks = bank.get("tasks") or [bank]
         task = tasks[0]
         task_id = str(meta.get("task_id") or task.get("task_id") or path.name)
-        task_index = int(meta.get("task_index", _infer_index(path.name)))
+        task_index = int(meta.get("task_index", _infer_index_from_path(path)))
         config_path = oracle_dir / "config.json"
         if not config_path.exists():
             raise FileNotFoundError(f"Missing oracle config: {config_path}")
         packages.append(
             TaskPackage(
                 path=path,
+                root=root,
                 task_index=task_index,
                 task_id=task_id,
                 task_json=task_json,
@@ -79,14 +145,19 @@ def discover_task_packages(root: str | Path) -> list[TaskPackage]:
             )
         )
     if not packages:
-        raise FileNotFoundError(f"No valid task packages under {root}")
+        raise FileNotFoundError(
+            f"No valid task packages under {root} "
+            "(need task.json + *.safetensors, or task.json + oracle/)"
+        )
+    packages.sort(key=lambda package: (package.task_index, package.name))
     return packages
 
 
-def _infer_index(name: str) -> int:
-    match = re.search(r"task[_-]?(\d+)", name)
-    if match:
-        return int(match.group(1))
+def _infer_index_from_path(path: Path) -> int:
+    for part in reversed(path.parts):
+        match = re.search(r"task[_-](\d+)", part)
+        if match:
+            return int(match.group(1))
     return 0
 
 
@@ -168,7 +239,12 @@ def pack_task_packages(
     seed: int | None = None,
     task_indices: list[int] | None = None,
 ) -> list[Path]:
-    """Pack each task + matching oracle ckpt into a task package directory."""
+    """Pack each task + matching oracle ckpt into a task package directory.
+
+    Legacy helper for ckpt trees that were trained before ``task.json`` was
+    written next to weights. Prefer pointing generate-record at ``coach_root``
+    directly when trainers already emit self-contained leaves.
+    """
 
     bank = load_task_bank(task_bank_path)
     ckpt_root = Path(ckpt_root)
@@ -208,9 +284,15 @@ def pack_task_packages(
         for item in oracle_src.iterdir():
             if item.is_file() and (
                 item.suffix == ".safetensors"
-                or item.name in {"config.json", "trainer_config.json"}
+                or item.name in {"config.json", "trainer_config.json", "task.json", "meta.json"}
             ):
                 shutil.copy2(item, oracle_dst / item.name)
+
+        # Also keep flat copies at package root for the preferred layout.
+        for name in ("task.json", "meta.json"):
+            src = oracle_src / name
+            if src.exists() and not (pkg_dir / name).exists():
+                shutil.copy2(src, pkg_dir / name)
 
         config_dst = oracle_dst / "config.json"
         if not config_dst.exists():

@@ -5,13 +5,50 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import queue as queue_mod
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from generate.dump_schema import ensure_dir
+from generate.progress import LocalQueue, ProgressTracker
 from generate.record_worker import worker_main
 from generate.task_package import discover_task_packages, pack_task_packages
+
+
+def _planned_record_count(jobs: list[dict[str, Any]]) -> int:
+    return sum(len(item["record_ids"]) for job in jobs for item in job["items"])
+
+
+def _attach_progress_queue(
+    jobs: list[dict[str, Any]], queue: Any
+) -> list[dict[str, Any]]:
+    attached: list[dict[str, Any]] = []
+    for job in jobs:
+        payload = dict(job)
+        payload["progress_queue"] = queue
+        attached.append(payload)
+    return attached
+
+
+def _drain_progress_queue(
+    queue: Any, tracker: ProgressTracker, stop: threading.Event
+) -> None:
+    while not stop.is_set():
+        try:
+            event = queue.get(timeout=0.2)
+        except queue_mod.Empty:
+            continue
+        tracker.handle(event)
+    # Final drain after workers finish.
+    while True:
+        try:
+            event = queue.get_nowait()
+        except queue_mod.Empty:
+            break
+        tracker.handle(event)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -66,24 +103,18 @@ def build_worker_slots(
     raise ValueError(f"Unsupported device: {device!r} (expected cpu|gpu)")
 
 
-def even_records_per_task(
-    total_records: int,
-    n_tasks: int,
-    *,
-    allow_uneven: bool = False,
-) -> list[int]:
-    """Return per-task record counts that sum to total_records."""
+def even_records_per_task(total_records: int, n_tasks: int) -> list[int]:
+    """Return per-task record counts that sum to total_records.
+
+    Everyone gets ``total_records // n_tasks``; the remainder is given one-by-one
+    to the first tasks.
+    """
 
     if total_records <= 0:
         raise ValueError("total_records must be positive")
     if n_tasks <= 0:
         raise ValueError("n_tasks must be positive")
     base, rem = divmod(total_records, n_tasks)
-    if rem and not allow_uneven:
-        raise ValueError(
-            f"total_records={total_records} is not divisible by n_tasks={n_tasks}. "
-            "Adjust total_records, or set allow_uneven: true."
-        )
     return [base + (1 if i < rem else 0) for i in range(n_tasks)]
 
 
@@ -156,14 +187,18 @@ def plan_jobs(
 
 
 def run_from_config(config: dict[str, Any]) -> None:
-    packages_root = Path(config["task_packages_root"])
+    coach_root = config.get("coach_root") or config.get("task_packages_root")
+    if not coach_root:
+        raise ValueError("coach_root (or legacy task_packages_root) is required")
+    packages_root = Path(coach_root)
     output_root = Path(config["output_root"])
     task_bank = config.get("task_bank")
     ckpt_root = config.get("ckpt_root")
 
+    # Legacy: pack bank + ckpt tree into packages_root when empty.
     if task_bank and ckpt_root:
         packages_root.mkdir(parents=True, exist_ok=True)
-        if not any(packages_root.glob("task_*")):
+        if not any(packages_root.rglob("task.json")):
             print(
                 f"[parallel_records] packing packages from {task_bank} → {packages_root}",
                 flush=True,
@@ -176,7 +211,10 @@ def run_from_config(config: dict[str, Any]) -> None:
                 seed=config.get("pack_seed"),
             )
 
-    packages = discover_task_packages(packages_root)
+    packages = discover_task_packages(
+        packages_root,
+        seed=config.get("coach_seed", config.get("pack_seed")),
+    )
     task_filter = config.get("task_index")
     if task_filter is not None:
         allowed = set(int(x) for x in task_filter)
@@ -185,11 +223,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         raise RuntimeError("No task packages to generate")
 
     total_records = int(config["total_records"])
-    counts = even_records_per_task(
-        total_records,
-        len(packages),
-        allow_uneven=bool(config.get("allow_uneven", False)),
-    )
+    counts = even_records_per_task(total_records, len(packages))
     start_index = int(config.get("start_index", 0))
     slots = build_worker_slots(
         device=str(config.get("device", "cpu")),
@@ -214,10 +248,17 @@ def run_from_config(config: dict[str, Any]) -> None:
         jax_platform=str(config.get("jax_platform", "cuda")),
     )
 
+    planned = _planned_record_count(jobs)
     print(
         f"[parallel_records] tasks={len(packages)} total_records={total_records} "
+        f"planned={planned} "
         f"per_task={counts[0] if len(set(counts)) == 1 else counts} "
         f"workers={len(slots)} device={slots[0].device} jobs={len(jobs)}",
+        flush=True,
+    )
+    print(
+        f"[parallel_records] progress → {output_root / 'generation_progress.json'} "
+        f"(jsonl: generation_progress.jsonl)",
         flush=True,
     )
     for slot in slots:
@@ -232,15 +273,42 @@ def run_from_config(config: dict[str, Any]) -> None:
             flush=True,
         )
 
-    if len(slots) <= 1:
-        for job in jobs:
-            worker_main(job)
-        return
+    tracker = ProgressTracker(total=planned, output_root=output_root)
+    status = "done"
+    try:
+        if len(jobs) <= 1:
+            queue = LocalQueue(tracker.handle)
+            for job in _attach_progress_queue(jobs, queue):
+                worker_main(job)
+            return
 
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=len(slots)) as pool:
-        for _ in pool.imap_unordered(worker_main, jobs):
-            pass
+        ctx = mp.get_context("spawn")
+        manager = ctx.Manager()
+        queue = manager.Queue()
+        stop = threading.Event()
+        drain = threading.Thread(
+            target=_drain_progress_queue,
+            args=(queue, tracker, stop),
+            name="record-progress",
+            daemon=True,
+        )
+        drain.start()
+        try:
+            with ctx.Pool(processes=len(slots)) as pool:
+                for _ in pool.imap_unordered(
+                    worker_main, _attach_progress_queue(jobs, queue)
+                ):
+                    pass
+        finally:
+            # Give the drain thread a moment to consume late events.
+            time.sleep(0.3)
+            stop.set()
+            drain.join(timeout=5.0)
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        tracker.finish(status=status)
 
 
 def _parse_gpu_ids(raw: str | None) -> list[int] | None:
@@ -262,8 +330,24 @@ def main(argv: list[str] | None = None) -> None:
         default="generate/configs/record_gen.yaml",
         help="YAML/JSON config (behavior mix + defaults)",
     )
-    parser.add_argument("--task_packages_root", type=str, default=None)
-    parser.add_argument("--task_bank", type=str, default=None, help="Task bank JSON (taskfile)")
+    parser.add_argument(
+        "--coach_root",
+        type=str,
+        default=None,
+        help="Root of self-contained coach leaves (task.json + safetensors)",
+    )
+    parser.add_argument(
+        "--task_packages_root",
+        type=str,
+        default=None,
+        help="Alias for --coach_root (legacy name)",
+    )
+    parser.add_argument(
+        "--task_bank",
+        type=str,
+        default=None,
+        help="Legacy: task bank JSON used only when packing into coach_root",
+    )
     parser.add_argument("--ckpt_root", type=str, default=None)
     parser.add_argument("--algorithm", type=str, default=None)
     parser.add_argument("--output_root", type=str, default=None)
@@ -280,9 +364,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--workers_per_gpu", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--coach_seed", type=int, default=None, help="Filter coach leaves by seed")
     parser.add_argument("--min_behavior_steps", type=int, default=None)
     parser.add_argument("--behavior_switch_prob", type=float, default=None)
-    parser.add_argument("--allow_uneven", action="store_true", default=None)
     parser.add_argument(
         "--task_index",
         type=int,
@@ -294,6 +378,7 @@ def main(argv: list[str] | None = None) -> None:
 
     config = load_config(args.config)
     overrides = {
+        "coach_root": args.coach_root,
         "task_packages_root": args.task_packages_root,
         "task_bank": args.task_bank,
         "ckpt_root": args.ckpt_root,
@@ -306,6 +391,7 @@ def main(argv: list[str] | None = None) -> None:
         "cpu_workers": args.cpu_workers,
         "workers_per_gpu": args.workers_per_gpu,
         "seed": args.seed,
+        "coach_seed": args.coach_seed,
         "min_behavior_steps": args.min_behavior_steps,
         "behavior_switch_prob": args.behavior_switch_prob,
     }
@@ -315,8 +401,6 @@ def main(argv: list[str] | None = None) -> None:
     gpu_ids = _parse_gpu_ids(args.gpu_ids)
     if gpu_ids is not None:
         config["gpu_ids"] = gpu_ids
-    if args.allow_uneven:
-        config["allow_uneven"] = True
     if args.task_index is not None:
         config["task_index"] = args.task_index
 

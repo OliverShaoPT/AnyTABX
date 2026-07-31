@@ -7,8 +7,16 @@ JAX_PLATFORMS can be set before JAX initializes in each process.
 from __future__ import annotations
 
 import os
+import traceback
 from pathlib import Path
 from typing import Any
+
+
+def _report(payload: dict[str, Any], event: dict[str, Any]) -> None:
+    queue = payload.get("progress_queue")
+    if queue is None:
+        return
+    queue.put(event)
 
 
 def worker_main(payload: dict[str, Any]) -> str:
@@ -35,23 +43,51 @@ def worker_main(payload: dict[str, Any]) -> str:
     packages = {p.name: p for p in discover_task_packages(payload["packages_root"])}
     mix = behavior_mix_from_config(payload.get("behavior_mix"))
     paths: list[str] = []
-    for item in payload["items"]:
-        package = packages[item["package_name"]]
-        for record_id in item["record_ids"]:
-            path = generate_one_record(
-                package,
-                record_id=int(record_id),
-                output_root=Path(payload["output_root"]),
-                total_timesteps=int(payload["total_timesteps"]),
-                seed=payload.get("seed"),
-                min_behavior_steps=int(payload["min_behavior_steps"]),
-                behavior_switch_prob=float(payload["behavior_switch_prob"]),
-                behavior_mix=mix,
-            )
-            paths.append(str(path))
-            print(
-                f"[record_worker] worker={worker_id} device={device} "
-                f"gpu={payload.get('gpu_id')} wrote {path}",
-                flush=True,
-            )
+    try:
+        for item in payload["items"]:
+            package = packages[item["package_name"]]
+            for record_id in item["record_ids"]:
+                path = generate_one_record(
+                    package,
+                    record_id=int(record_id),
+                    output_root=Path(payload["output_root"]),
+                    total_timesteps=int(payload["total_timesteps"]),
+                    seed=payload.get("seed"),
+                    min_behavior_steps=int(payload["min_behavior_steps"]),
+                    behavior_switch_prob=float(payload["behavior_switch_prob"]),
+                    behavior_mix=mix,
+                )
+                paths.append(str(path))
+                _report(
+                    payload,
+                    {
+                        "event": "record_done",
+                        "worker_id": worker_id,
+                        "device": device,
+                        "gpu_id": payload.get("gpu_id"),
+                        "package_name": item["package_name"],
+                        "record_id": int(record_id),
+                        "path": str(path),
+                    },
+                )
+                # When a progress queue is attached, the parent draws the bar.
+                if payload.get("progress_queue") is None:
+                    print(
+                        f"[record_worker] worker={worker_id} device={device} "
+                        f"gpu={payload.get('gpu_id')} wrote {path}",
+                        flush=True,
+                    )
+    except Exception as exc:
+        _report(
+            payload,
+            {
+                "event": "worker_error",
+                "worker_id": worker_id,
+                "device": device,
+                "gpu_id": payload.get("gpu_id"),
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            },
+        )
+        raise
     return ",".join(paths)

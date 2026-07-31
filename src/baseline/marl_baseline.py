@@ -28,7 +28,11 @@ from flax.training.train_state import TrainState
 
 from src.baseline.utils import save_params
 from src.tabx import TABX
-from src.tabx.sample_task import build_batched_env_params_from_tasks, load_task_bank
+from src.tabx.sample_task import (
+    build_batched_env_params_from_tasks,
+    load_task_bank,
+    save_task_bank,
+)
 from src.tabx.wrappers.wrappers import (
     TABXAutoResetWrapper,
     TABXEnemyAllyFlipWrapper,
@@ -377,6 +381,32 @@ class BaseMARLTrainer(ABC):
         self.output.mkdir(parents=True, exist_ok=True)
         (self.output / "config.json").write_text(
             json.dumps(asdict(config), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        # Self-contained package leaf for generate-record: task.json next to weights.
+        save_task_bank(
+            self.output / "task.json",
+            [self.task],
+            seed=int(manifest.get("seed", config.seed)),
+            physics=self.physics,
+            heuristic=self.heuristic,
+            max_n_ally=int(schema["max_n_ally"]),
+            max_n_enemy=int(schema["max_n_enemy"]),
+            max_n_zone=int(schema["max_n_zone"]),
+            filter_protocol=manifest.get("filter_protocol"),
+        )
+        (self.output / "meta.json").write_text(
+            json.dumps(
+                {
+                    "task_index": config.task_index,
+                    "task_id": self.task_id,
+                    "seed": config.seed,
+                    "algorithm": config.algorithm,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
         self.best_path = self.output / "best.safetensors"
         self.final_path = self.output / "final.safetensors"
