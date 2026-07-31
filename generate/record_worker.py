@@ -87,8 +87,13 @@ def worker_main(payload: dict[str, Any]) -> str:
 
     packages = {p.name: p for p in discover_task_packages(payload["packages_root"])}
     mix = behavior_mix_from_config(payload.get("behavior_mix"))
-    # Reuse env+oracle per package inside this process (amortize XLA compile).
+    scan_rollout = bool(payload.get("scan_rollout", True))
+    total_timesteps = int(payload["total_timesteps"])
+    min_behavior_steps = int(payload["min_behavior_steps"])
+    behavior_switch_prob = float(payload["behavior_switch_prob"])
+    # Reuse env+oracle (+ optional scan fn) per package inside this process.
     contexts: dict[str, Any] = {}
+    rollout_fns: dict[str, Any] = {}
     paths: list[str] = []
     try:
         for item in payload["items"]:
@@ -106,6 +111,24 @@ def worker_main(payload: dict[str, Any]) -> str:
                     steps=2,
                     seed=int(payload.get("seed") or 0) + worker_id,
                 )
+                if scan_rollout:
+                    from generate.scan_rollout import (
+                        build_scan_rollout_fn,
+                        warmup_scan_rollout,
+                    )
+
+                    rollout_fn = build_scan_rollout_fn(
+                        ctx,
+                        mix=mix,
+                        min_behavior_steps=min_behavior_steps,
+                        behavior_switch_prob=behavior_switch_prob,
+                        total_timesteps=total_timesteps,
+                    )
+                    compile_s += warmup_scan_rollout(
+                        rollout_fn,
+                        seed=int(payload.get("seed") or 0) + worker_id,
+                    )
+                    rollout_fns[package.name] = rollout_fn
                 contexts[package.name] = ctx
                 _report(
                     payload,
@@ -125,12 +148,14 @@ def worker_main(payload: dict[str, Any]) -> str:
                     package,
                     record_id=int(record_id),
                     output_root=Path(payload["output_root"]),
-                    total_timesteps=int(payload["total_timesteps"]),
+                    total_timesteps=total_timesteps,
                     seed=payload.get("seed"),
-                    min_behavior_steps=int(payload["min_behavior_steps"]),
-                    behavior_switch_prob=float(payload["behavior_switch_prob"]),
+                    min_behavior_steps=min_behavior_steps,
+                    behavior_switch_prob=behavior_switch_prob,
                     behavior_mix=mix,
                     ctx=ctx,
+                    scan_rollout=scan_rollout,
+                    rollout_fn=rollout_fns.get(package.name),
                 )
                 generate_s = time.perf_counter() - t_gen
                 paths.append(str(path))

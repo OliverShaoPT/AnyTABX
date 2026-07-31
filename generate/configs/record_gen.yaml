@@ -41,6 +41,9 @@ seed: null
 # --- Behavior switching ---
 min_behavior_steps: 64
 behavior_switch_prob: 0.2
+# Device-side lax.scan for a whole record (one host sync at dump). Set false
+# for the legacy per-step Python loop (numpy BehaviorSwitcher).
+scan_rollout: true
 
 # --- Behavior policy mixture (weights renormalized) ---
 behavior_mix:

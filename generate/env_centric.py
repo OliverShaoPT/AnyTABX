@@ -256,7 +256,31 @@ def generate_one_record(
     behavior_switch_prob: float,
     behavior_mix: tuple[BehaviorSpec, ...] | None = None,
     ctx: RecordGenContext | None = None,
+    scan_rollout: bool = True,
+    rollout_fn: Any | None = None,
 ) -> Path:
+    """Generate one env-centric record.
+
+    ``scan_rollout=True`` (default) runs a device-side ``lax.scan`` and syncs
+    once at the end. Set ``False`` for the legacy per-step Python loop.
+    """
+
+    if scan_rollout:
+        from generate.scan_rollout import generate_one_record_scan
+
+        return generate_one_record_scan(
+            package,
+            record_id=record_id,
+            output_root=output_root,
+            total_timesteps=total_timesteps,
+            seed=seed,
+            min_behavior_steps=min_behavior_steps,
+            behavior_switch_prob=behavior_switch_prob,
+            behavior_mix=behavior_mix,
+            ctx=ctx,
+            rollout_fn=rollout_fn,
+        )
+
     seed = sample_record_seed(seed, salt=record_id)
     mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
     if ctx is None:
@@ -491,6 +515,8 @@ def generate_one_record(
         "physics": manifest.get("physics"),
         "enemy_heuristic": manifest.get("heuristic"),
         "n_episodes_seen": int(episode_id + 1),
+        "scan_rollout": False,
+        "switcher_rng": "numpy",
     }
     write_env_centric_record(record_dir, arrays, meta)
     return record_dir
@@ -506,6 +532,7 @@ def _worker(args: tuple) -> str:
         seed,
         min_behavior_steps,
         behavior_switch_prob,
+        scan_rollout,
     ) = args
     # Prefer CPU in workers to avoid multi-process GPU contention.
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -521,6 +548,7 @@ def _worker(args: tuple) -> str:
             seed=seed,
             min_behavior_steps=min_behavior_steps,
             behavior_switch_prob=behavior_switch_prob,
+            scan_rollout=bool(scan_rollout),
         )
         paths.append(str(path))
         print(f"[env_centric] wrote {path}", flush=True)
@@ -549,6 +577,7 @@ def run_parallel(
     min_behavior_steps: int,
     behavior_switch_prob: float,
     task_filter: list[int] | None = None,
+    scan_rollout: bool = True,
 ) -> None:
     packages = discover_task_packages(task_packages_root)
     if task_filter is not None:
@@ -569,6 +598,7 @@ def run_parallel(
                     seed,
                     min_behavior_steps,
                     behavior_switch_prob,
+                    scan_rollout,
                 )
             )
 
@@ -611,6 +641,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--min_behavior_steps", type=int, default=64)
     parser.add_argument("--behavior_switch_prob", type=float, default=0.2)
     parser.add_argument(
+        "--scan_rollout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Device-side lax.scan per record (default). --no-scan_rollout for step loop.",
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -632,6 +668,7 @@ def main(argv: list[str] | None = None) -> None:
         min_behavior_steps=args.min_behavior_steps,
         behavior_switch_prob=args.behavior_switch_prob,
         task_filter=args.task_index,
+        scan_rollout=bool(args.scan_rollout),
     )
 
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -95,3 +97,45 @@ class BehaviorSwitcher:
         self.current = self.sample()
         self.steps_since_switch = 0
         return self.current
+
+
+def mix_cdf_jax(mix: Sequence[BehaviorSpec]) -> jax.Array:
+    """Normalized CDF over mix weights (same order as ``mix``)."""
+
+    weights = jnp.asarray([float(spec.weight) for spec in mix], dtype=jnp.float64)
+    weights = weights / jnp.maximum(weights.sum(), 1e-12)
+    return jnp.cumsum(weights)
+
+
+def sample_policy_index(key: jax.Array, cdf: jax.Array) -> jax.Array:
+    """Sample a mix index with the same rule as ``BehaviorSwitcher.sample``."""
+
+    u = jax.random.uniform(key, (), dtype=jnp.float64)
+    index = jnp.searchsorted(cdf, u, side="right")
+    return jnp.minimum(index, cdf.shape[0] - 1).astype(jnp.int32)
+
+
+def maybe_switch_policy_id(
+    key: jax.Array,
+    *,
+    policy_id: jax.Array,
+    steps_since_switch: jax.Array,
+    cdf: jax.Array,
+    min_behavior_steps: int,
+    behavior_switch_prob: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """JAX mid-episode switcher.
+
+    Returns ``(key, policy_id, steps_since_switch)`` after one step of cooldown logic.
+    """
+
+    key, gate_key, sample_key = jax.random.split(key, 3)
+    steps = steps_since_switch + jnp.int32(1)
+    can_switch = steps >= jnp.int32(min_behavior_steps)
+    do_switch = can_switch & (
+        jax.random.uniform(gate_key, ()) < jnp.float32(behavior_switch_prob)
+    )
+    sampled = sample_policy_index(sample_key, cdf)
+    new_id = jnp.where(do_switch, sampled, policy_id).astype(jnp.int32)
+    new_steps = jnp.where(do_switch, jnp.int32(0), steps).astype(jnp.int32)
+    return key, new_id, new_steps

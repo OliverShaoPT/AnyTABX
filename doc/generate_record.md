@@ -139,6 +139,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 - `stagger_s`：worker 启动前 sleep `worker_id * stagger_s`，错开编译高峰。
 - GPU：`XLA_PYTHON_CLIENT_PREALLOCATE=false`；建议每卡 `workers_per_gpu` 取 2–4（与旧粘住进程脚本同量级）。
 - `device: cpu` 仅本地 debug；**不要**用 CPU 量产 record。
+- 默认 `scan_rollout: true`：整条 record 在设备上 `lax.scan`，结束时一次性 `device_get` 落盘（减少逐步 Python/同步）。`false` 回退逐步循环；scan 路径的 behavior 切换用 JAX RNG（`meta.switcher_rng=jax`），与 numpy switcher 序列不必 bit 一致。
 - 目录在 **写完一条 record 落盘时** 再创建（不预建空文件夹）。
 - 也可用 `python -m generate.parallel_records --config ...`。
 
@@ -213,6 +214,7 @@ record-XXXXXX/agent_centric/{ally_key}/
 | `generate/parallel_records.py` | 均匀分片 + GPU 并行编排（主入口） |
 | `generate/record_worker.py` | spawn worker（先设 CUDA 再 import JAX；进程内 warmup） |
 | `generate/progress.py` | 进度条与 setup/compile/generate 计时 |
+| `generate/scan_rollout.py` | 设备侧整 record `lax.scan`（`scan_rollout: true`） |
 | `generate/generate_records.sh` | 加载 config 一键启动 |
 | `generate/env_centric.py` | Step 1 单条采集 + `RecordGenContext` |
 | `generate/agent_centric.py` | Step 2 拆分 |

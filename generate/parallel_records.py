@@ -261,6 +261,7 @@ def plan_jobs(
     jax_platform: str = "cuda",
     schedule: str = "task",
     stagger_s: float = 1.0,
+    scan_rollout: bool = True,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -306,6 +307,7 @@ def plan_jobs(
                 "jax_platform": jax_platform,
                 "schedule": schedule,
                 "stagger_s": float(stagger_s),
+                "scan_rollout": bool(scan_rollout),
             }
         )
     return jobs
@@ -387,6 +389,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         jax_platform=str(config.get("jax_platform", "cuda")),
         schedule=schedule,
         stagger_s=stagger_s,
+        scan_rollout=bool(config.get("scan_rollout", True)),
     )
 
     planned = _planned_record_count(jobs)
@@ -527,6 +530,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--min_behavior_steps", type=int, default=None)
     parser.add_argument("--behavior_switch_prob", type=float, default=None)
     parser.add_argument(
+        "--scan_rollout",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help="Device-side lax.scan per record (default true). false=legacy step loop.",
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -564,6 +574,8 @@ def main(argv: list[str] | None = None) -> None:
         config["gpu_ids"] = gpu_ids
     if args.task_index is not None:
         config["task_index"] = args.task_index
+    if args.scan_rollout is not None:
+        config["scan_rollout"] = args.scan_rollout == "true"
 
     run_from_config(config)
     print(f"[parallel_records] done → {config['output_root']}", flush=True)
