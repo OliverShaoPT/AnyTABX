@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import random
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,13 +22,31 @@ from generate.behavior_mix import (
     behavior_mix_from_config,
 )
 from generate.dump_schema import ensure_dir, write_env_centric_record
-from generate.oracle_loader import load_oracle_coach
+from generate.oracle_loader import OracleCoach, load_oracle_coach
 from generate.policies import SharedAllyPolicy, reference_labels
 from generate.task_package import TaskPackage, discover_task_packages, load_package_task_bank
 from src.tabx import TABX
 from src.tabx.sample_task import build_batched_env_params_from_tasks
 from src.tabx.wrappers.individual_reward import IndividualRewardConfig, compute_shaped_rewards
 from src.tabx.wrappers.wrappers import TABXEnemyHeuristicWrapper
+
+
+@dataclass
+class RecordGenContext:
+    """Reusable env + oracle for many records of the same task (amortize JAX JIT)."""
+
+    package: TaskPackage
+    env: Any
+    env_params: Any
+    task: dict[str, Any]
+    manifest: dict[str, Any]
+    oracle: OracleCoach
+    ally_keys: list[str]
+    unit_keys: list[str]
+    n_ally: int
+    action_dim: int
+    obs_dim: int
+    n_units_total: int
 
 
 def sample_record_seed(explicit: int | None = None, *, salt: int = 0) -> int:
@@ -116,6 +134,117 @@ def build_env_and_params(package: TaskPackage):
     return env, env_params, task, manifest
 
 
+def build_record_gen_context(package: TaskPackage) -> RecordGenContext:
+    """Build env + oracle once; reuse across records for the same package."""
+
+    env, env_params, task, manifest = build_env_and_params(package)
+    ally_keys = list(env.agents)
+    unit_keys = list(env.unit_keys)
+    action_dim = int(env.action_space(ally_keys[0]).n)
+    obs_dim = int(env.observation_space(ally_keys[0]).shape[0])
+    oracle = load_oracle_coach(package.oracle_dir, obs_dim=obs_dim, action_dim=action_dim)
+    return RecordGenContext(
+        package=package,
+        env=env,
+        env_params=env_params,
+        task=task,
+        manifest=manifest,
+        oracle=oracle,
+        ally_keys=ally_keys,
+        unit_keys=unit_keys,
+        n_ally=len(ally_keys),
+        action_dim=action_dim,
+        obs_dim=obs_dim,
+        n_units_total=len(unit_keys),
+    )
+
+
+def warmup_record_gen_context(
+    ctx: RecordGenContext,
+    *,
+    behavior_mix: tuple[BehaviorSpec, ...] | None = None,
+    steps: int = 2,
+    seed: int = 0,
+) -> float:
+    """Force JAX/XLA compile for every behavior in the mix; return wall seconds.
+
+    Walks **each** ``BehaviorSpec`` (not just one oracle + one heuristic) plus an
+    explicit mid-episode ``reset``, so generate-time policy switches are less
+    likely to trigger new JIT. Cannot literally compile every dynamic branch in
+    TABX, but covers the paths used by record generation.
+    """
+
+    mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
+    t0 = time.perf_counter()
+    env = ctx.env
+    env_params = ctx.env_params
+    ally_keys = ctx.ally_keys
+    unit_keys = ctx.unit_keys
+    oracle = ctx.oracle
+    indiv_cfg = IndividualRewardConfig()
+    key = jax.random.key(int(seed) % (2**32))
+    key, reset_key = jax.random.split(key)
+    obs, state = env.reset(reset_key, env_params)
+    n_steps = max(1, int(steps))
+
+    for spec_index, spec in enumerate(mix):
+        shared = SharedAllyPolicy.from_spec(
+            spec,
+            oracle=oracle,
+            ally_keys=ally_keys,
+            n_agents=ctx.n_units_total,
+            max_n_zone=env.max_n_zone,
+        )
+        for _ in range(n_steps):
+            avail = env.get_avail_actions(state)
+            key, bkey, skey = jax.random.split(key, 3)
+            behavior = shared.act(
+                key=bkey,
+                obs_by_agent=obs,
+                avail_by_agent=avail,
+                ally_keys=ally_keys,
+                physics_params=state["physics_params"],
+            )
+            _ = reference_labels(
+                oracle,
+                obs_by_agent=obs,
+                avail_by_agent=avail,
+                ally_keys=ally_keys,
+            )
+            prev_state = state
+            obs, state, rewards, dones, info = env.step(skey, state, dict(behavior))
+            # Same reward shaping path as generate_one_record.
+            team_by_agent = {agent: rewards[agent] for agent in ally_keys}
+            damage_dealt = info.get("damage_dealt")
+            if damage_dealt is None:
+                damage_dealt = jnp.stack(
+                    [state["state"][unit].damage_dealt for unit in unit_keys]
+                )
+            _ = compute_shaped_rewards(
+                unit_keys=unit_keys,
+                agent_keys=ally_keys,
+                prev_state=prev_state["state"],
+                next_state=state["state"],
+                team_reward_by_agent=team_by_agent,
+                damage_dealt=damage_dealt,
+                config=indiv_cfg,
+            )
+            if bool(_to_numpy(dones["__all__"])):
+                key, reset_key = jax.random.split(key)
+                obs, state = env.reset(reset_key, env_params)
+
+        # Explicit reset between policies (covers mid-run episode boundaries).
+        if spec_index + 1 < len(mix):
+            key, reset_key = jax.random.split(key)
+            obs, state = env.reset(reset_key, env_params)
+
+    # Ensure device work finished before stopping the timer.
+    visible = state["state"]["game_manager"].visible_matrix
+    if hasattr(visible, "block_until_ready"):
+        visible.block_until_ready()
+    return float(time.perf_counter() - t0)
+
+
 def generate_one_record(
     package: TaskPackage,
     *,
@@ -126,17 +255,27 @@ def generate_one_record(
     min_behavior_steps: int,
     behavior_switch_prob: float,
     behavior_mix: tuple[BehaviorSpec, ...] | None = None,
+    ctx: RecordGenContext | None = None,
 ) -> Path:
     seed = sample_record_seed(seed, salt=record_id)
     mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
-    env, env_params, task, manifest = build_env_and_params(package)
-    ally_keys = list(env.agents)
-    unit_keys = list(env.unit_keys)
-    n_ally = len(ally_keys)
-    action_dim = int(env.action_space(ally_keys[0]).n)
-    obs_dim = int(env.observation_space(ally_keys[0]).shape[0])
-
-    oracle = load_oracle_coach(package.oracle_dir, obs_dim=obs_dim, action_dim=action_dim)
+    if ctx is None:
+        ctx = build_record_gen_context(package)
+    elif ctx.package.name != package.name:
+        raise ValueError(
+            f"RecordGenContext package mismatch: ctx={ctx.package.name} vs {package.name}"
+        )
+    env = ctx.env
+    env_params = ctx.env_params
+    task = ctx.task
+    manifest = ctx.manifest
+    ally_keys = ctx.ally_keys
+    unit_keys = ctx.unit_keys
+    n_ally = ctx.n_ally
+    action_dim = ctx.action_dim
+    obs_dim = ctx.obs_dim
+    oracle = ctx.oracle
+    n_units_total = ctx.n_units_total
     switcher = BehaviorSwitcher(
         mix=mix,
         min_behavior_steps=min_behavior_steps,

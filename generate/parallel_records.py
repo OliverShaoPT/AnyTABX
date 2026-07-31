@@ -1,4 +1,7 @@
-"""Orchestrate even, parallel env-centric record generation (CPU or GPU)."""
+"""Orchestrate even, parallel env-centric record generation (GPU production path).
+
+``device=cpu`` remains available for local debug only — not for mass production.
+"""
 
 from __future__ import annotations
 
@@ -39,19 +42,42 @@ def _attach_progress_queue(
 def _drain_progress_queue(
     queue: Any, tracker: ProgressTracker, stop: threading.Event
 ) -> None:
+    """Pull progress events until stop, or until the Manager dies (EOF).
+
+    ``EOFError`` / broken pipe are normal when the parent is SIGTERM'd or the
+    Manager shuts down before this daemon thread exits — swallow them quietly.
+    """
+
+    def _get(timeout: float | None = None) -> Any:
+        if timeout is None:
+            return queue.get_nowait()
+        return queue.get(timeout=timeout)
+
     while not stop.is_set():
         try:
-            event = queue.get(timeout=0.2)
+            event = _get(0.2)
         except queue_mod.Empty:
+            tracker.maybe_heartbeat()
             continue
-        tracker.handle(event)
-    # Final drain after workers finish.
+        except (EOFError, BrokenPipeError, ConnectionError, OSError):
+            return
+        try:
+            tracker.handle(event)
+        except Exception as exc:  # noqa: BLE001 — keep progress thread alive
+            print(f"[parallel_records] progress handle error: {exc}", flush=True)
+
     while True:
         try:
-            event = queue.get_nowait()
+            event = _get()
         except queue_mod.Empty:
             break
-        tracker.handle(event)
+        except (EOFError, BrokenPipeError, ConnectionError, OSError):
+            return
+        try:
+            tracker.handle(event)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[parallel_records] progress handle error: {exc}", flush=True)
+            break
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -154,6 +180,71 @@ def _group_units_by_package(
     return items
 
 
+def plan_jobs_task_affinity(
+    *,
+    packages: list[Any],
+    counts: list[int],
+    start_index: int,
+    slots: list[WorkerSlot],
+) -> list[tuple[WorkerSlot, list[dict[str, Any]]]]:
+    """Assign whole tasks to workers (round-robin over tasks).
+
+    Each worker owns all records of its tasks so JAX JIT is amortized in-process.
+    Active workers = min(n_slots, n_tasks_with_work).
+    """
+
+    task_items: list[dict[str, Any]] = []
+    for package, count in zip(packages, counts):
+        if count <= 0:
+            continue
+        task_items.append(
+            {
+                "package_name": package.name,
+                "record_ids": list(
+                    range(start_index, start_index + int(count))
+                ),
+            }
+        )
+    if not task_items:
+        return []
+
+    n_workers = min(len(slots), len(task_items))
+    active_slots = slots[:n_workers]
+    owned: list[list[dict[str, Any]]] = [[] for _ in range(n_workers)]
+    for index, item in enumerate(task_items):
+        owned[index % n_workers].append(item)
+    return [
+        (slot, items)
+        for slot, items in zip(active_slots, owned)
+        if items
+    ]
+
+
+def plan_jobs_record_stripe(
+    *,
+    packages: list[Any],
+    counts: list[int],
+    start_index: int,
+    slots: list[WorkerSlot],
+) -> list[tuple[WorkerSlot, list[dict[str, Any]]]]:
+    """LEGACY: flatten (task, record_id) and round-robin (avoid for GPU production)."""
+
+    units = flatten_record_units(packages, counts, start_index)
+    if not units:
+        return []
+
+    active_slots = slots[: min(len(slots), len(units))]
+    n_workers = len(active_slots)
+    owned: list[list[tuple[str, int]]] = [[] for _ in range(n_workers)]
+    for index, unit in enumerate(units):
+        owned[index % n_workers].append(unit)
+    return [
+        (slot, _group_units_by_package(units_for_worker))
+        for slot, units_for_worker in zip(active_slots, owned)
+        if units_for_worker
+    ]
+
+
 def plan_jobs(
     *,
     packages_root: Path,
@@ -168,33 +259,41 @@ def plan_jobs(
     behavior_switch_prob: float,
     behavior_mix: list[dict[str, Any]] | None,
     jax_platform: str = "cuda",
+    schedule: str = "task",
+    stagger_s: float = 1.0,
 ) -> list[dict[str, Any]]:
-    """One job per active worker; work units are striped across all records.
+    """Build one job payload per active worker.
 
-    Unlike per-task striping, every ``(task, record_id)`` pair is flattened first
-    and then round-robined across workers, so idle workers only appear when
-    ``n_workers > n_records``.
+    ``schedule``:
+      - ``task`` (default): whole-task affinity; best for JAX compile reuse.
+      - ``record``: LEGACY stripe of individual records; avoid for GPU production
+        (multi-process cold JIT).
     """
 
-    units = flatten_record_units(packages, counts, start_index)
-    if not units:
-        return []
-
-    # Do not spawn more processes than there are records to write.
-    active_slots = slots[: min(len(slots), len(units))]
-    n_workers = len(active_slots)
-    owned: list[list[tuple[str, int]]] = [[] for _ in range(n_workers)]
-    for index, unit in enumerate(units):
-        owned[index % n_workers].append(unit)
+    schedule = (schedule or "task").lower()
+    if schedule == "task":
+        assignments = plan_jobs_task_affinity(
+            packages=packages,
+            counts=counts,
+            start_index=start_index,
+            slots=slots,
+        )
+    elif schedule == "record":
+        assignments = plan_jobs_record_stripe(
+            packages=packages,
+            counts=counts,
+            start_index=start_index,
+            slots=slots,
+        )
+    else:
+        raise ValueError(f"Unsupported schedule={schedule!r} (expected task|record)")
 
     jobs: list[dict[str, Any]] = []
-    for slot, units_for_worker in zip(active_slots, owned):
-        if not units_for_worker:
-            continue
+    for slot, items in assignments:
         jobs.append(
             {
                 "packages_root": str(packages_root),
-                "items": _group_units_by_package(units_for_worker),
+                "items": items,
                 "output_root": str(output_root),
                 "total_timesteps": total_timesteps,
                 "seed": seed,
@@ -205,19 +304,21 @@ def plan_jobs(
                 "gpu_id": slot.gpu_id,
                 "worker_id": slot.worker_id,
                 "jax_platform": jax_platform,
+                "schedule": schedule,
+                "stagger_s": float(stagger_s),
             }
         )
     return jobs
 
 
 def run_from_config(config: dict[str, Any]) -> None:
-    device = str(config.get("device", "cpu")).lower()
+    device = str(config.get("device", "gpu")).lower()
     if device == "cpu":
-        # Must run before importing task_package / tabx / jax (see module docstring).
+        # Debug-only path: must run before importing task_package / tabx / jax.
         force_jax_cpu_env()
         print(
-            "[parallel_records] device=cpu → JAX_PLATFORMS=cpu, "
-            "JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1 (no CUDA init)",
+            "[parallel_records] device=cpu (debug only, not for production) → "
+            "JAX_PLATFORMS=cpu, JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1",
             flush=True,
         )
 
@@ -268,6 +369,8 @@ def run_from_config(config: dict[str, Any]) -> None:
         workers_per_gpu=int(config.get("workers_per_gpu", 1)),
     )
 
+    schedule = str(config.get("schedule", "task")).lower()
+    stagger_s = float(config.get("stagger_s", 1.0) or 0.0)
     ensure_dir(output_root)
     jobs = plan_jobs(
         packages_root=packages_root,
@@ -282,11 +385,14 @@ def run_from_config(config: dict[str, Any]) -> None:
         behavior_switch_prob=float(config.get("behavior_switch_prob", 0.2)),
         behavior_mix=config.get("behavior_mix"),
         jax_platform=str(config.get("jax_platform", "cuda")),
+        schedule=schedule,
+        stagger_s=stagger_s,
     )
 
     planned = _planned_record_count(jobs)
     print(
-        f"[parallel_records] tasks={len(packages)} total_records={total_records} "
+        f"[parallel_records] schedule={schedule} stagger_s={stagger_s} "
+        f"tasks={len(packages)} total_records={total_records} "
         f"planned={planned} "
         f"per_task={counts[0] if len(set(counts)) == 1 else counts} "
         f"slots={len(slots)} active_workers={len(jobs)} device={slots[0].device}",
@@ -362,7 +468,7 @@ def _parse_gpu_ids(raw: str | None) -> list[int] | None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Evenly generate env-centric records in parallel (CPU/GPU)"
+        description="Evenly generate env-centric records in parallel (GPU production)"
     )
     parser.add_argument(
         "--config",
@@ -403,6 +509,19 @@ def main(argv: list[str] | None = None) -> None:
         help="Comma-separated GPU ids, e.g. 0,1,3",
     )
     parser.add_argument("--workers_per_gpu", type=int, default=None)
+    parser.add_argument(
+        "--schedule",
+        type=str,
+        choices=("task", "record"),
+        default=None,
+        help="task=whole-task affinity (default); record=LEGACY stripe (avoid in production)",
+    )
+    parser.add_argument(
+        "--stagger_s",
+        type=float,
+        default=None,
+        help="Sleep worker_id * stagger_s before each worker starts (JIT stagger)",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--coach_seed", type=int, default=None, help="Filter coach leaves by seed")
     parser.add_argument("--min_behavior_steps", type=int, default=None)
@@ -430,6 +549,8 @@ def main(argv: list[str] | None = None) -> None:
         "device": args.device,
         "cpu_workers": args.cpu_workers,
         "workers_per_gpu": args.workers_per_gpu,
+        "schedule": args.schedule,
+        "stagger_s": args.stagger_s,
         "seed": args.seed,
         "coach_seed": args.coach_seed,
         "min_behavior_steps": args.min_behavior_steps,

@@ -37,9 +37,14 @@ class ProgressTracker:
     output_root: Path
     started_at: float = field(default_factory=time.time)
     completed: int = 0
+    setup_s: float = 0.0
+    compile_s: float = 0.0
+    generate_s: float = 0.0
     last_event: dict[str, Any] | None = None
     jsonl_path: Path | None = None
     snapshot_path: Path | None = None
+    heartbeat_s: float = 30.0
+    _last_heartbeat_at: float = field(default=0.0, repr=False)
 
     def __post_init__(self) -> None:
         self.output_root = Path(self.output_root)
@@ -48,19 +53,46 @@ class ProgressTracker:
         self.snapshot_path = self.output_root / "generation_progress.json"
         # Fresh run marker.
         self.jsonl_path.write_text("", encoding="utf-8")
+        self._last_heartbeat_at = time.time()
+        self._write_snapshot(status="running")
+
+    def maybe_heartbeat(self) -> None:
+        """Rewrite snapshot periodically so long gaps (first record) stay visible."""
+
+        now = time.time()
+        if now - self._last_heartbeat_at < float(self.heartbeat_s):
+            return
+        self._last_heartbeat_at = now
         self._write_snapshot(status="running")
 
     def handle(self, event: dict[str, Any]) -> None:
         kind = str(event.get("event", "record_done"))
-        if kind == "record_done":
-            self.completed += 1
+        if kind == "compile_done":
+            self.setup_s += float(event.get("setup_s", 0.0) or 0.0)
+            self.compile_s += float(event.get("compile_s", 0.0) or 0.0)
             self.last_event = event
             self._append_jsonl(event)
+            self._last_heartbeat_at = time.time()
+            self._write_snapshot(status="running")
+            print(
+                f"[parallel_records] compile worker={event.get('worker_id')} "
+                f"pkg={event.get('package_name')} "
+                f"setup={float(event.get('setup_s', 0.0)):.1f}s "
+                f"jit={float(event.get('compile_s', 0.0)):.1f}s",
+                flush=True,
+            )
+        elif kind == "record_done":
+            self.completed += 1
+            self.generate_s += float(event.get("generate_s", 0.0) or 0.0)
+            self.last_event = event
+            self._append_jsonl(event)
+            self._last_heartbeat_at = time.time()
             self._write_snapshot(status="running")
             self._print_line(final=False)
         elif kind == "worker_error":
             self.last_event = event
             self._append_jsonl(event)
+            self._last_heartbeat_at = time.time()
             self._write_snapshot(status="running", error=event.get("error"))
             print(
                 f"[parallel_records] worker_error worker={event.get('worker_id')} "
@@ -73,11 +105,16 @@ class ProgressTracker:
         self._print_line(final=True)
         elapsed = time.time() - self.started_at
         rate = self.completed / elapsed if elapsed > 0 else 0.0
+        gen_rate = self.completed / self.generate_s if self.generate_s > 0 else 0.0
         print(
             f"[parallel_records] summary status={status} "
             f"completed={self.completed}/{self.total} "
             f"elapsed={format_duration(elapsed)} "
+            f"setup={format_duration(self.setup_s)} "
+            f"compile={format_duration(self.compile_s)} "
+            f"generate={format_duration(self.generate_s)} "
             f"rate={rate:.3f} rec/s "
+            f"generate_rate={gen_rate:.3f} rec/s "
             f"progress_file={self.snapshot_path}",
             flush=True,
         )
@@ -89,9 +126,22 @@ class ProgressTracker:
             "completed": self.completed,
             "total": self.total,
             "elapsed_s": round(time.time() - self.started_at, 3),
+            "setup_s_total": round(self.setup_s, 3),
+            "compile_s_total": round(self.compile_s, 3),
+            "generate_s_total": round(self.generate_s, 3),
         }
         with self.jsonl_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def _timing_fields(self) -> dict[str, Any]:
+        return {
+            "setup_s": round(self.setup_s, 3),
+            "compile_s": round(self.compile_s, 3),
+            "generate_s": round(self.generate_s, 3),
+            "generate_rate_rec_per_s": (
+                round(self.completed / self.generate_s, 4) if self.generate_s > 0 else 0.0
+            ),
+        }
 
     def _write_snapshot(self, *, status: str, error: Any = None) -> None:
         assert self.snapshot_path is not None
@@ -111,6 +161,7 @@ class ProgressTracker:
             "last": self.last_event,
             "error": error,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            **self._timing_fields(),
         }
         temporary = self.snapshot_path.with_suffix(".json.tmp")
         temporary.write_text(
@@ -133,7 +184,11 @@ class ProgressTracker:
         line = (
             f"\r[parallel_records] {render_bar(self.completed, self.total)} "
             f"{self.completed}/{self.total} ({pct:5.1f}%) "
-            f"{rate:.3f} rec/s elapsed={format_duration(elapsed)} ETA={eta}{last}"
+            f"{rate:.3f} rec/s elapsed={format_duration(elapsed)} "
+            f"setup={format_duration(self.setup_s)} "
+            f"compile={format_duration(self.compile_s)} "
+            f"generate={format_duration(self.generate_s)} "
+            f"ETA={eta}{last}"
         )
         end = "\n" if final or self.completed >= self.total else ""
         sys.stdout.write(line + end)

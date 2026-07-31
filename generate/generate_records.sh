@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Load YAML config and run parallel env-centric record generation.
+# Load YAML config and run parallel env-centric record generation (GPU production).
 #
 # Usage:
 #   ./generate/generate_records.sh
 #   ./generate/generate_records.sh generate/configs/record_gen.yaml
 #   CONFIG=generate/configs/my_run.yaml ./generate/generate_records.sh
 #
-# Edit generate/configs/record_gen.yaml for paths, volume, device, and behavior mix.
+# Edit generate/configs/record_gen.yaml (default device=gpu, schedule=task).
 
 set -euo pipefail
 

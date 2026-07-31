@@ -18,15 +18,20 @@ total_records: 1000
 total_timesteps: 3000
 start_index: 0                # first record id per task → record-000000
 
-# --- Parallelism ---
-# device: cpu | gpu
+# --- Parallelism (production: GPU) ---
+# device=gpu is the production path. device=cpu is debug-only — do not mass-produce.
 device: gpu
-cpu_workers: 8                # used when device=cpu
-# GPU: n_workers = len(gpu_ids) * workers_per_gpu
-# All (task, record_id) pairs are flattened then round-robined across workers.
-# Active processes = min(n_workers, total_records).
+cpu_workers: 2                # debug-only when device=cpu
+# schedule:
+#   task   (default) — whole-task affinity; amortize JAX compile in-process
+#                      active_workers = min(slots, n_tasks)
+#   record — LEGACY stripe across (task, record_id); cold multi-process JIT;
+#            do not use for GPU production
+schedule: task
+stagger_s: 1.0                # worker_id * stagger_s sleep before start (JIT stagger)
+# GPU: slots = len(gpu_ids) * workers_per_gpu  (recommend 2–4 per GPU)
 gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
-workers_per_gpu: 8
+workers_per_gpu: 2
 jax_platform: cuda            # JAX_PLATFORMS for GPU workers
 
 # --- RNG ---

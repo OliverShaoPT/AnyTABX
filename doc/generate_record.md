@@ -119,10 +119,10 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
   unit_*.npy                # 全局单位快照
 ```
 
-并行：改配置后一键启动（均匀分 task、CPU/GPU）：
+并行（**生产路径：GPU**）：改配置后一键启动：
 
 ```bash
-# 编辑 generate/configs/record_gen.yaml，然后：
+# 编辑 generate/configs/record_gen.yaml（默认 device=gpu），然后：
 ./generate/generate_records.sh
 
 # 或指定另一份配置：
@@ -134,19 +134,26 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 `behavior_mix` 等。
 
 - `total_records` 在 tasks 间均分（`// n_tasks`，余数补给前面的 task）。
-- 先把所有 `(task, record_id)` 摊平，再 round-robin 分给 worker（按 record 并行，而不是按 task 内 id 分片）。
-- 实际进程数 = `min(配置的 worker 数, 总 record 数)`，避免空闲 worker。
+- 默认 `schedule: task`：**整 task 亲和**——每个 worker 吃完所属 task 的全部 record，进程内复用 env/oracle + warmup，摊薄 JAX JIT；`active_workers = min(slots, n_tasks)`。
+- `schedule: record` 为 **legacy**：把 `(task, record_id)` 摊平后 round-robin，易多进程同时冷编译；**GPU 生产勿用**。
+- `stagger_s`：worker 启动前 sleep `worker_id * stagger_s`，错开编译高峰。
+- GPU：`XLA_PYTHON_CLIENT_PREALLOCATE=false`；建议每卡 `workers_per_gpu` 取 2–4（与旧粘住进程脚本同量级）。
+- `device: cpu` 仅本地 debug；**不要**用 CPU 量产 record。
 - 目录在 **写完一条 record 落盘时** 再创建（不预建空文件夹）。
 - 也可用 `python -m generate.parallel_records --config ...`。
 
 进度监控：
 
 - 终端进度条：`completed/total`、`rec/s`、`ETA`、最近完成的 worker/task/record。
-- 快照：`{output_root}/generation_progress.json`（可 `watch -n 2 cat ...`）。
-- 明细：`{output_root}/generation_progress.jsonl`（每完成一条追加一行）。
-- 结束时打印 summary（elapsed / rate / status）。
+- 时间拆分（每个 task 首次进入 worker 时）：
+  - `setup_s`：建 env + 加载 oracle
+  - `compile_s`：对 `behavior_mix` **每条 policy** warmup 几步 + reset / reward shaping（不落盘），尽量一次编译完
+  - `generate_s`：每条 record 的纯采集时间
+- 快照：`{output_root}/generation_progress.json`（含 setup/compile/generate 累计）。
+- 明细：`{output_root}/generation_progress.jsonl`（`compile_done` / `record_done` 事件）。
+- 结束 summary：`setup` / `compile` / `generate` / `generate_rate`。
 
-旧入口 `python -m generate.env_centric` 仍可用；子进程默认 `JAX_PLATFORMS=cpu`。
+旧入口 `python -m generate.env_centric` 仍可用（小规模/调试）。
 
 ---
 
@@ -202,11 +209,12 @@ record-XXXXXX/agent_centric/{ally_key}/
 | 模块 | 作用 |
 |---|---|
 | `generate/pack_task_packages.py` | （legacy）bank + ckpt → packages |
-| `generate/configs/record_gen.yaml` | 全部生产参数（`coach_root`、产量、设备、behavior） |
-| `generate/parallel_records.py` | 均匀分片 + CPU/GPU 并行编排 |
-| `generate/record_worker.py` | spawn worker（先设 CUDA 再 import JAX） |
+| `generate/configs/record_gen.yaml` | 全部生产参数（默认 GPU：`coach_root`、产量、设备、behavior） |
+| `generate/parallel_records.py` | 均匀分片 + GPU 并行编排（主入口） |
+| `generate/record_worker.py` | spawn worker（先设 CUDA 再 import JAX；进程内 warmup） |
+| `generate/progress.py` | 进度条与 setup/compile/generate 计时 |
 | `generate/generate_records.sh` | 加载 config 一键启动 |
-| `generate/env_centric.py` | Step 1 单条/旧并行采集 |
+| `generate/env_centric.py` | Step 1 单条采集 + `RecordGenContext` |
 | `generate/agent_centric.py` | Step 2 拆分 |
 | `generate/behavior_mix.py` | 加权 mix + 冷却切换 |
 | `generate/oracle_loader.py` | 加载 safetensors coach |
