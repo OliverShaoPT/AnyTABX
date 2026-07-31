@@ -140,6 +140,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 - GPU：`XLA_PYTHON_CLIENT_PREALLOCATE=false`；建议每卡 `workers_per_gpu` 取 2–4（与旧粘住进程脚本同量级）。
 - `device: cpu` 仅本地 debug；**不要**用 CPU 量产 record。
 - 默认 `scan_rollout: true`：整条 record 在设备上 `lax.scan`，结束时一次性 `device_get` 落盘（减少逐步 Python/同步）。`false` 回退逐步循环；scan 路径的 behavior 切换用 JAX RNG（`meta.switcher_rng=jax`），与 numpy switcher 序列不必 bit 一致。
+- `parallel_envs: B`（需 `scan_rollout`）：对同一 task 用 `vmap` 一次跑 B 个环境；该 task 的 N 条 record 分 `ceil(N/B)` 轮，最后一轮 pad 到 B 以复用同一份 JIT。提高 B 时建议 `workers_per_gpu: 1`，避免多进程 × B 爆显存。
 - 目录在 **写完一条 record 落盘时** 再创建（不预建空文件夹）。
 - 也可用 `python -m generate.parallel_records --config ...`。
 

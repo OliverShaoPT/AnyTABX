@@ -29,9 +29,10 @@ cpu_workers: 2                # debug-only when device=cpu
 #            do not use for GPU production
 schedule: task
 stagger_s: 1.0                # worker_id * stagger_s sleep before start (JIT stagger)
-# GPU: slots = len(gpu_ids) * workers_per_gpu  (recommend 2–4 per GPU)
+# GPU: slots = len(gpu_ids) * workers_per_gpu
+# With parallel_envs>=8 prefer workers_per_gpu=1 to limit VRAM.
 gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
-workers_per_gpu: 2
+workers_per_gpu: 1
 jax_platform: cuda            # JAX_PLATFORMS for GPU workers
 
 # --- RNG ---
@@ -44,6 +45,10 @@ behavior_switch_prob: 0.2
 # Device-side lax.scan for a whole record (one host sync at dump). Set false
 # for the legacy per-step Python loop (numpy BehaviorSwitcher).
 scan_rollout: true
+# vmap batch size B: each scan call runs B envs in parallel (pad last batch to B
+# so one JIT is reused). N records → ceil(N/B) calls. Prefer workers_per_gpu=1
+# when B is large (VRAM). 1 = single-env scan.
+parallel_envs: 8
 
 # --- Behavior policy mixture (weights renormalized) ---
 behavior_mix:

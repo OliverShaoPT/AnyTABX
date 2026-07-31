@@ -88,6 +88,9 @@ def worker_main(payload: dict[str, Any]) -> str:
     packages = {p.name: p for p in discover_task_packages(payload["packages_root"])}
     mix = behavior_mix_from_config(payload.get("behavior_mix"))
     scan_rollout = bool(payload.get("scan_rollout", True))
+    parallel_envs = max(1, int(payload.get("parallel_envs", 1) or 1))
+    if not scan_rollout:
+        parallel_envs = 1
     total_timesteps = int(payload["total_timesteps"])
     min_behavior_steps = int(payload["min_behavior_steps"])
     behavior_switch_prob = float(payload["behavior_switch_prob"])
@@ -123,10 +126,12 @@ def worker_main(payload: dict[str, Any]) -> str:
                         min_behavior_steps=min_behavior_steps,
                         behavior_switch_prob=behavior_switch_prob,
                         total_timesteps=total_timesteps,
+                        parallel_envs=parallel_envs,
                     )
                     compile_s += warmup_scan_rollout(
                         rollout_fn,
                         seed=int(payload.get("seed") or 0) + worker_id,
+                        parallel_envs=parallel_envs,
                     )
                     rollout_fns[package.name] = rollout_fn
                 contexts[package.name] = ctx
@@ -140,9 +145,56 @@ def worker_main(payload: dict[str, Any]) -> str:
                         "package_name": item["package_name"],
                         "setup_s": round(setup_s, 3),
                         "compile_s": round(compile_s, 3),
+                        "parallel_envs": parallel_envs,
                     },
                 )
-            for record_id in item["record_ids"]:
+
+            record_ids = [int(r) for r in item["record_ids"]]
+            if scan_rollout and parallel_envs > 1:
+                from generate.scan_rollout import generate_records_scan_batch
+
+                t_gen = time.perf_counter()
+                batch_paths = generate_records_scan_batch(
+                    package,
+                    record_ids=record_ids,
+                    output_root=Path(payload["output_root"]),
+                    total_timesteps=total_timesteps,
+                    seed=payload.get("seed"),
+                    min_behavior_steps=min_behavior_steps,
+                    behavior_switch_prob=behavior_switch_prob,
+                    behavior_mix=mix,
+                    ctx=ctx,
+                    rollout_fn=rollout_fns.get(package.name),
+                    parallel_envs=parallel_envs,
+                )
+                # Attribute generate time evenly across records for progress.
+                generate_s_total = time.perf_counter() - t_gen
+                per_rec = generate_s_total / max(len(batch_paths), 1)
+                for path, record_id in zip(batch_paths, record_ids):
+                    paths.append(path)
+                    _report(
+                        payload,
+                        {
+                            "event": "record_done",
+                            "worker_id": worker_id,
+                            "device": device,
+                            "gpu_id": payload.get("gpu_id"),
+                            "package_name": item["package_name"],
+                            "record_id": int(record_id),
+                            "path": str(path),
+                            "generate_s": round(per_rec, 3),
+                        },
+                    )
+                    if payload.get("progress_queue") is None:
+                        print(
+                            f"[record_worker] worker={worker_id} device={device} "
+                            f"gpu={payload.get('gpu_id')} wrote {path} "
+                            f"generate_s~={per_rec:.1f} parallel_envs={parallel_envs}",
+                            flush=True,
+                        )
+                continue
+
+            for record_id in record_ids:
                 t_gen = time.perf_counter()
                 path = generate_one_record(
                     package,

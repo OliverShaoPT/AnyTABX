@@ -262,6 +262,7 @@ def plan_jobs(
     schedule: str = "task",
     stagger_s: float = 1.0,
     scan_rollout: bool = True,
+    parallel_envs: int = 1,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -308,6 +309,7 @@ def plan_jobs(
                 "schedule": schedule,
                 "stagger_s": float(stagger_s),
                 "scan_rollout": bool(scan_rollout),
+                "parallel_envs": max(1, int(parallel_envs)),
             }
         )
     return jobs
@@ -390,11 +392,15 @@ def run_from_config(config: dict[str, Any]) -> None:
         schedule=schedule,
         stagger_s=stagger_s,
         scan_rollout=bool(config.get("scan_rollout", True)),
+        parallel_envs=max(1, int(config.get("parallel_envs", 1) or 1)),
     )
 
     planned = _planned_record_count(jobs)
+    parallel_envs = max(1, int(config.get("parallel_envs", 1) or 1))
     print(
         f"[parallel_records] schedule={schedule} stagger_s={stagger_s} "
+        f"scan_rollout={config.get('scan_rollout', True)} "
+        f"parallel_envs={parallel_envs} "
         f"tasks={len(packages)} total_records={total_records} "
         f"planned={planned} "
         f"per_task={counts[0] if len(set(counts)) == 1 else counts} "
@@ -537,6 +543,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Device-side lax.scan per record (default true). false=legacy step loop.",
     )
     parser.add_argument(
+        "--parallel_envs",
+        type=int,
+        default=None,
+        help="vmap batch size B per scan call (pad last batch). Requires scan_rollout.",
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -576,6 +588,8 @@ def main(argv: list[str] | None = None) -> None:
         config["task_index"] = args.task_index
     if args.scan_rollout is not None:
         config["scan_rollout"] = args.scan_rollout == "true"
+    if args.parallel_envs is not None:
+        config["parallel_envs"] = max(1, int(args.parallel_envs))
 
     run_from_config(config)
     print(f"[parallel_records] done → {config['output_root']}", flush=True)
