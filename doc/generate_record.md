@@ -134,7 +134,8 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 `behavior_mix` 等。
 
 - `total_records` 在 tasks 间均分（`// n_tasks`，余数补给前面的 task）。
-- Worker 按 `record_id % n_workers` 分片（worker0: `record-000000,000004,…`）。
+- 先把所有 `(task, record_id)` 摊平，再 round-robin 分给 worker（按 record 并行，而不是按 task 内 id 分片）。
+- 实际进程数 = `min(配置的 worker 数, 总 record 数)`，避免空闲 worker。
 - 目录在 **写完一条 record 落盘时** 再创建（不预建空文件夹）。
 - 也可用 `python -m generate.parallel_records --config ...`。
 

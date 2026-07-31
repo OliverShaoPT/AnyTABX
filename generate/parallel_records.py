@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 import queue as queue_mod
 import threading
 import time
@@ -14,8 +15,10 @@ from typing import Any
 
 from generate.dump_schema import ensure_dir
 from generate.progress import LocalQueue, ProgressTracker
-from generate.record_worker import worker_main
-from generate.task_package import discover_task_packages, pack_task_packages
+from generate.record_worker import force_jax_cpu_env, worker_main
+
+# NOTE: do not import generate.task_package / src.tabx at module import time.
+# Those pull in JAX; for device=cpu we must set CUDA/JAX env first.
 
 
 def _planned_record_count(jobs: list[dict[str, Any]]) -> int:
@@ -118,21 +121,37 @@ def even_records_per_task(total_records: int, n_tasks: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(n_tasks)]
 
 
-def stripe_record_ids(
+def flatten_record_units(
+    packages: list[Any],
+    counts: list[int],
     start_index: int,
-    count: int,
-    n_workers: int,
-    worker_id: int,
-) -> list[int]:
-    """Round-robin ids: worker0 → start, start+n, …; worker1 → start+1, …"""
+) -> list[tuple[str, int]]:
+    """Flatten all (package_name, record_id) work units across tasks."""
 
-    if count <= 0:
-        return []
-    return [
-        record_id
-        for offset, record_id in enumerate(range(start_index, start_index + count))
-        if offset % n_workers == worker_id
-    ]
+    units: list[tuple[str, int]] = []
+    for package, count in zip(packages, counts):
+        if count <= 0:
+            continue
+        for record_id in range(start_index, start_index + count):
+            units.append((package.name, int(record_id)))
+    return units
+
+
+def _group_units_by_package(
+    units: list[tuple[str, int]],
+) -> list[dict[str, Any]]:
+    """Preserve assignment order while grouping record ids under each package."""
+
+    items: list[dict[str, Any]] = []
+    index: dict[str, dict[str, Any]] = {}
+    for package_name, record_id in units:
+        item = index.get(package_name)
+        if item is None:
+            item = {"package_name": package_name, "record_ids": []}
+            index[package_name] = item
+            items.append(item)
+        item["record_ids"].append(record_id)
+    return items
 
 
 def plan_jobs(
@@ -150,27 +169,32 @@ def plan_jobs(
     behavior_mix: list[dict[str, Any]] | None,
     jax_platform: str = "cuda",
 ) -> list[dict[str, Any]]:
-    """One job per worker slot (keeps GPU occupancy at workers_per_gpu)."""
+    """One job per active worker; work units are striped across all records.
 
-    n_workers = len(slots)
+    Unlike per-task striping, every ``(task, record_id)`` pair is flattened first
+    and then round-robined across workers, so idle workers only appear when
+    ``n_workers > n_records``.
+    """
+
+    units = flatten_record_units(packages, counts, start_index)
+    if not units:
+        return []
+
+    # Do not spawn more processes than there are records to write.
+    active_slots = slots[: min(len(slots), len(units))]
+    n_workers = len(active_slots)
+    owned: list[list[tuple[str, int]]] = [[] for _ in range(n_workers)]
+    for index, unit in enumerate(units):
+        owned[index % n_workers].append(unit)
+
     jobs: list[dict[str, Any]] = []
-    for slot in slots:
-        items: list[dict[str, Any]] = []
-        for package, count in zip(packages, counts):
-            record_ids = stripe_record_ids(start_index, count, n_workers, slot.worker_id)
-            if record_ids:
-                items.append(
-                    {
-                        "package_name": package.name,
-                        "record_ids": record_ids,
-                    }
-                )
-        if not items:
+    for slot, units_for_worker in zip(active_slots, owned):
+        if not units_for_worker:
             continue
         jobs.append(
             {
                 "packages_root": str(packages_root),
-                "items": items,
+                "items": _group_units_by_package(units_for_worker),
                 "output_root": str(output_root),
                 "total_timesteps": total_timesteps,
                 "seed": seed,
@@ -187,6 +211,18 @@ def plan_jobs(
 
 
 def run_from_config(config: dict[str, Any]) -> None:
+    device = str(config.get("device", "cpu")).lower()
+    if device == "cpu":
+        # Must run before importing task_package / tabx / jax (see module docstring).
+        force_jax_cpu_env()
+        print(
+            "[parallel_records] device=cpu → JAX_PLATFORMS=cpu, "
+            "JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1 (no CUDA init)",
+            flush=True,
+        )
+
+    from generate.task_package import discover_task_packages, pack_task_packages
+
     coach_root = config.get("coach_root") or config.get("task_packages_root")
     if not coach_root:
         raise ValueError("coach_root (or legacy task_packages_root) is required")
@@ -226,7 +262,7 @@ def run_from_config(config: dict[str, Any]) -> None:
     counts = even_records_per_task(total_records, len(packages))
     start_index = int(config.get("start_index", 0))
     slots = build_worker_slots(
-        device=str(config.get("device", "cpu")),
+        device=device,
         cpu_workers=int(config.get("cpu_workers", 8)),
         gpu_ids=[int(x) for x in (config.get("gpu_ids") or [])],
         workers_per_gpu=int(config.get("workers_per_gpu", 1)),
@@ -253,7 +289,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"[parallel_records] tasks={len(packages)} total_records={total_records} "
         f"planned={planned} "
         f"per_task={counts[0] if len(set(counts)) == 1 else counts} "
-        f"workers={len(slots)} device={slots[0].device} jobs={len(jobs)}",
+        f"slots={len(slots)} active_workers={len(jobs)} device={slots[0].device}",
         flush=True,
     )
     print(
@@ -261,15 +297,15 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"(jsonl: generation_progress.jsonl)",
         flush=True,
     )
-    for slot in slots:
-        owned = [
-            rid
-            for count in counts
-            for rid in stripe_record_ids(start_index, count, len(slots), slot.worker_id)
+    for job in jobs:
+        sample = [
+            f"{item['package_name']}:{rid}"
+            for item in job["items"]
+            for rid in item["record_ids"]
         ]
         print(
-            f"  worker={slot.worker_id:02d} device={slot.device} gpu={slot.gpu_id} "
-            f"n_records={len(owned)} ids_sample={owned[:6]}{'...' if len(owned) > 6 else ''}",
+            f"  worker={job['worker_id']:02d} device={job['device']} gpu={job['gpu_id']} "
+            f"n_records={len(sample)} sample={sample[:4]}{'...' if len(sample) > 4 else ''}",
             flush=True,
         )
 
@@ -294,7 +330,11 @@ def run_from_config(config: dict[str, Any]) -> None:
         )
         drain.start()
         try:
-            with ctx.Pool(processes=len(slots)) as pool:
+            # Re-assert CPU env in each child before it imports JAX.
+            pool_kwargs: dict[str, Any] = {"processes": len(jobs)}
+            if device == "cpu":
+                pool_kwargs["initializer"] = force_jax_cpu_env
+            with ctx.Pool(**pool_kwargs) as pool:
                 for _ in pool.imap_unordered(
                     worker_main, _attach_progress_queue(jobs, queue)
                 ):
