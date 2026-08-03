@@ -59,6 +59,7 @@ adapt_pilot_records: 4        # records used to estimate WR before/while adaptin
 adapt_max_iters: 3
 
 # --- Behavior policy mixture (weights renormalized) ---
+# Ordered by quality so policy_id == policy_tag (0=weakest … 7=oracle; 8=mask at convert).
 behavior_mix:
   - policy_id: 0
     name: heuristic_random
@@ -71,21 +72,21 @@ behavior_mix:
     weight: 0.14
     heuristic: novice
   - policy_id: 2
-    name: heuristic_medium
-    kind: heuristic
-    weight: 0.16
-    heuristic: medium
-  - policy_id: 3
-    name: heuristic_advanced
-    kind: heuristic
-    weight: 0.12
-    heuristic: advanced
-  - policy_id: 4
     name: heuristic_medium_eps0.5
     kind: heuristic
     weight: 0.10
     heuristic: medium
     epsilon: 0.5
+  - policy_id: 3
+    name: heuristic_medium
+    kind: heuristic
+    weight: 0.16
+    heuristic: medium
+  - policy_id: 4
+    name: heuristic_advanced
+    kind: heuristic
+    weight: 0.12
+    heuristic: advanced
   - policy_id: 5
     name: oracle_eps0.3
     kind: oracle_eps

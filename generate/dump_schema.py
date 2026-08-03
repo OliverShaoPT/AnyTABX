@@ -24,6 +24,7 @@ ENV_CENTRIC_ARRAYS = (
     "reset",
     "episode_id",
     "behavior_policy_id",
+    "policy_tag",
     "visible_matrix",
     "unit_position",
     "unit_rotation",

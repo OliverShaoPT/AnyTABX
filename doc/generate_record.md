@@ -132,11 +132,30 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
   reward_team.npy           # (T, n_ally) team 广播标量
   reward_individual.npy     # (T, n_ally) 消融用 hybrid
   done.npy, truncation.npy, is_win.npy
-  reset.npy, episode_id.npy, behavior_policy_id.npy
+  reset.npy, episode_id.npy
+  behavior_policy_id.npy    # (T, n_ally) mix policy_id（目前各 ally 相同）
+  policy_tag.npy            # (T, n_ally) 质量序：0…7；agent 转换后 mask 步为 8
   visible_matrix.npy        # (T, N, N)
   obs_flat.npy              # (T, n_ally, obs_dim) 便于第二步拆分
   unit_*.npy                # 全局单位快照
 ```
+
+**`policy_id` / `policy_tag` 对照（默认 `behavior_mix`，已按质量排序，`policy_id == policy_tag`）**
+
+| policy_id | name | policy_tag |
+|---|---|---|
+| 0 | heuristic_random | 0 |
+| 1 | heuristic_novice | 1 |
+| 2 | heuristic_medium_eps0.5 | 2 |
+| 3 | heuristic_medium | 3 |
+| 4 | heuristic_advanced | 4 |
+| 5 | oracle_eps0.3 | 5 |
+| 6 | oracle_eps0.1 | 6 |
+| 7 | oracle_pure | 7 |
+| — | mask（仅 agent-centric 转换写入） | 8 |
+
+`policy_tag` 阶梯：0 random → 1 novice → 2 medium+ε → 3 medium → 4 advanced → 5 oracle_eps高ε → 6 oracle_eps低ε → 7 pure oracle → **8 mask**。  
+env 落盘不含 8；`python -m generate.agent_centric` 在 `policy_mask==1` 的步把 `policy_tag` 写成 8。`meta.json` 含 `policy_tag_legend` 与 `policy_id_mapping`。
 
 并行（**生产路径：GPU**）：改配置后一键启动：
 
@@ -186,6 +205,8 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 python -m generate.agent_centric \
   --records_root /path/to/0803_overfit_16task_val \
   --output_root /path/to/0803_overfit_16task_val_agent \
+  --mask_prob 0.3 \
+  --seed 0 \
   --shuffle \
   --workers 8
 ```
@@ -197,6 +218,8 @@ python -m generate.agent_centric --records_root ./data/records
 python -m generate.agent_centric --record_dir ./data/records/task_00000_xxx/record-000000
 ```
 
+**`policy_mask`（转换时生成）**：`--mask_prob` 控制（默认 `0.3`）。每次 `behavior_policy_id` **切换**时以该概率决定是否 mask；若 mask，则一直 mask 到下次 switch。`1`=masked。`t=0` 也算一次决策点。同时将这些步的 `policy_tag` 设为 **8（mask）**。
+
 **扁平布局**（`--output_root`）：
 
 ```text
@@ -205,6 +228,8 @@ python -m generate.agent_centric --record_dir ./data/records/task_00000_xxx/reco
     obs_static.npy
     obs_dynamic.npy
     ...
+    policy_tag.npy            # (T,)
+    policy_mask.npy           # (T,) 1=masked
     meta.json
 ```
 
@@ -226,10 +251,12 @@ record-XXXXXX/agent_centric/{ally_key}/
   reset.npy                 # 透传，提示 episode 跳变
   episode_id.npy
   behavior_policy_id.npy
+  policy_tag.npy
+  policy_mask.npy
   meta.json
 ```
 
-目录名与环境 `ally_keys` 一致（常见为 `unit_00`…，不是 `ally_0`）。同一 agent 下各文件第 `t` 行对齐。`obs_static` = own(14) + zones；`obs_dynamic` = 其他单位槽 (N−1, 16)，`mask` 标可见非零槽。训练侧 `discover_agent_centric_dirs` 会优先识别扁平根目录下的 agent 子目录。
+目录名与环境 `ally_keys` 一致（常见为 `unit_00`…，不是 `ally_0`）。同一 agent 下各文件第 `t` 行对齐。`obs_static` = own(14) + zones；`obs_dynamic` = 其他单位槽 (N−1, 16)，`obs_dynamic_mask` 标可见非零槽。训练侧 `discover_agent_centric_dirs` 会优先识别扁平根目录下的 agent 子目录。
 
 > **NaN 说明**：padding 单位曾在 `ParsedState` 里对 `max_health=0` / `attack_cooldown=0` 做除法得到 NaN，再与 visibility 相乘仍为 NaN（`NaN*0=NaN`）。已在 `ParsedState.from_state` 改为安全除法；`env_centric` 落盘时额外 `nan_to_num` 兜底（与 `marl_baseline` 训练侧一致）。
 

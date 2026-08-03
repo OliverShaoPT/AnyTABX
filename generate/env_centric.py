@@ -20,6 +20,9 @@ from generate.behavior_mix import (
     DEFAULT_BEHAVIOR_MIX,
     BehaviorSpec,
     behavior_mix_from_config,
+    policy_id_mapping_json,
+    policy_tag_for_spec,
+    policy_tag_legend_json,
 )
 from generate.dump_schema import ensure_dir, write_env_centric_record
 from generate.oracle_loader import OracleCoach, load_oracle_coach
@@ -335,6 +338,7 @@ def generate_one_record(
         "reset": [],
         "episode_id": [],
         "behavior_policy_id": [],
+        "policy_tag": [],
         "visible_matrix": [],
         "obs_flat": [],
         "unit_position": [],
@@ -424,7 +428,12 @@ def generate_one_record(
         buffers["is_win"].append(np.uint8(ally_win))
         buffers["reset"].append(np.uint8(is_reset_step))
         buffers["episode_id"].append(np.int32(episode_id))
-        buffers["behavior_policy_id"].append(np.int32(shared.spec.policy_id))
+        # Per-ally channels (currently shared across allies).
+        tag = int(policy_tag_for_spec(shared.spec))
+        buffers["behavior_policy_id"].append(
+            np.full((n_ally,), int(shared.spec.policy_id), dtype=np.int32)
+        )
+        buffers["policy_tag"].append(np.full((n_ally,), tag, dtype=np.int32))
         buffers["visible_matrix"].append(visible)
         buffers["obs_flat"].append(
             np.stack(
@@ -471,7 +480,8 @@ def generate_one_record(
         "is_win": np.asarray(buffers["is_win"], dtype=np.uint8),
         "reset": np.asarray(buffers["reset"], dtype=np.uint8),
         "episode_id": np.asarray(buffers["episode_id"], dtype=np.int32),
-        "behavior_policy_id": np.asarray(buffers["behavior_policy_id"], dtype=np.int32),
+        "behavior_policy_id": np.stack(buffers["behavior_policy_id"], axis=0),
+        "policy_tag": np.stack(buffers["policy_tag"], axis=0),
         "visible_matrix": np.stack(buffers["visible_matrix"], axis=0),
         "obs_flat": np.stack(buffers["obs_flat"], axis=0),
         "unit_position": np.stack(buffers["unit_position"], axis=0),
@@ -507,6 +517,8 @@ def generate_one_record(
         "shared_ally_policy": True,
         "individual_reward_config": asdict(indiv_cfg),
         "behavior_mix": [asdict(s) for s in mix],
+        "policy_tag_legend": policy_tag_legend_json(),
+        "policy_id_mapping": policy_id_mapping_json(mix),
         "oracle": {
             "algorithm": oracle.algorithm,
             "ckpt": str(package.oracle_ckpt),

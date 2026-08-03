@@ -8,8 +8,18 @@ from pathlib import Path
 
 import numpy as np
 
-from generate.agent_centric import flat_agent_dirname, split_one_record, split_records_root
-from generate.behavior_mix import BehaviorSwitcher, DEFAULT_BEHAVIOR_MIX
+from generate.agent_centric import (
+    build_policy_mask,
+    flat_agent_dirname,
+    split_one_record,
+    split_records_root,
+)
+from generate.behavior_mix import (
+    POLICY_TAG_MASK,
+    BehaviorSwitcher,
+    DEFAULT_BEHAVIOR_MIX,
+    policy_tag_for_spec,
+)
 from generate.dump_schema import (
     OWN_FEATURE_DIM,
     OTHER_FEATURE_DIM,
@@ -82,7 +92,12 @@ class AgentCentricSplitTest(unittest.TestCase):
             "is_win": np.array([0, 0, 0, 0, 0], dtype=np.uint8),
             "reset": np.array([1, 0, 0, 1, 0], dtype=np.uint8),
             "episode_id": np.array([0, 0, 0, 1, 1], dtype=np.int32),
-            "behavior_policy_id": np.zeros((t,), dtype=np.int32),
+            "behavior_policy_id": np.array(
+                [[0, 0], [0, 0], [1, 1], [1, 1], [2, 2]], dtype=np.int32
+            ),
+            "policy_tag": np.array(
+                [[0, 0], [0, 0], [3, 3], [3, 3], [7, 7]], dtype=np.int32
+            ),
             "obs_flat": np.zeros((t, n_ally, obs_dim), dtype=np.float32),
         }
         meta = {
@@ -97,7 +112,7 @@ class AgentCentricSplitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             record_dir = Path(tmp) / "record-000000"
             write_env_centric_record(record_dir, arrays, meta)
-            paths = split_one_record(record_dir)
+            paths = split_one_record(record_dir, mask_prob=1.0, mask_seed=0)
             self.assertEqual(len(paths), 2)
             ally0 = record_dir / "agent_centric" / "ally_0"
             reset = np.load(ally0 / "reset.npy")
@@ -117,6 +132,11 @@ class AgentCentricSplitTest(unittest.TestCase):
                     np.argmax(ref_dist, axis=-1),
                     np.load(ally0 / "reference_action.npy"),
                 )
+            )
+            # mask_prob=1 → every segment masked; tags overwritten to 8
+            self.assertTrue(np.all(np.load(ally0 / "policy_mask.npy") == 1))
+            self.assertTrue(
+                np.all(np.load(ally0 / "policy_tag.npy") == POLICY_TAG_MASK)
             )
 
     def test_flat_output_root(self) -> None:
@@ -199,6 +219,41 @@ class AgentCentricSplitTest(unittest.TestCase):
                 write_env_centric_record(root / task / f"record-{rid:06d}", arrays, m)
             split_records_root(root, output_root=out, shuffle=True, seed=0, workers=2)
             self.assertEqual(len(discover_agent_centric_dirs(out)), 2)
+
+
+class PolicyTagMaskTest(unittest.TestCase):
+    def test_policy_tag_ladder(self) -> None:
+        by_name = {s.name: policy_tag_for_spec(s) for s in DEFAULT_BEHAVIOR_MIX}
+        self.assertEqual(by_name["heuristic_random"], 0)
+        self.assertEqual(by_name["heuristic_novice"], 1)
+        self.assertEqual(by_name["heuristic_medium_eps0.5"], 2)
+        self.assertEqual(by_name["heuristic_medium"], 3)
+        self.assertEqual(by_name["heuristic_advanced"], 4)
+        self.assertEqual(by_name["oracle_eps0.3"], 5)
+        self.assertEqual(by_name["oracle_eps0.1"], 6)
+        self.assertEqual(by_name["oracle_pure"], 7)
+        self.assertEqual(POLICY_TAG_MASK, 8)
+        # Quality-ordered mix: policy_id matches policy_tag for defaults.
+        for spec in DEFAULT_BEHAVIOR_MIX:
+            self.assertEqual(int(spec.policy_id), policy_tag_for_spec(spec), spec.name)
+
+    def test_build_policy_mask_holds_until_switch(self) -> None:
+        ids = np.array([0, 0, 0, 1, 1, 2], dtype=np.int32)
+
+        class Scripted:
+            def __init__(self, values):
+                self.values = list(values)
+                self.i = 0
+
+            def random(self):
+                v = self.values[self.i]
+                self.i += 1
+                return v
+
+        # p=0.5: 0.0→mask, 0.9→keep, 0.0→mask; held within each policy segment.
+        scripted = Scripted([0.0, 0.9, 0.0])
+        mask = build_policy_mask(ids, mask_prob=0.5, rng=scripted)  # type: ignore[arg-type]
+        self.assertTrue(np.array_equal(mask, np.array([1, 1, 1, 0, 0, 1], dtype=np.uint8)))
 
 
 class WinrateAdaptTest(unittest.TestCase):

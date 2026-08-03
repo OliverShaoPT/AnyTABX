@@ -22,16 +22,130 @@ class BehaviorSpec:
     epsilon: float | None = None
 
 
+# Ordered by quality so default ``policy_id == policy_tag`` (0…7; 8=mask at convert).
 DEFAULT_BEHAVIOR_MIX: tuple[BehaviorSpec, ...] = (
     BehaviorSpec(0, "heuristic_random", "heuristic", 0.12, heuristic="random"),
     BehaviorSpec(1, "heuristic_novice", "heuristic", 0.14, heuristic="novice"),
-    BehaviorSpec(2, "heuristic_medium", "heuristic", 0.16, heuristic="medium"),
-    BehaviorSpec(3, "heuristic_advanced", "heuristic", 0.12, heuristic="advanced"),
-    BehaviorSpec(4, "heuristic_medium_eps0.5", "heuristic", 0.10, heuristic="medium", epsilon=0.5),
+    BehaviorSpec(2, "heuristic_medium_eps0.5", "heuristic", 0.10, heuristic="medium", epsilon=0.5),
+    BehaviorSpec(3, "heuristic_medium", "heuristic", 0.16, heuristic="medium"),
+    BehaviorSpec(4, "heuristic_advanced", "heuristic", 0.12, heuristic="advanced"),
     BehaviorSpec(5, "oracle_eps0.3", "oracle_eps", 0.14, epsilon=0.3),
     BehaviorSpec(6, "oracle_eps0.1", "oracle_eps", 0.12, epsilon=0.1),
     BehaviorSpec(7, "oracle_pure", "oracle", 0.10, epsilon=0.0),
 )
+
+# Quality / mask index written to ``policy_tag.npy``.
+POLICY_TAG_MASK = 8
+
+# tag → short name (includes conversion-time mask).
+POLICY_TAG_LEGEND: dict[int, str] = {
+    0: "heuristic_random",
+    1: "heuristic_novice",
+    2: "heuristic_medium_noisy",
+    3: "heuristic_medium",
+    4: "heuristic_advanced",
+    5: "oracle_eps_high",
+    6: "oracle_eps_low",
+    7: "oracle_pure",
+    8: "mask",
+}
+
+# Default mix: policy_id → (name, policy_tag). Tag 8 is only set at agent-centric convert.
+DEFAULT_POLICY_ID_MAPPING: tuple[tuple[int, str, int], ...] = (
+    (0, "heuristic_random", 0),
+    (1, "heuristic_novice", 1),
+    (2, "heuristic_medium_eps0.5", 2),
+    (3, "heuristic_medium", 3),
+    (4, "heuristic_advanced", 4),
+    (5, "oracle_eps0.3", 5),
+    (6, "oracle_eps0.1", 6),
+    (7, "oracle_pure", 7),
+)
+
+
+def policy_tag_legend_json() -> dict[str, str]:
+    """String-keyed legend for ``meta.json``."""
+
+    return {str(k): v for k, v in sorted(POLICY_TAG_LEGEND.items())}
+
+
+def policy_id_mapping_json(mix: Sequence[BehaviorSpec] | None = None) -> list[dict[str, Any]]:
+    """Full ``policy_id → name → tag`` rows for meta / docs."""
+
+    if mix is None:
+        mix = DEFAULT_BEHAVIOR_MIX
+    rows = [
+        {
+            "policy_id": int(spec.policy_id),
+            "name": str(spec.name),
+            "policy_tag": int(policy_tag_for_spec(spec)),
+        }
+        for spec in mix
+    ]
+    rows.append(
+        {
+            "policy_id": None,
+            "name": "mask",
+            "policy_tag": int(POLICY_TAG_MASK),
+            "note": "set on agent-centric convert when policy_mask==1",
+        }
+    )
+    return rows
+
+
+def policy_tag_for_spec(spec: BehaviorSpec) -> int:
+    """Quality rank for dump/training: ``random=0`` … pure ``oracle=7``; ``8=mask``.
+
+    Ladder:
+      0 random, 1 novice, 2 medium+ε, 3 medium, 4 advanced,
+      5 oracle_eps(~0.3), 6 oracle_eps(~0.1), 7 oracle, 8 mask
+      (mask is applied in agent-centric conversion, not at env dump).
+
+    Default mix is quality-ordered so ``policy_id == policy_tag``::
+
+      0 heuristic_random
+      1 heuristic_novice
+      2 heuristic_medium_eps0.5
+      3 heuristic_medium
+      4 heuristic_advanced
+      5 oracle_eps0.3
+      6 oracle_eps0.1
+      7 oracle_pure
+      (convert) mask → 8
+    """
+
+    if spec.kind == "oracle":
+        return 7
+    if spec.kind == "oracle_eps":
+        eps = float(spec.epsilon or 0.0)
+        if eps <= 0.15:
+            return 6
+        return 5
+    heuristic = str(spec.heuristic or "medium")
+    eps = float(spec.epsilon or 0.0)
+    if heuristic == "random":
+        return 0
+    if heuristic == "novice":
+        return 1
+    if heuristic == "medium":
+        return 2 if eps >= 0.25 else 3
+    if heuristic == "advanced":
+        return 4
+    if heuristic == "expert":
+        return 5
+    return 3
+
+
+def policy_tag_table(mix: Sequence[BehaviorSpec]) -> list[int]:
+    """Per-mix-index tags (same order as ``mix`` / ``lax.switch``)."""
+
+    return [policy_tag_for_spec(spec) for spec in mix]
+
+
+def policy_id_to_tag(mix: Sequence[BehaviorSpec]) -> dict[int, int]:
+    """Map ``BehaviorSpec.policy_id`` → quality tag (last wins on duplicates)."""
+
+    return {int(spec.policy_id): policy_tag_for_spec(spec) for spec in mix}
 
 
 def behavior_mix_from_config(entries: Sequence[dict[str, Any]] | None) -> tuple[BehaviorSpec, ...]:

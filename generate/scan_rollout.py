@@ -15,6 +15,9 @@ from generate.behavior_mix import (
     DEFAULT_BEHAVIOR_MIX,
     maybe_switch_policy_id,
     mix_cdf_jax,
+    policy_id_mapping_json,
+    policy_tag_legend_json,
+    policy_tag_table,
     sample_policy_index,
 )
 from generate.dump_schema import write_env_centric_record
@@ -125,8 +128,9 @@ def _make_single_env_rollout(
     max_n_zone = int(env.max_n_zone)
     oracle = ctx.oracle
     indiv_cfg = IndividualRewardConfig()
-    # Map mix position -> policy_id (usually identity, but honor config).
+    # Map mix position -> policy_id / quality tag (usually identity, but honor config).
     policy_ids = jnp.asarray([int(s.policy_id) for s in mix], dtype=jnp.int32)
+    policy_tags = jnp.asarray(policy_tag_table(mix), dtype=jnp.int32)
     branches = _build_policy_branches(
         mix,
         oracle=oracle,
@@ -178,6 +182,10 @@ def _make_single_env_rollout(
                 behavior_switch_prob=behavior_switch_prob,
             )
             policy_id = policy_ids[mix_index]
+            policy_tag = policy_tags[mix_index]
+            # Per-ally channels (currently shared; ready for heterogeneous policies).
+            policy_id_agents = jnp.full((n_ally,), policy_id, dtype=jnp.int32)
+            policy_tag_agents = jnp.full((n_ally,), policy_tag, dtype=jnp.int32)
 
             avail = env.get_avail_actions(state)
             # Same split pattern as env_centric (key, bkey, skey).
@@ -259,7 +267,8 @@ def _make_single_env_rollout(
                 "is_win": ally_win.astype(jnp.uint8),
                 "reset": is_reset_step.astype(jnp.uint8),
                 "episode_id": episode_id.astype(jnp.int32),
-                "behavior_policy_id": policy_id.astype(jnp.int32),
+                "behavior_policy_id": policy_id_agents,
+                "policy_tag": policy_tag_agents,
                 "visible_matrix": visible,
                 "obs_flat": obs_flat,
                 **unit_pack,
@@ -400,6 +409,7 @@ def _cast_array(name: str, arr: np.ndarray) -> np.ndarray:
     if name in {
         "episode_id",
         "behavior_policy_id",
+        "policy_tag",
         "unit_team",
         "actions_behavior",
         "actions_reference",
@@ -458,6 +468,8 @@ def _record_meta(
         "shared_ally_policy": True,
         "individual_reward_config": asdict(indiv_cfg),
         "behavior_mix": [asdict(s) for s in mix],
+        "policy_tag_legend": policy_tag_legend_json(),
+        "policy_id_mapping": policy_id_mapping_json(mix),
         "oracle": {
             "algorithm": ctx.oracle.algorithm,
             "ckpt": str(package.oracle_ckpt),
