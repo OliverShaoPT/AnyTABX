@@ -89,6 +89,19 @@ class ProgressTracker:
             self._last_heartbeat_at = time.time()
             self._write_snapshot(status="running")
             self._print_line(final=False)
+        elif kind == "adapt_done":
+            self.last_event = event
+            self._append_jsonl(event)
+            self._last_heartbeat_at = time.time()
+            wr = event.get("measured_win_rate")
+            wr_s = "n/a" if wr is None else f"{float(wr):.1%}"
+            print(
+                f"[parallel_records] adapt worker={event.get('worker_id')} "
+                f"pkg={event.get('package_name')} status={event.get('status')} "
+                f"strength={event.get('strength')} wr={wr_s} "
+                f"band=[{event.get('win_rate_min')},{event.get('win_rate_max')}]",
+                flush=True,
+            )
         elif kind == "worker_error":
             self.last_event = event
             self._append_jsonl(event)

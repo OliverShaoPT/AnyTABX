@@ -86,6 +86,25 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 
 默认 **每次 env reset 都会强制重采样** behavior policy；同一 episode 内仍受冷却约束（`min_behavior_steps` + `behavior_switch_prob`）。
 
+### 3.3.1 按 Task 自适应胜率（可选）
+
+同一套全局 `behavior_mix` 在不同 task 上胜率可能差很多。打开 `winrate_adapt` 后，每个 task 会：
+
+1. 用 `adapt_pilot_records` 条 record **试跑**估 episode 胜率（计入最终输出，`meta.adapt.pilot=true`）
+2. 只重加权 ally mix（strong=oracle/oracle_eps/advanced vs 其余）；**不改 enemy**（保持 Coach 对手）
+3. Mix CDF 为运行时输入，权重变化不必重新 JIT
+4. 正式生成剩余 records（`meta.adapt` 记录 strength / 测得 WR / status）
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `winrate_adapt` | false | 是否启用 |
+| `win_rate_min` | 0.30 | 胜率下限；过低则提高 oracle 权重 |
+| `win_rate_max` | null | 上限；**不设置 / null = 不约束上限** |
+| `adapt_pilot_records` | 4 | 每次试跑用的 record 条数 |
+| `adapt_max_iters` | 3 | 最多调整轮数 |
+
+验收：`python tools/summarize_env_winrate.py --records_root ... --by_task`。若 max-oracle 仍低于下限，记 `adapt_failed` 并保留尽力 mix。
+
 ### 3.4 总 timestep + 多次 reset
 
 - Record 长度 = `total_timesteps`，不是固定 episode 数。

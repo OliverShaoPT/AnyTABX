@@ -114,7 +114,7 @@ def _make_single_env_rollout(
     behavior_switch_prob: float,
     total_timesteps: int,
 ):
-    """Unjitted ``seed -> traj`` for one env (vmappable over seed)."""
+    """Unjitted ``(seed, cdf) -> traj`` for one env (vmappable over seed)."""
 
     env = ctx.env
     env_params = ctx.env_params
@@ -125,7 +125,6 @@ def _make_single_env_rollout(
     max_n_zone = int(env.max_n_zone)
     oracle = ctx.oracle
     indiv_cfg = IndividualRewardConfig()
-    cdf = mix_cdf_jax(mix)
     # Map mix position -> policy_id (usually identity, but honor config).
     policy_ids = jnp.asarray([int(s.policy_id) for s in mix], dtype=jnp.int32)
     branches = _build_policy_branches(
@@ -136,7 +135,9 @@ def _make_single_env_rollout(
         max_n_zone=max_n_zone,
     )
 
-    def rollout(seed: jax.Array):
+    def rollout(seed: jax.Array, cdf: jax.Array):
+        """``seed`` + runtime mix ``cdf`` (weights change without recompile)."""
+
         # Match env_centric: jax.random.key(seed % 2**32).
         key = jax.random.key(jnp.asarray(seed, dtype=jnp.uint32))
         key, reset_key, init_policy_key = jax.random.split(key, 3)
@@ -347,9 +348,9 @@ def build_scan_rollout_fn(
 ):
     """Return jitted rollout.
 
-    - ``parallel_envs <= 1``: ``seed -> traj`` with leaves ``(T, ...)``
-    - ``parallel_envs > 1``: ``seeds[B] -> traj`` with leaves ``(B, T, ...)``
-      (fixed B; pad incomplete batches so one compile is reused).
+    - ``parallel_envs <= 1``: ``(seed, cdf) -> traj`` with leaves ``(T, ...)``
+    - ``parallel_envs > 1``: ``(seeds[B], cdf) -> traj`` with leaves ``(B, T, ...)``
+      (vmap over seeds only; cdf broadcast). Fixed B; pad incomplete batches.
     """
 
     raw = _make_single_env_rollout(
@@ -362,24 +363,30 @@ def build_scan_rollout_fn(
     b = max(1, int(parallel_envs))
     if b <= 1:
         return jax.jit(raw)
-    return jax.jit(jax.vmap(raw))
+    return jax.jit(jax.vmap(raw, in_axes=(0, None)))
 
 
 def warmup_scan_rollout(
     rollout_fn,
     *,
+    mix: tuple[BehaviorSpec, ...] | None = None,
+    cdf: jax.Array | None = None,
     seed: int = 0,
     parallel_envs: int = 1,
 ) -> float:
     import time
 
+    if cdf is None:
+        if mix is None:
+            mix = DEFAULT_BEHAVIOR_MIX
+        cdf = mix_cdf_jax(mix)
     t0 = time.perf_counter()
     b = max(1, int(parallel_envs))
     if b <= 1:
-        traj = rollout_fn(jnp.asarray(seed, dtype=jnp.uint32))
+        traj = rollout_fn(jnp.asarray(seed, dtype=jnp.uint32), cdf)
     else:
         seeds = jnp.arange(b, dtype=jnp.uint32) + jnp.uint32(int(seed) % (2**32))
-        traj = rollout_fn(seeds)
+        traj = rollout_fn(seeds, cdf)
     # Touch a leaf so device work finishes.
     leaf = traj["done"]
     if hasattr(leaf, "block_until_ready"):
@@ -429,9 +436,10 @@ def _record_meta(
     mix: tuple[BehaviorSpec, ...],
     arrays: dict[str, np.ndarray],
     parallel_envs: int,
+    adapt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     indiv_cfg = IndividualRewardConfig()
-    return {
+    meta: dict[str, Any] = {
         "schema": "env_centric_v1",
         "task_index": package.task_index,
         "task_id": package.task_id,
@@ -464,6 +472,9 @@ def _record_meta(
         "switcher_rng": "jax",
         "parallel_envs": int(parallel_envs),
     }
+    if adapt is not None:
+        meta["adapt"] = adapt
+    return meta
 
 
 def _write_one_from_arrays(
@@ -479,6 +490,7 @@ def _write_one_from_arrays(
     mix: tuple[BehaviorSpec, ...],
     arrays: dict[str, np.ndarray],
     parallel_envs: int,
+    adapt: dict[str, Any] | None = None,
 ) -> Path:
     safe_id = package.task_id.replace("/", "_")
     record_dir = (
@@ -497,6 +509,7 @@ def _write_one_from_arrays(
         mix=mix,
         arrays=arrays,
         parallel_envs=parallel_envs,
+        adapt=adapt,
     )
     write_env_centric_record(record_dir, arrays, meta)
     return record_dir
@@ -515,6 +528,7 @@ def generate_one_record_scan(
     ctx: RecordGenContext | None = None,
     rollout_fn=None,
     parallel_envs: int = 1,
+    adapt: dict[str, Any] | None = None,
 ) -> Path:
     """Generate one record (single-env scan). For B>1 use ``generate_records_scan_batch``."""
 
@@ -522,6 +536,7 @@ def generate_one_record_scan(
 
     seed_i = sample_record_seed(seed, salt=record_id)
     mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
+    cdf = mix_cdf_jax(mix)
     if ctx is None:
         ctx = build_record_gen_context(package)
     elif ctx.package.name != package.name:
@@ -539,7 +554,7 @@ def generate_one_record_scan(
             parallel_envs=1,
         )
 
-    traj = rollout_fn(jnp.asarray(seed_i % (2**32), dtype=jnp.uint32))
+    traj = rollout_fn(jnp.asarray(seed_i % (2**32), dtype=jnp.uint32), cdf)
     arrays = trajectory_to_numpy(traj)
     return _write_one_from_arrays(
         package,
@@ -553,6 +568,7 @@ def generate_one_record_scan(
         mix=mix,
         arrays=arrays,
         parallel_envs=max(1, int(parallel_envs)),
+        adapt=adapt,
     )
 
 
@@ -569,12 +585,14 @@ def generate_records_scan_batch(
     ctx: RecordGenContext | None = None,
     rollout_fn=None,
     parallel_envs: int = 1,
+    adapt: dict[str, Any] | None = None,
 ) -> list[str]:
     """Generate ``len(record_ids)`` records using fixed-B vmap batches + padding."""
 
     from generate.env_centric import build_record_gen_context
 
     mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
+    cdf = mix_cdf_jax(mix)
     if ctx is None:
         ctx = build_record_gen_context(package)
     elif ctx.package.name != package.name:
@@ -608,6 +626,7 @@ def generate_records_scan_batch(
                 ctx=ctx,
                 rollout_fn=rollout_fn,
                 parallel_envs=1,
+                adapt=adapt,
             )
             paths.append(str(path))
         return paths
@@ -622,7 +641,7 @@ def generate_records_scan_batch(
         while len(seeds_list) < b:
             seeds_list.append(0)
 
-        traj = rollout_fn(jnp.asarray(seeds_list, dtype=jnp.uint32))
+        traj = rollout_fn(jnp.asarray(seeds_list, dtype=jnp.uint32), cdf)
         batch = batch_trajectory_to_numpy(traj)
         for i in range(valid):
             rid = chunk[i]
@@ -639,7 +658,9 @@ def generate_records_scan_batch(
                 mix=mix,
                 arrays=arrays,
                 parallel_envs=b,
+                adapt=adapt,
             )
             paths.append(str(path))
         # Padded slots (valid:b) are discarded; keeps a single JIT for fixed B.
     return paths
+

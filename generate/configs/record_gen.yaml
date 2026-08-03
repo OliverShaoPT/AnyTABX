@@ -50,6 +50,14 @@ scan_rollout: true
 # when B is large (VRAM). 1 = single-env scan.
 parallel_envs: 8
 
+# --- Per-task win-rate adapt (ally mix weights only; enemy unchanged) ---
+# Pilot a few records, reweight strong vs weak behaviors, then generate the rest.
+winrate_adapt: false
+win_rate_min: 0.30
+win_rate_max: null            # null = no upper bound; set e.g. 0.70 to cap
+adapt_pilot_records: 4        # records used to estimate WR before/while adapting
+adapt_max_iters: 3
+
 # --- Behavior policy mixture (weights renormalized) ---
 behavior_mix:
   - policy_id: 0

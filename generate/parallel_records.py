@@ -263,6 +263,11 @@ def plan_jobs(
     stagger_s: float = 1.0,
     scan_rollout: bool = True,
     parallel_envs: int = 1,
+    winrate_adapt: bool = False,
+    win_rate_min: float = 0.30,
+    win_rate_max: float | None = None,
+    adapt_pilot_records: int = 4,
+    adapt_max_iters: int = 3,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -310,6 +315,11 @@ def plan_jobs(
                 "stagger_s": float(stagger_s),
                 "scan_rollout": bool(scan_rollout),
                 "parallel_envs": max(1, int(parallel_envs)),
+                "winrate_adapt": bool(winrate_adapt),
+                "win_rate_min": float(win_rate_min),
+                "win_rate_max": win_rate_max,
+                "adapt_pilot_records": int(adapt_pilot_records),
+                "adapt_max_iters": int(adapt_max_iters),
             }
         )
     return jobs
@@ -393,6 +403,15 @@ def run_from_config(config: dict[str, Any]) -> None:
         stagger_s=stagger_s,
         scan_rollout=bool(config.get("scan_rollout", True)),
         parallel_envs=max(1, int(config.get("parallel_envs", 1) or 1)),
+        winrate_adapt=bool(config.get("winrate_adapt", False)),
+        win_rate_min=float(config.get("win_rate_min", 0.30)),
+        win_rate_max=(
+            None
+            if config.get("win_rate_max", None) is None
+            else float(config.get("win_rate_max"))
+        ),
+        adapt_pilot_records=int(config.get("adapt_pilot_records", 4) or 4),
+        adapt_max_iters=int(config.get("adapt_max_iters", 3) or 3),
     )
 
     planned = _planned_record_count(jobs)
@@ -401,6 +420,9 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"[parallel_records] schedule={schedule} stagger_s={stagger_s} "
         f"scan_rollout={config.get('scan_rollout', True)} "
         f"parallel_envs={parallel_envs} "
+        f"winrate_adapt={config.get('winrate_adapt', False)} "
+        f"win_rate_min={config.get('win_rate_min', 0.30)} "
+        f"win_rate_max={config.get('win_rate_max', None)} "
         f"tasks={len(packages)} total_records={total_records} "
         f"planned={planned} "
         f"per_task={counts[0] if len(set(counts)) == 1 else counts} "
@@ -549,6 +571,21 @@ def main(argv: list[str] | None = None) -> None:
         help="vmap batch size B per scan call (pad last batch). Requires scan_rollout.",
     )
     parser.add_argument(
+        "--winrate_adapt",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help="Per-task ally mix reweight to steer episode win rate (enemy unchanged).",
+    )
+    parser.add_argument("--win_rate_min", type=float, default=None)
+    parser.add_argument(
+        "--win_rate_max",
+        type=str,
+        default=None,
+        help="Upper WR bound, or 'null' / 'none' for no upper bound.",
+    )
+    parser.add_argument("--adapt_pilot_records", type=int, default=None)
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -577,6 +614,8 @@ def main(argv: list[str] | None = None) -> None:
         "coach_seed": args.coach_seed,
         "min_behavior_steps": args.min_behavior_steps,
         "behavior_switch_prob": args.behavior_switch_prob,
+        "win_rate_min": args.win_rate_min,
+        "adapt_pilot_records": args.adapt_pilot_records,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -590,6 +629,14 @@ def main(argv: list[str] | None = None) -> None:
         config["scan_rollout"] = args.scan_rollout == "true"
     if args.parallel_envs is not None:
         config["parallel_envs"] = max(1, int(args.parallel_envs))
+    if args.winrate_adapt is not None:
+        config["winrate_adapt"] = args.winrate_adapt == "true"
+    if args.win_rate_max is not None:
+        token = str(args.win_rate_max).strip().lower()
+        if token in {"null", "none", ""}:
+            config["win_rate_max"] = None
+        else:
+            config["win_rate_max"] = float(args.win_rate_max)
 
     run_from_config(config)
     print(f"[parallel_records] done → {config['output_root']}", flush=True)

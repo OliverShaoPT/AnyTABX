@@ -18,6 +18,14 @@ from generate.dump_schema import (
     split_flat_obs,
     write_env_centric_record,
 )
+from generate.winrate_adapt import (
+    choose_strength,
+    in_win_rate_band,
+    is_strong_spec,
+    reweight_mix,
+    summarize_arrays,
+    win_rate_from_counts,
+)
 
 
 class BehaviorSwitcherTest(unittest.TestCase):
@@ -191,6 +199,64 @@ class AgentCentricSplitTest(unittest.TestCase):
                 write_env_centric_record(root / task / f"record-{rid:06d}", arrays, m)
             split_records_root(root, output_root=out, shuffle=True, seed=0, workers=2)
             self.assertEqual(len(discover_agent_centric_dirs(out)), 2)
+
+
+class WinrateAdaptTest(unittest.TestCase):
+    def test_reweight_monotonic_strong_mass(self) -> None:
+        weak = reweight_mix(DEFAULT_BEHAVIOR_MIX, 0.0)
+        mid = reweight_mix(DEFAULT_BEHAVIOR_MIX, 0.5)
+        strong = reweight_mix(DEFAULT_BEHAVIOR_MIX, 1.0)
+
+        def strong_mass(mix):
+            return sum(s.weight for s in mix if is_strong_spec(s))
+
+        self.assertLess(strong_mass(weak), strong_mass(mid))
+        self.assertLess(strong_mass(mid), strong_mass(strong))
+        self.assertAlmostEqual(sum(s.weight for s in strong), 1.0, places=5)
+
+    def test_win_rate_max_none_skips_upper_bound(self) -> None:
+        self.assertTrue(in_win_rate_band(0.95, win_rate_min=0.3, win_rate_max=None))
+        self.assertFalse(in_win_rate_band(0.95, win_rate_min=0.3, win_rate_max=0.7))
+        self.assertFalse(in_win_rate_band(0.1, win_rate_min=0.3, win_rate_max=None))
+
+    def test_choose_strength_directions(self) -> None:
+        up = choose_strength(0.05, win_rate_min=0.3, win_rate_max=None, current_strength=0.5)
+        self.assertGreater(up, 0.5)
+        down = choose_strength(0.9, win_rate_min=0.3, win_rate_max=0.7, current_strength=0.5)
+        self.assertLess(down, 0.5)
+        stay = choose_strength(0.5, win_rate_min=0.3, win_rate_max=None, current_strength=0.5)
+        self.assertEqual(stay, 0.5)
+
+    def test_summarize_arrays_hp_draw_and_win(self) -> None:
+        done = np.array([0, 1, 0, 1], dtype=np.uint8)
+        is_win = np.array([0, 0, 0, 0], dtype=np.uint8)
+        # N=2 units: team0, team1
+        health = np.array(
+            [
+                [10.0, 10.0],
+                [5.0, 5.0],  # draw
+                [10.0, 10.0],
+                [8.0, 2.0],  # win
+            ],
+            dtype=np.float32,
+        )
+        team = np.array(
+            [
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+            ],
+            dtype=np.int32,
+        )
+        counts = summarize_arrays(
+            done=done, is_win=is_win, unit_health=health, unit_team=team
+        )
+        self.assertEqual(counts["episodes"], 2)
+        self.assertEqual(counts["draw"], 1)
+        self.assertEqual(counts["win"], 1)
+        self.assertEqual(counts["loss"], 0)
+        self.assertAlmostEqual(win_rate_from_counts(counts), 1.0)
 
 
 if __name__ == "__main__":
