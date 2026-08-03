@@ -71,6 +71,28 @@ def read_env_centric_record(record_dir: Path) -> tuple[dict[str, np.ndarray], di
     return arrays, meta
 
 
+def discover_agent_centric_dirs(records_root: Path) -> list[Path]:
+    """Find agent-centric sequence dirs (flat output_root or nested layout).
+
+    Preference:
+    1. Flat: immediate children of ``records_root`` that contain ``obs_static.npy``
+    2. Nested: ``**/agent_centric/unit_*`` then ``**/agent_centric/ally_*``
+    """
+
+    root = Path(records_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Not a directory: {root}")
+    flat = sorted(
+        p for p in root.iterdir() if p.is_dir() and (p / "obs_static.npy").is_file()
+    )
+    if flat:
+        return flat
+    nested = sorted(root.glob("**/agent_centric/unit_*"))
+    if not nested:
+        nested = sorted(root.glob("**/agent_centric/ally_*"))
+    return nested
+
+
 def split_flat_obs(
     obs: np.ndarray,
     *,

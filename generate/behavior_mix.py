@@ -102,15 +102,15 @@ class BehaviorSwitcher:
 def mix_cdf_jax(mix: Sequence[BehaviorSpec]) -> jax.Array:
     """Normalized CDF over mix weights (same order as ``mix``)."""
 
-    weights = jnp.asarray([float(spec.weight) for spec in mix], dtype=jnp.float64)
-    weights = weights / jnp.maximum(weights.sum(), 1e-12)
+    weights = jnp.asarray([float(spec.weight) for spec in mix], dtype=jnp.float32)
+    weights = weights / jnp.maximum(weights.sum(), jnp.float32(1e-12))
     return jnp.cumsum(weights)
 
 
 def sample_policy_index(key: jax.Array, cdf: jax.Array) -> jax.Array:
     """Sample a mix index with the same rule as ``BehaviorSwitcher.sample``."""
 
-    u = jax.random.uniform(key, (), dtype=jnp.float64)
+    u = jax.random.uniform(key, (), dtype=jnp.float32)
     index = jnp.searchsorted(cdf, u, side="right")
     return jnp.minimum(index, cdf.shape[0] - 1).astype(jnp.int32)
 

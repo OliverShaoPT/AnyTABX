@@ -161,11 +161,35 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 
 ## 4. Step 2：Agent-centric
 
+推荐：输入顶层 env 目录，输出到**单个扁平文件夹**（不按 task 分层；可用 `--shuffle` 打乱处理顺序；`--workers` 多进程）：
+
+```bash
+python -m generate.agent_centric \
+  --records_root /path/to/0803_overfit_16task_val \
+  --output_root /path/to/0803_overfit_16task_val_agent \
+  --shuffle \
+  --workers 8
+```
+
+也支持单条 / 旧嵌套布局（不传 `--output_root` 时写到 `{record}/agent_centric/{ally}/`）：
+
 ```bash
 python -m generate.agent_centric --records_root ./data/records
-# 或
 python -m generate.agent_centric --record_dir ./data/records/task_00000_xxx/record-000000
 ```
+
+**扁平布局**（`--output_root`）：
+
+```text
+{output_root}/
+  {task_dir}__record-XXXXXX__{ally_key}/
+    obs_static.npy
+    obs_dynamic.npy
+    ...
+    meta.json
+```
+
+**嵌套布局**（默认兼容）：
 
 ```text
 record-XXXXXX/agent_centric/{ally_key}/
@@ -186,7 +210,7 @@ record-XXXXXX/agent_centric/{ally_key}/
   meta.json
 ```
 
-目录名与环境 `ally_keys` 一致（常见为 `unit_00`…，不是 `ally_0`）。同一 agent 下各文件第 `t` 行对齐。`obs_static` = own(14) + zones；`obs_dynamic` = 其他单位槽 (N−1, 16)，`mask` 标可见非零槽。
+目录名与环境 `ally_keys` 一致（常见为 `unit_00`…，不是 `ally_0`）。同一 agent 下各文件第 `t` 行对齐。`obs_static` = own(14) + zones；`obs_dynamic` = 其他单位槽 (N−1, 16)，`mask` 标可见非零槽。训练侧 `discover_agent_centric_dirs` 会优先识别扁平根目录下的 agent 子目录。
 
 > **NaN 说明**：padding 单位曾在 `ParsedState` 里对 `max_health=0` / `attack_cooldown=0` 做除法得到 NaN，再与 visibility 相乘仍为 NaN（`NaN*0=NaN`）。已在 `ParsedState.from_state` 改为安全除法；`env_centric` 落盘时额外 `nan_to_num` 兜底（与 `marl_baseline` 训练侧一致）。
 

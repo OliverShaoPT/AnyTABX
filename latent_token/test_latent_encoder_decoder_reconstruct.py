@@ -107,9 +107,9 @@ class TrainState(train_state.TrainState):
 
 
 def load_data(records_root: Path):
-    agent_dirs = sorted(records_root.glob("**/agent_centric/unit_*"))
-    if not agent_dirs:
-        agent_dirs = sorted(records_root.glob("**/agent_centric/ally_*"))
+    from generate.dump_schema import discover_agent_centric_dirs
+
+    agent_dirs = discover_agent_centric_dirs(Path(records_root))
     if not agent_dirs:
         raise FileNotFoundError(f"No agent_centric/unit_* or ally_* under {records_root}")
 

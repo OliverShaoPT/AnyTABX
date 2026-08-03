@@ -8,12 +8,13 @@ from pathlib import Path
 
 import numpy as np
 
-from generate.agent_centric import split_one_record
+from generate.agent_centric import flat_agent_dirname, split_one_record, split_records_root
 from generate.behavior_mix import BehaviorSwitcher, DEFAULT_BEHAVIOR_MIX
 from generate.dump_schema import (
     OWN_FEATURE_DIM,
     OTHER_FEATURE_DIM,
     ZONE_FEATURE_DIM,
+    discover_agent_centric_dirs,
     split_flat_obs,
     write_env_centric_record,
 )
@@ -109,6 +110,87 @@ class AgentCentricSplitTest(unittest.TestCase):
                     np.load(ally0 / "reference_action.npy"),
                 )
             )
+
+    def test_flat_output_root(self) -> None:
+        t, n_ally, n_units, max_n_zone = 3, 2, 4, 1
+        obs_dim = (
+            OWN_FEATURE_DIM
+            + OTHER_FEATURE_DIM * (n_units - 1)
+            + ZONE_FEATURE_DIM * max_n_zone
+        )
+        action_dim = 4
+        dist = np.zeros((t, n_ally, action_dim), dtype=np.float32)
+        dist[..., 0] = 1.0
+        arrays = {
+            "actions_behavior": np.zeros((t, n_ally), dtype=np.int32),
+            "actions_reference": np.zeros((t, n_ally), dtype=np.int32),
+            "actions_reference_distribution": dist,
+            "reward_team": np.zeros((t, n_ally), dtype=np.float32),
+            "reward_individual": np.zeros((t, n_ally), dtype=np.float32),
+            "done": np.zeros((t,), dtype=np.uint8),
+            "truncation": np.zeros((t,), dtype=np.uint8),
+            "is_win": np.zeros((t,), dtype=np.uint8),
+            "reset": np.array([1, 0, 0], dtype=np.uint8),
+            "episode_id": np.zeros((t,), dtype=np.int32),
+            "behavior_policy_id": np.zeros((t,), dtype=np.int32),
+            "obs_flat": np.zeros((t, n_ally, obs_dim), dtype=np.float32),
+        }
+        meta = {
+            "ally_keys": ["unit_00", "unit_01"],
+            "n_units": n_units,
+            "max_n_zone": max_n_zone,
+            "task_index": 36,
+            "task_id": "dummy",
+            "record_id": 0,
+            "shared_ally_policy": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record_dir = root / "task_foo" / "record-000000"
+            out_root = root / "agent_flat"
+            write_env_centric_record(record_dir, arrays, meta)
+            paths = split_one_record(record_dir, output_root=out_root)
+            self.assertEqual(len(paths), 2)
+            self.assertFalse((record_dir / "agent_centric").exists())
+            name0 = flat_agent_dirname(record_dir, "unit_00")
+            self.assertTrue((out_root / name0 / "obs_static.npy").exists())
+            discovered = discover_agent_centric_dirs(out_root)
+            self.assertEqual(len(discovered), 2)
+
+    def test_split_records_root_parallel_flat(self) -> None:
+        t, n_ally, n_units, max_n_zone = 2, 1, 2, 0
+        obs_dim = OWN_FEATURE_DIM + OTHER_FEATURE_DIM * (n_units - 1)
+        arrays = {
+            "actions_behavior": np.zeros((t, n_ally), dtype=np.int32),
+            "actions_reference": np.zeros((t, n_ally), dtype=np.int32),
+            "actions_reference_distribution": np.ones((t, n_ally, 2), dtype=np.float32) / 2,
+            "reward_team": np.zeros((t, n_ally), dtype=np.float32),
+            "reward_individual": np.zeros((t, n_ally), dtype=np.float32),
+            "done": np.zeros((t,), dtype=np.uint8),
+            "truncation": np.zeros((t,), dtype=np.uint8),
+            "is_win": np.zeros((t,), dtype=np.uint8),
+            "reset": np.array([1, 0], dtype=np.uint8),
+            "episode_id": np.zeros((t,), dtype=np.int32),
+            "behavior_policy_id": np.zeros((t,), dtype=np.int32),
+            "obs_flat": np.zeros((t, n_ally, obs_dim), dtype=np.float32),
+        }
+        meta = {
+            "ally_keys": ["unit_00"],
+            "n_units": n_units,
+            "max_n_zone": max_n_zone,
+            "task_index": 1,
+            "task_id": "t",
+            "record_id": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "env"
+            out = Path(tmp) / "flat"
+            for task, rid in (("task_a", 0), ("task_b", 1)):
+                m = dict(meta)
+                m["record_id"] = rid
+                write_env_centric_record(root / task / f"record-{rid:06d}", arrays, m)
+            split_records_root(root, output_root=out, shuffle=True, seed=0, workers=2)
+            self.assertEqual(len(discover_agent_centric_dirs(out)), 2)
 
 
 if __name__ == "__main__":
