@@ -268,6 +268,7 @@ def plan_jobs(
     win_rate_max: float | None = None,
     adapt_pilot_records: int = 4,
     adapt_max_iters: int = 3,
+    adapt_strength_max: float = 0.7,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -320,6 +321,7 @@ def plan_jobs(
                 "win_rate_max": win_rate_max,
                 "adapt_pilot_records": int(adapt_pilot_records),
                 "adapt_max_iters": int(adapt_max_iters),
+                "adapt_strength_max": float(adapt_strength_max),
             }
         )
     return jobs
@@ -412,6 +414,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         ),
         adapt_pilot_records=int(config.get("adapt_pilot_records", 4) or 4),
         adapt_max_iters=int(config.get("adapt_max_iters", 3) or 3),
+        adapt_strength_max=float(config.get("adapt_strength_max", 0.7) or 0.7),
     )
 
     planned = _planned_record_count(jobs)
@@ -585,6 +588,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Upper WR bound, or 'null' / 'none' for no upper bound.",
     )
     parser.add_argument("--adapt_pilot_records", type=int, default=None)
+    parser.add_argument("--adapt_max_iters", type=int, default=None)
+    parser.add_argument(
+        "--adapt_strength_max",
+        type=float,
+        default=None,
+        help="Max strong-group mass (default 0.7; keeps weak policies).",
+    )
     parser.add_argument(
         "--task_index",
         type=int,
@@ -616,6 +626,8 @@ def main(argv: list[str] | None = None) -> None:
         "behavior_switch_prob": args.behavior_switch_prob,
         "win_rate_min": args.win_rate_min,
         "adapt_pilot_records": args.adapt_pilot_records,
+        "adapt_max_iters": args.adapt_max_iters,
+        "adapt_strength_max": args.adapt_strength_max,
     }
     for key, value in overrides.items():
         if value is not None:

@@ -107,18 +107,21 @@ def _generate_ids(
     device: str,
     adapt: dict[str, Any] | None,
     paths: list[str],
+    output_root: Path | str | None = None,
+    report_progress: bool = True,
 ) -> None:
     from generate.env_centric import generate_one_record
     from generate.scan_rollout import generate_records_scan_batch
 
     if not record_ids:
         return
+    root = Path(output_root) if output_root is not None else Path(payload["output_root"])
     if scan_rollout and parallel_envs > 1:
         t_gen = time.perf_counter()
         batch_paths = generate_records_scan_batch(
             package,
             record_ids=record_ids,
-            output_root=Path(payload["output_root"]),
+            output_root=root,
             total_timesteps=total_timesteps,
             seed=payload.get("seed"),
             min_behavior_steps=min_behavior_steps,
@@ -132,17 +135,18 @@ def _generate_ids(
         generate_s_total = time.perf_counter() - t_gen
         per_rec = generate_s_total / max(len(batch_paths), 1)
         for path, record_id in zip(batch_paths, record_ids):
-            paths.append(path)
-            _emit_record_done(
-                payload,
-                worker_id=worker_id,
-                device=device,
-                package_name=package.name,
-                record_id=int(record_id),
-                path=str(path),
-                generate_s=per_rec,
-                parallel_envs=parallel_envs,
-            )
+            paths.append(str(path))
+            if report_progress:
+                _emit_record_done(
+                    payload,
+                    worker_id=worker_id,
+                    device=device,
+                    package_name=package.name,
+                    record_id=int(record_id),
+                    path=str(path),
+                    generate_s=per_rec,
+                    parallel_envs=parallel_envs,
+                )
         return
 
     for record_id in record_ids:
@@ -153,7 +157,7 @@ def _generate_ids(
             path = generate_one_record_scan(
                 package,
                 record_id=int(record_id),
-                output_root=Path(payload["output_root"]),
+                output_root=root,
                 total_timesteps=total_timesteps,
                 seed=payload.get("seed"),
                 min_behavior_steps=min_behavior_steps,
@@ -168,7 +172,7 @@ def _generate_ids(
             path = generate_one_record(
                 package,
                 record_id=int(record_id),
-                output_root=Path(payload["output_root"]),
+                output_root=root,
                 total_timesteps=total_timesteps,
                 seed=payload.get("seed"),
                 min_behavior_steps=min_behavior_steps,
@@ -180,16 +184,17 @@ def _generate_ids(
             )
         generate_s = time.perf_counter() - t_gen
         paths.append(str(path))
-        _emit_record_done(
-            payload,
-            worker_id=worker_id,
-            device=device,
-            package_name=package.name,
-            record_id=int(record_id),
-            path=str(path),
-            generate_s=generate_s,
-            parallel_envs=parallel_envs,
-        )
+        if report_progress:
+            _emit_record_done(
+                payload,
+                worker_id=worker_id,
+                device=device,
+                package_name=package.name,
+                record_id=int(record_id),
+                path=str(path),
+                generate_s=generate_s,
+                parallel_envs=parallel_envs,
+            )
 
 
 def _adapt_mix_for_package(
@@ -209,9 +214,13 @@ def _adapt_mix_for_package(
     device: str,
     paths: list[str],
 ) -> None:
+    import shutil
+    import tempfile
+
     from generate.winrate_adapt import (
+        DEFAULT_STRENGTH_MAX,
         adapt_meta_dict,
-        choose_strength,
+        choose_adapt_params,
         in_win_rate_band,
         reweight_mix,
         summarize_record_paths,
@@ -222,24 +231,31 @@ def _adapt_mix_for_package(
     win_rate_max = None if raw_max is None else float(raw_max)
     pilot_n = max(1, int(payload.get("adapt_pilot_records", 4) or 4))
     max_iters = max(1, int(payload.get("adapt_max_iters", 3) or 3))
+    strength_max = float(
+        payload.get("adapt_strength_max", DEFAULT_STRENGTH_MAX) or DEFAULT_STRENGTH_MAX
+    )
+    strength_max = min(max(strength_max, 0.0), 1.0)
 
     ids = [int(r) for r in record_ids]
-    pilot_n = min(pilot_n, len(ids))
-    cursor = 0
-    # First pilot uses YAML mix as-is; strength is only applied after a miss.
+    # Search mix on temporary pilots; only the final mix is written to output_root.
     strength = 0.5
+    oracle_focus = 0.0
+    using_base = True
     active_mix = base_mix
     measured_wr: float | None = None
     status = "adapt_failed"
-    pending_eval = True
-    using_base = True
+    pilot_rounds = 0
 
-    for _it in range(max_iters):
-        if cursor >= len(ids):
-            break
-        take = min(pilot_n, len(ids) - cursor)
-        chunk = ids[cursor : cursor + take]
-        cursor += take
+    out_root = Path(payload["output_root"])
+    pilot_parent = out_root / ".adapt_pilot"
+    pilot_parent.mkdir(parents=True, exist_ok=True)
+    pilot_root = Path(
+        tempfile.mkdtemp(prefix=f"{package.name}_w{worker_id}_", dir=str(pilot_parent))
+    )
+
+    def _run_pilot_round(round_idx: int) -> float:
+        nonlocal pilot_rounds
+        pilot_ids = list(range(round_idx * pilot_n, (round_idx + 1) * pilot_n))
         adapt = adapt_meta_dict(
             strength=None if using_base else strength,
             win_rate_min=win_rate_min,
@@ -248,11 +264,13 @@ def _adapt_mix_for_package(
             status="pilot",
             pilot=True,
             mix=active_mix,
+            oracle_focus=0.0 if using_base else oracle_focus,
+            strength_max=strength_max,
         )
-        before = len(paths)
+        round_paths: list[str] = []
         _generate_ids(
             package=package,
-            record_ids=chunk,
+            record_ids=pilot_ids,
             payload=payload,
             ctx=ctx,
             rollout_fn=rollout_fn,
@@ -265,70 +283,72 @@ def _adapt_mix_for_package(
             worker_id=worker_id,
             device=device,
             adapt=adapt,
-            paths=paths,
+            paths=round_paths,
+            output_root=pilot_root,
+            report_progress=False,
         )
-        _counts, measured_wr = summarize_record_paths(paths[before:])
-        pending_eval = False
-        if in_win_rate_band(measured_wr, win_rate_min=win_rate_min, win_rate_max=win_rate_max):
-            status = "ok"
-            break
-        new_strength = choose_strength(
-            measured_wr,
-            win_rate_min=win_rate_min,
-            win_rate_max=win_rate_max,
-            current_strength=strength,
-        )
-        if (not using_base) and abs(new_strength - strength) < 1e-6:
-            status = "adapt_failed"
-            break
-        strength = new_strength
-        active_mix = reweight_mix(base_mix, strength)
-        using_base = False
-        pending_eval = True
+        pilot_rounds += 1
+        _counts, wr = summarize_record_paths(round_paths)
+        shutil.rmtree(pilot_root / package.name, ignore_errors=True)
+        return float(wr)
 
-    if pending_eval and cursor < len(ids):
-        take = min(pilot_n, len(ids) - cursor)
-        chunk = ids[cursor : cursor + take]
-        cursor += take
-        adapt = adapt_meta_dict(
-            strength=strength,
-            win_rate_min=win_rate_min,
-            win_rate_max=win_rate_max,
-            measured_win_rate=measured_wr,
-            status="pilot",
-            pilot=True,
-            mix=active_mix,
-        )
-        before = len(paths)
-        _generate_ids(
-            package=package,
-            record_ids=chunk,
-            payload=payload,
-            ctx=ctx,
-            rollout_fn=rollout_fn,
-            mix=active_mix,
-            scan_rollout=scan_rollout,
-            parallel_envs=parallel_envs,
-            total_timesteps=total_timesteps,
-            min_behavior_steps=min_behavior_steps,
-            behavior_switch_prob=behavior_switch_prob,
-            worker_id=worker_id,
-            device=device,
-            adapt=adapt,
-            paths=paths,
-        )
-        _counts, measured_wr = summarize_record_paths(paths[before:])
-        status = (
-            "ok"
+    try:
+        needs_verify = False
+        for it in range(max_iters):
+            measured_wr = _run_pilot_round(it)
+            needs_verify = False
             if in_win_rate_band(
                 measured_wr, win_rate_min=win_rate_min, win_rate_max=win_rate_max
+            ):
+                status = "ok"
+                break
+
+            nxt = choose_adapt_params(
+                measured_wr,
+                win_rate_min=win_rate_min,
+                win_rate_max=win_rate_max,
+                strength=strength,
+                oracle_focus=oracle_focus,
+                strength_max=strength_max,
             )
-            else "adapt_failed"
-        )
-    elif measured_wr is not None and in_win_rate_band(
-        measured_wr, win_rate_min=win_rate_min, win_rate_max=win_rate_max
-    ):
-        status = "ok"
+            if nxt is None:
+                status = "adapt_failed"
+                break
+            new_strength, new_focus = nxt
+            if (
+                (not using_base)
+                and abs(new_strength - strength) < 1e-6
+                and abs(new_focus - oracle_focus) < 1e-6
+            ):
+                status = "adapt_failed"
+                break
+            strength, oracle_focus = new_strength, new_focus
+            active_mix = reweight_mix(
+                base_mix,
+                strength,
+                oracle_focus=oracle_focus,
+                strength_max=strength_max,
+            )
+            using_base = False
+            needs_verify = True
+
+        # Last iteration may have updated the mix without measuring it.
+        if needs_verify and status != "ok":
+            measured_wr = _run_pilot_round(pilot_rounds)
+            status = (
+                "ok"
+                if in_win_rate_band(
+                    measured_wr, win_rate_min=win_rate_min, win_rate_max=win_rate_max
+                )
+                else "adapt_failed"
+            )
+    finally:
+        shutil.rmtree(pilot_root, ignore_errors=True)
+        try:
+            if pilot_parent.is_dir() and not any(pilot_parent.iterdir()):
+                pilot_parent.rmdir()
+        except OSError:
+            pass
 
     _report(
         payload,
@@ -338,34 +358,38 @@ def _adapt_mix_for_package(
             "device": device,
             "gpu_id": payload.get("gpu_id"),
             "package_name": package.name,
-            "strength": float(strength),
+            "strength": float(strength) if not using_base else None,
+            "oracle_focus": float(oracle_focus),
+            "strength_max": float(strength_max),
             "measured_win_rate": None if measured_wr is None else float(measured_wr),
             "win_rate_min": win_rate_min,
             "win_rate_max": win_rate_max,
             "status": status,
-            "pilot_records": cursor,
+            "pilot_rounds": pilot_rounds,
+            "pilot_records": pilot_rounds * pilot_n,
         },
     )
     print(
         f"[record_worker] adapt package={package.name} status={status} "
-        f"strength={strength:.2f} wr={measured_wr} "
-        f"band=[{win_rate_min},{win_rate_max}]",
+        f"strength={strength:.2f} oracle_focus={oracle_focus:.2f} "
+        f"wr={measured_wr} band=[{win_rate_min},{win_rate_max}]",
         flush=True,
     )
 
-    rest = ids[cursor:]
     final_adapt = adapt_meta_dict(
-        strength=strength,
+        strength=None if using_base else strength,
         win_rate_min=win_rate_min,
         win_rate_max=win_rate_max,
         measured_win_rate=measured_wr,
         status=status,
         pilot=False,
         mix=active_mix,
+        oracle_focus=0.0 if using_base else oracle_focus,
+        strength_max=strength_max,
     )
     _generate_ids(
         package=package,
-        record_ids=rest,
+        record_ids=ids,
         payload=payload,
         ctx=ctx,
         rollout_fn=rollout_fn,

@@ -10,10 +10,21 @@ import numpy as np
 
 from generate.behavior_mix import BehaviorSpec
 
+# Cap on strong-group mass so weak policies are never fully dropped.
+DEFAULT_STRENGTH_MAX = 0.7
+
 
 def is_strong_spec(spec: BehaviorSpec) -> bool:
-    if spec.kind in {"oracle", "oracle_eps"}:
+    """Strong group for win-rate adapt: advanced + low-ε oracle_eps + oracle_pure.
+
+    High-ε ``oracle_eps`` (e.g. 0.3) stays in the weak group.
+    """
+
+    if spec.kind == "oracle":
         return True
+    if spec.kind == "oracle_eps":
+        # Match quality ladder: eps > 0.15 ≈ oracle_eps0.3 (weak); ≤0.15 strong.
+        return float(spec.epsilon or 0.0) <= 0.15
     if spec.kind == "heuristic" and str(spec.heuristic or "") == "advanced":
         return True
     return False
@@ -34,14 +45,44 @@ def _group_weights(mix: Sequence[BehaviorSpec], *, strong: bool) -> np.ndarray:
     return raw / total
 
 
-def reweight_mix(mix: Sequence[BehaviorSpec], strength: float) -> tuple[BehaviorSpec, ...]:
-    """Interpolate mix weights between weak-heavy (0) and strong-heavy (1)."""
+def _oracle_pure_target(mix: Sequence[BehaviorSpec], strong: np.ndarray) -> np.ndarray:
+    """Unit mass on ``oracle`` (pure) within the strong support; else keep ``strong``."""
 
-    s = float(np.clip(strength, 0.0, 1.0))
+    target = np.zeros(len(mix), dtype=np.float64)
+    for i, spec in enumerate(mix):
+        if is_strong_spec(spec) and spec.kind == "oracle":
+            target[i] = 1.0
+    total = float(target.sum())
+    if total <= 1e-12:
+        return strong
+    return target / total
+
+
+def reweight_mix(
+    mix: Sequence[BehaviorSpec],
+    strength: float,
+    *,
+    oracle_focus: float = 0.0,
+    strength_max: float = DEFAULT_STRENGTH_MAX,
+) -> tuple[BehaviorSpec, ...]:
+    """Blend weak vs strong, then optionally concentrate strong mass on oracle_pure.
+
+    - ``strength`` is clipped to ``[0, strength_max]`` (default max 0.7 ⇒ ≥30% weak).
+    - ``oracle_focus`` in ``[0, 1]``: 0 keeps relative strong weights; 1 puts all
+      strong mass on ``oracle_pure``.
+    """
+
+    s_max = float(np.clip(strength_max, 0.0, 1.0))
+    s = float(np.clip(strength, 0.0, s_max))
+    f = float(np.clip(oracle_focus, 0.0, 1.0))
     weak = _group_weights(mix, strong=False)
     strong = _group_weights(mix, strong=True)
     if weak.sum() <= 0 and strong.sum() <= 0:
         raise ValueError("behavior mix has no usable weights")
+    if strong.sum() > 0 and f > 0:
+        target = _oracle_pure_target(mix, strong)
+        strong = (1.0 - f) * strong + f * target
+        strong = strong / max(float(strong.sum()), 1e-12)
     if weak.sum() <= 0:
         weights = strong
     elif strong.sum() <= 0:
@@ -170,18 +211,66 @@ def choose_strength(
     win_rate_min: float,
     win_rate_max: float | None,
     current_strength: float = 0.5,
+    strength_max: float = DEFAULT_STRENGTH_MAX,
 ) -> float:
-    """One-step strength update toward the win-rate band."""
+    """One-step strength update toward the win-rate band (capped by ``strength_max``)."""
 
-    s = float(np.clip(current_strength, 0.0, 1.0))
+    s_max = float(np.clip(strength_max, 0.0, 1.0))
+    s = float(np.clip(current_strength, 0.0, s_max))
     if measured_wr < float(win_rate_min):
-        # Move toward strong; jump harder when far below.
         gap = float(win_rate_min) - measured_wr
-        return float(np.clip(s + max(0.25, gap), 0.0, 1.0))
+        return float(np.clip(s + max(0.25, gap), 0.0, s_max))
     if win_rate_max is not None and measured_wr > float(win_rate_max):
         gap = measured_wr - float(win_rate_max)
-        return float(np.clip(s - max(0.25, gap), 0.0, 1.0))
+        return float(np.clip(s - max(0.25, gap), 0.0, s_max))
     return s
+
+
+def choose_adapt_params(
+    measured_wr: float,
+    *,
+    win_rate_min: float,
+    win_rate_max: float | None,
+    strength: float,
+    oracle_focus: float,
+    strength_max: float = DEFAULT_STRENGTH_MAX,
+) -> tuple[float, float] | None:
+    """Next ``(strength, oracle_focus)``, or ``None`` if no further move is possible.
+
+    Order when WR is too low:
+      1. Raise ``strength`` up to ``strength_max`` (keep weak mass ≥ 1-strength_max).
+      2. Raise ``oracle_focus`` to concentrate strong mass on ``oracle_pure``.
+
+    Order when WR is too high (only if ``win_rate_max`` is set):
+      1. Lower ``oracle_focus``.
+      2. Lower ``strength``.
+    """
+
+    s_max = float(np.clip(strength_max, 0.0, 1.0))
+    s = float(np.clip(strength, 0.0, s_max))
+    f = float(np.clip(oracle_focus, 0.0, 1.0))
+
+    if measured_wr < float(win_rate_min):
+        gap = float(win_rate_min) - measured_wr
+        step = max(0.25, gap)
+        if s < s_max - 1e-6:
+            return float(min(s_max, s + step)), f
+        new_f = float(min(1.0, f + step))
+        if abs(new_f - f) < 1e-6:
+            return None
+        return s, new_f
+
+    if win_rate_max is not None and measured_wr > float(win_rate_max):
+        gap = measured_wr - float(win_rate_max)
+        step = max(0.25, gap)
+        if f > 1e-6:
+            return s, float(max(0.0, f - step))
+        new_s = float(max(0.0, s - step))
+        if abs(new_s - s) < 1e-6:
+            return None
+        return new_s, f
+
+    return s, f
 
 
 def adapt_meta_dict(
@@ -193,11 +282,15 @@ def adapt_meta_dict(
     status: str,
     pilot: bool,
     mix: Sequence[BehaviorSpec],
+    oracle_focus: float = 0.0,
+    strength_max: float = DEFAULT_STRENGTH_MAX,
 ) -> dict[str, Any]:
     return {
         "enabled": True,
         "pilot": bool(pilot),
         "strength": None if strength is None else float(strength),
+        "oracle_focus": float(oracle_focus),
+        "strength_max": float(strength_max),
         "win_rate_min": float(win_rate_min),
         "win_rate_max": None if win_rate_max is None else float(win_rate_max),
         "measured_win_rate": None

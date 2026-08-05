@@ -90,20 +90,24 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 
 同一套全局 `behavior_mix` 在不同 task 上胜率可能差很多。打开 `winrate_adapt` 后，每个 task 会：
 
-1. 用 `adapt_pilot_records` 条 record **试跑**估 episode 胜率（计入最终输出，`meta.adapt.pilot=true`）
-2. 只重加权 ally mix（strong=oracle/oracle_eps/advanced vs 其余）；**不改 enemy**（保持 Coach 对手）
+1. 在临时目录用 `adapt_pilot_records` 条 **试跑**估胜率（**不计入**最终输出，试跑后删除）
+2. 只重加权 ally mix（**不改 enemy**）：
+   - 先调 `strength`（强组质量上限 `adapt_strength_max`，默认 0.7，弱组至少保留 30%）
+   - 仍偏低再调 `oracle_focus`，把强组内质量往 `oracle_pure` 集中
+   - 强组 = `oracle_pure` / 低ε `oracle_eps` / `advanced`；高ε `oracle_eps0.3` 算弱组
 3. Mix CDF 为运行时输入，权重变化不必重新 JIT
-4. 正式生成剩余 records（`meta.adapt` 记录 strength / 测得 WR / status）
+4. 找到（或尽力）最终 mix 后，**再生成全部正式 records**（`meta.adapt` 记 strength / oracle_focus / WR / status）
 
 | 配置 | 默认 | 含义 |
 |---|---|---|
 | `winrate_adapt` | false | 是否启用 |
-| `win_rate_min` | 0.30 | 胜率下限；过低则提高 oracle 权重 |
+| `win_rate_min` | 0.30 | 胜率下限；过低则先抬 strength，再抬 oracle_focus |
 | `win_rate_max` | null | 上限；**不设置 / null = 不约束上限** |
-| `adapt_pilot_records` | 4 | 每次试跑用的 record 条数 |
-| `adapt_max_iters` | 3 | 最多调整轮数 |
+| `adapt_pilot_records` | 4 | 每轮试跑 record 条数（临时） |
+| `adapt_max_iters` | 3 | 最多试跑/调整轮数 |
+| `adapt_strength_max` | 0.7 | 强组质量上限（保留弱策略） |
 
-验收：`python tools/summarize_env_winrate.py --records_root ... --by_task`。若 max-oracle 仍低于下限，记 `adapt_failed` 并保留尽力 mix。
+验收：`python tools/summarize_env_winrate.py --records_root ... --by_task`。若 `strength=strength_max` 且 `oracle_focus=1` 仍低于下限，记 `adapt_failed` 并保留尽力 mix。
 
 ### 3.4 总 timestep + 多次 reset
 

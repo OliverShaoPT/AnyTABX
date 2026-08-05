@@ -98,7 +98,8 @@ class ProgressTracker:
             print(
                 f"[parallel_records] adapt worker={event.get('worker_id')} "
                 f"pkg={event.get('package_name')} status={event.get('status')} "
-                f"strength={event.get('strength')} wr={wr_s} "
+                f"strength={event.get('strength')} "
+                f"oracle_focus={event.get('oracle_focus')} wr={wr_s} "
                 f"band=[{event.get('win_rate_min')},{event.get('win_rate_max')}]",
                 flush=True,
             )

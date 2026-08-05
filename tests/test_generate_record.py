@@ -29,6 +29,7 @@ from generate.dump_schema import (
     write_env_centric_record,
 )
 from generate.winrate_adapt import (
+    choose_adapt_params,
     choose_strength,
     in_win_rate_band,
     is_strong_spec,
@@ -257,17 +258,47 @@ class PolicyTagMaskTest(unittest.TestCase):
 
 
 class WinrateAdaptTest(unittest.TestCase):
+    def test_strong_group_excludes_high_eps_oracle(self) -> None:
+        by_name = {s.name: s for s in DEFAULT_BEHAVIOR_MIX}
+        self.assertFalse(is_strong_spec(by_name["oracle_eps0.3"]))
+        self.assertTrue(is_strong_spec(by_name["oracle_eps0.1"]))
+        self.assertTrue(is_strong_spec(by_name["oracle_pure"]))
+        self.assertTrue(is_strong_spec(by_name["heuristic_advanced"]))
+        self.assertFalse(is_strong_spec(by_name["heuristic_medium"]))
+
     def test_reweight_monotonic_strong_mass(self) -> None:
         weak = reweight_mix(DEFAULT_BEHAVIOR_MIX, 0.0)
         mid = reweight_mix(DEFAULT_BEHAVIOR_MIX, 0.5)
-        strong = reweight_mix(DEFAULT_BEHAVIOR_MIX, 1.0)
+        capped = reweight_mix(DEFAULT_BEHAVIOR_MIX, 1.0, strength_max=0.7)
 
         def strong_mass(mix):
             return sum(s.weight for s in mix if is_strong_spec(s))
 
+        def weak_mass(mix):
+            return sum(s.weight for s in mix if not is_strong_spec(s))
+
         self.assertLess(strong_mass(weak), strong_mass(mid))
-        self.assertLess(strong_mass(mid), strong_mass(strong))
-        self.assertAlmostEqual(sum(s.weight for s in strong), 1.0, places=5)
+        self.assertLess(strong_mass(mid), strong_mass(capped))
+        self.assertAlmostEqual(sum(s.weight for s in capped), 1.0, places=5)
+        # strength is clipped to strength_max → weak mass stays ≥ 1 - max.
+        self.assertAlmostEqual(strong_mass(capped), 0.7, places=5)
+        self.assertAlmostEqual(weak_mass(capped), 0.3, places=5)
+        self.assertGreater(
+            {s.name: s.weight for s in capped}["oracle_eps0.3"], 0.0
+        )
+
+    def test_oracle_focus_boosts_pure_inside_strong(self) -> None:
+        base = reweight_mix(DEFAULT_BEHAVIOR_MIX, 0.7, oracle_focus=0.0)
+        focused = reweight_mix(DEFAULT_BEHAVIOR_MIX, 0.7, oracle_focus=1.0)
+        base_w = {s.name: s.weight for s in base}
+        focused_w = {s.name: s.weight for s in focused}
+        self.assertGreater(focused_w["oracle_pure"], base_w["oracle_pure"])
+        # At full focus, all strong mass sits on oracle_pure.
+        self.assertAlmostEqual(focused_w["oracle_pure"], 0.7, places=5)
+        self.assertAlmostEqual(focused_w["heuristic_advanced"], 0.0, places=5)
+        self.assertAlmostEqual(focused_w["oracle_eps0.1"], 0.0, places=5)
+        # Weak policies retained.
+        self.assertGreater(focused_w["oracle_eps0.3"], 0.0)
 
     def test_win_rate_max_none_skips_upper_bound(self) -> None:
         self.assertTrue(in_win_rate_band(0.95, win_rate_min=0.3, win_rate_max=None))
@@ -277,10 +308,35 @@ class WinrateAdaptTest(unittest.TestCase):
     def test_choose_strength_directions(self) -> None:
         up = choose_strength(0.05, win_rate_min=0.3, win_rate_max=None, current_strength=0.5)
         self.assertGreater(up, 0.5)
+        self.assertLessEqual(up, 0.7)
         down = choose_strength(0.9, win_rate_min=0.3, win_rate_max=0.7, current_strength=0.5)
         self.assertLess(down, 0.5)
         stay = choose_strength(0.5, win_rate_min=0.3, win_rate_max=None, current_strength=0.5)
         self.assertEqual(stay, 0.5)
+
+    def test_choose_adapt_params_focus_after_strength_cap(self) -> None:
+        nxt = choose_adapt_params(
+            0.05,
+            win_rate_min=0.3,
+            win_rate_max=None,
+            strength=0.7,
+            oracle_focus=0.0,
+            strength_max=0.7,
+        )
+        self.assertIsNotNone(nxt)
+        assert nxt is not None
+        s, f = nxt
+        self.assertAlmostEqual(s, 0.7, places=5)
+        self.assertGreater(f, 0.0)
+        stuck = choose_adapt_params(
+            0.05,
+            win_rate_min=0.3,
+            win_rate_max=None,
+            strength=0.7,
+            oracle_focus=1.0,
+            strength_max=0.7,
+        )
+        self.assertIsNone(stuck)
 
     def test_summarize_arrays_hp_draw_and_win(self) -> None:
         done = np.array([0, 1, 0, 1], dtype=np.uint8)
