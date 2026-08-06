@@ -42,6 +42,14 @@ seed: null
 # --- Behavior switching ---
 min_behavior_steps: 64
 behavior_switch_prob: 0.2
+# true (default): allow mid-episode policy resample after cooldown.
+# false: keep policy fixed within a trial; only resample on episode reset.
+mid_episode_policy_switch: true
+# false (default): all allies share one sampled policy per trial.
+# true: each ally samples independently; resample per ally on every episode reset.
+# Mid-episode switches (if enabled) also apply per ally. winrate_adapt still
+# reweights the shared mix CDF (raises P(strong) for every agent).
+independent_ally_policies: false
 # Device-side lax.scan for a whole record (one host sync at dump). Set false
 # for the legacy per-step Python loop (numpy BehaviorSwitcher).
 scan_rollout: true

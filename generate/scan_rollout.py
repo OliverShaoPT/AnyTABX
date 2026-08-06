@@ -14,11 +14,13 @@ from generate.behavior_mix import (
     BehaviorSpec,
     DEFAULT_BEHAVIOR_MIX,
     maybe_switch_policy_id,
+    maybe_switch_policy_ids,
     mix_cdf_jax,
     policy_id_mapping_json,
     policy_tag_legend_json,
     policy_tag_table,
     sample_policy_index,
+    sample_policy_indices,
 )
 from generate.dump_schema import write_env_centric_record
 from generate.env_centric import RecordGenContext, sample_record_seed
@@ -109,6 +111,74 @@ def _build_policy_branches(
     return branches
 
 
+def _select_last_visible_by_mix(
+    lasts_by_mix: list[list[LastVisibleTarget]],
+    mix_indices: jax.Array,
+    n_ally: int,
+) -> list[LastVisibleTarget]:
+    """Gather per-agent ``LastVisibleTarget`` from policy-indexed candidates."""
+
+    pos = jnp.stack(
+        [
+            jnp.stack([lv.abs_position for lv in lasts], axis=0)
+            for lasts in lasts_by_mix
+        ],
+        axis=0,
+    )
+    ever = jnp.stack(
+        [
+            jnp.stack([lv.ever_visible for lv in lasts], axis=0)
+            for lasts in lasts_by_mix
+        ],
+        axis=0,
+    )
+    arange = jnp.arange(n_ally)
+    sel_pos = pos[mix_indices, arange]
+    sel_ever = ever[mix_indices, arange]
+    return [
+        LastVisibleTarget(abs_position=sel_pos[i], ever_visible=sel_ever[i])
+        for i in range(n_ally)
+    ]
+
+
+def _act_independent_allies(
+    *,
+    key: jax.Array,
+    mix_indices: jax.Array,
+    branches: list[Callable],
+    obs,
+    avail,
+    physics_params,
+    last_visible: list[LastVisibleTarget],
+    ally_keys: list[str],
+    n_ally: int,
+) -> tuple[dict[str, jax.Array], list[LastVisibleTarget], jax.Array]:
+    """Run every mix policy, then pick each agent's action by its mix index."""
+
+    actions_by_mix: list[jax.Array] = []
+    lasts_by_mix: list[list[LastVisibleTarget]] = []
+    key_work = key
+    for branch in branches:
+        key_work, sub = jax.random.split(key_work)
+        acts, new_last, _ = branch(
+            (sub, obs, avail, physics_params, last_visible)
+        )
+        actions_by_mix.append(
+            jnp.stack(
+                [jnp.asarray(acts[a], dtype=jnp.int32).reshape(()) for a in ally_keys]
+            )
+        )
+        lasts_by_mix.append(new_last)
+    stacked = jnp.stack(actions_by_mix, axis=0)  # (n_mix, n_ally)
+    selected = stacked[mix_indices, jnp.arange(n_ally)]
+    behavior = {
+        agent: selected[i].astype(jnp.int32)
+        for i, agent in enumerate(ally_keys)
+    }
+    new_last = _select_last_visible_by_mix(lasts_by_mix, mix_indices, n_ally)
+    return behavior, new_last, key_work
+
+
 def _make_single_env_rollout(
     ctx: RecordGenContext,
     *,
@@ -116,6 +186,8 @@ def _make_single_env_rollout(
     min_behavior_steps: int,
     behavior_switch_prob: float,
     total_timesteps: int,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ):
     """Unjitted ``(seed, cdf) -> traj`` for one env (vmappable over seed)."""
 
@@ -128,6 +200,8 @@ def _make_single_env_rollout(
     max_n_zone = int(env.max_n_zone)
     oracle = ctx.oracle
     indiv_cfg = IndividualRewardConfig()
+    independent = bool(independent_ally_policies)
+    allow_mid_switch = bool(mid_episode_policy_switch)
     # Map mix position -> policy_id / quality tag (usually identity, but honor config).
     policy_ids = jnp.asarray([int(s.policy_id) for s in mix], dtype=jnp.int32)
     policy_tags = jnp.asarray(policy_tag_table(mix), dtype=jnp.int32)
@@ -147,15 +221,20 @@ def _make_single_env_rollout(
         key, reset_key, init_policy_key = jax.random.split(key, 3)
         obs, state = env.reset(reset_key, env_params)
         # Carry mix index (0..n_mix-1); dump BehaviorSpec.policy_id separately.
-        mix_index = sample_policy_index(init_policy_key, cdf)
+        if independent:
+            mix_index = sample_policy_indices(init_policy_key, cdf, n_ally)
+            steps0 = jnp.zeros((n_ally,), dtype=jnp.int32)
+        else:
+            mix_index = sample_policy_index(init_policy_key, cdf).astype(jnp.int32)
+            steps0 = jnp.int32(0)
         last_visible = _init_last_visible(n_ally)
 
         carry0 = (
             obs,
             state,
             key,
-            mix_index.astype(jnp.int32),
-            jnp.int32(0),  # steps_since_switch
+            mix_index,
+            steps0,  # steps_since_switch
             jnp.int32(0),  # episode_id
             jnp.bool_(True),  # is_reset_step
             last_visible,
@@ -173,28 +252,59 @@ def _make_single_env_rollout(
                 last_visible,
             ) = carry
 
-            key, mix_index, steps_since_switch = maybe_switch_policy_id(
-                key,
-                policy_id=mix_index,
-                steps_since_switch=steps_since_switch,
-                cdf=cdf,
-                min_behavior_steps=min_behavior_steps,
-                behavior_switch_prob=behavior_switch_prob,
-            )
-            policy_id = policy_ids[mix_index]
-            policy_tag = policy_tags[mix_index]
-            # Per-ally channels (currently shared; ready for heterogeneous policies).
-            policy_id_agents = jnp.full((n_ally,), policy_id, dtype=jnp.int32)
-            policy_tag_agents = jnp.full((n_ally,), policy_tag, dtype=jnp.int32)
+            if allow_mid_switch:
+                if independent:
+                    key, mix_index, steps_since_switch = maybe_switch_policy_ids(
+                        key,
+                        policy_ids=mix_index,
+                        steps_since_switch=steps_since_switch,
+                        cdf=cdf,
+                        min_behavior_steps=min_behavior_steps,
+                        behavior_switch_prob=behavior_switch_prob,
+                    )
+                else:
+                    key, mix_index, steps_since_switch = maybe_switch_policy_id(
+                        key,
+                        policy_id=mix_index,
+                        steps_since_switch=steps_since_switch,
+                        cdf=cdf,
+                        min_behavior_steps=min_behavior_steps,
+                        behavior_switch_prob=behavior_switch_prob,
+                    )
+            else:
+                # Still advance the cooldown counter for meta consistency.
+                steps_since_switch = steps_since_switch + jnp.int32(1)
+
+            if independent:
+                policy_id_agents = policy_ids[mix_index]
+                policy_tag_agents = policy_tags[mix_index]
+            else:
+                policy_id = policy_ids[mix_index]
+                policy_tag = policy_tags[mix_index]
+                policy_id_agents = jnp.full((n_ally,), policy_id, dtype=jnp.int32)
+                policy_tag_agents = jnp.full((n_ally,), policy_tag, dtype=jnp.int32)
 
             avail = env.get_avail_actions(state)
             # Same split pattern as env_centric (key, bkey, skey).
             key, bkey, skey = jax.random.split(key, 3)
-            behavior, last_visible, _bkey_out = jax.lax.switch(
-                mix_index,
-                branches,
-                (bkey, obs, avail, state["physics_params"], last_visible),
-            )
+            if independent:
+                behavior, last_visible, _bkey_out = _act_independent_allies(
+                    key=bkey,
+                    mix_indices=mix_index,
+                    branches=branches,
+                    obs=obs,
+                    avail=avail,
+                    physics_params=state["physics_params"],
+                    last_visible=last_visible,
+                    ally_keys=ally_keys,
+                    n_ally=n_ally,
+                )
+            else:
+                behavior, last_visible, _bkey_out = jax.lax.switch(
+                    mix_index,
+                    branches,
+                    (bkey, obs, avail, state["physics_params"], last_visible),
+                )
 
             ref, ref_dist = reference_labels_jax(
                 oracle,
@@ -288,14 +398,19 @@ def _make_single_env_rollout(
                 ) = operands
                 key_in, reset_key, sample_key = jax.random.split(key_in, 3)
                 obs_r, state_r = env.reset(reset_key, env_params)
-                idx = sample_policy_index(sample_key, cdf)
+                if independent:
+                    idx = sample_policy_indices(sample_key, cdf, n_ally)
+                    steps_r = jnp.zeros((n_ally,), dtype=jnp.int32)
+                else:
+                    idx = sample_policy_index(sample_key, cdf).astype(jnp.int32)
+                    steps_r = jnp.int32(0)
                 last_r = _init_last_visible(n_ally)
                 return (
                     obs_r,
                     state_r,
                     key_in,
-                    idx.astype(jnp.int32),
-                    jnp.int32(0),
+                    idx,
+                    steps_r,
                     (episode_in + jnp.int32(1)).astype(jnp.int32),
                     jnp.bool_(True),
                     last_r,
@@ -354,6 +469,8 @@ def build_scan_rollout_fn(
     behavior_switch_prob: float,
     total_timesteps: int,
     parallel_envs: int = 1,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ):
     """Return jitted rollout.
 
@@ -368,6 +485,8 @@ def build_scan_rollout_fn(
         min_behavior_steps=min_behavior_steps,
         behavior_switch_prob=behavior_switch_prob,
         total_timesteps=total_timesteps,
+        independent_ally_policies=independent_ally_policies,
+        mid_episode_policy_switch=mid_episode_policy_switch,
     )
     b = max(1, int(parallel_envs))
     if b <= 1:
@@ -447,8 +566,12 @@ def _record_meta(
     arrays: dict[str, np.ndarray],
     parallel_envs: int,
     adapt: dict[str, Any] | None = None,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ) -> dict[str, Any]:
     indiv_cfg = IndividualRewardConfig()
+    independent = bool(independent_ally_policies)
+    mid_switch = bool(mid_episode_policy_switch)
     meta: dict[str, Any] = {
         "schema": "env_centric_v1",
         "task_index": package.task_index,
@@ -465,7 +588,9 @@ def _record_meta(
         "seed": seed_i,
         "min_behavior_steps": min_behavior_steps,
         "behavior_switch_prob": behavior_switch_prob,
-        "shared_ally_policy": True,
+        "mid_episode_policy_switch": mid_switch,
+        "shared_ally_policy": not independent,
+        "independent_ally_policies": independent,
         "individual_reward_config": asdict(indiv_cfg),
         "behavior_mix": [asdict(s) for s in mix],
         "policy_tag_legend": policy_tag_legend_json(),
@@ -503,6 +628,8 @@ def _write_one_from_arrays(
     arrays: dict[str, np.ndarray],
     parallel_envs: int,
     adapt: dict[str, Any] | None = None,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ) -> Path:
     safe_id = package.task_id.replace("/", "_")
     record_dir = (
@@ -522,6 +649,8 @@ def _write_one_from_arrays(
         arrays=arrays,
         parallel_envs=parallel_envs,
         adapt=adapt,
+        independent_ally_policies=independent_ally_policies,
+        mid_episode_policy_switch=mid_episode_policy_switch,
     )
     write_env_centric_record(record_dir, arrays, meta)
     return record_dir
@@ -541,6 +670,8 @@ def generate_one_record_scan(
     rollout_fn=None,
     parallel_envs: int = 1,
     adapt: dict[str, Any] | None = None,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ) -> Path:
     """Generate one record (single-env scan). For B>1 use ``generate_records_scan_batch``."""
 
@@ -564,6 +695,8 @@ def generate_one_record_scan(
             behavior_switch_prob=behavior_switch_prob,
             total_timesteps=total_timesteps,
             parallel_envs=1,
+            independent_ally_policies=independent_ally_policies,
+            mid_episode_policy_switch=mid_episode_policy_switch,
         )
 
     traj = rollout_fn(jnp.asarray(seed_i % (2**32), dtype=jnp.uint32), cdf)
@@ -581,6 +714,8 @@ def generate_one_record_scan(
         arrays=arrays,
         parallel_envs=max(1, int(parallel_envs)),
         adapt=adapt,
+        independent_ally_policies=independent_ally_policies,
+        mid_episode_policy_switch=mid_episode_policy_switch,
     )
 
 
@@ -598,6 +733,8 @@ def generate_records_scan_batch(
     rollout_fn=None,
     parallel_envs: int = 1,
     adapt: dict[str, Any] | None = None,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ) -> list[str]:
     """Generate ``len(record_ids)`` records using fixed-B vmap batches + padding."""
 
@@ -621,6 +758,8 @@ def generate_records_scan_batch(
             behavior_switch_prob=behavior_switch_prob,
             total_timesteps=total_timesteps,
             parallel_envs=b,
+            independent_ally_policies=independent_ally_policies,
+            mid_episode_policy_switch=mid_episode_policy_switch,
         )
 
     paths: list[str] = []
@@ -639,6 +778,8 @@ def generate_records_scan_batch(
                 rollout_fn=rollout_fn,
                 parallel_envs=1,
                 adapt=adapt,
+                independent_ally_policies=independent_ally_policies,
+                mid_episode_policy_switch=mid_episode_policy_switch,
             )
             paths.append(str(path))
         return paths
@@ -671,6 +812,8 @@ def generate_records_scan_batch(
                 arrays=arrays,
                 parallel_envs=b,
                 adapt=adapt,
+                independent_ally_policies=independent_ally_policies,
+                mid_episode_policy_switch=mid_episode_policy_switch,
             )
             paths.append(str(path))
         # Padded slots (valid:b) are discarded; keeps a single JIT for fixed B.

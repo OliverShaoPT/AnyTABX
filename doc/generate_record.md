@@ -73,18 +73,24 @@ python -m generate.env_centric ... --seed 0
 
 Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank manifest）。
 
-### 3.2 同刻全体 ally 共用同一 policy（已实现）
+### 3.2 Ally policy 采样模式
 
-首版：`t` 时刻所有 ally 的 `behavior_policy_id[t]` **相同**；共享一个 behavior 实例出各自动作。
+| 配置 `independent_ally_policies` | 行为 |
+|---|---|
+| `false`（默认） | 每个 trial 全体 ally **共用**一个 mix 采样；`behavior_policy_id[t, :]` 同行相同 |
+| `true` | 每个 ally **独立**从同一 `behavior_mix` CDF 采样；落盘 `(T, n_ally)` 可互不相同；**每次 episode reset 后各 ally 单独 resample**；episode 内冷却切换也按 ally 独立 |
+
+两种模式下 `winrate_adapt` 都只重加权共享 CDF：胜率偏低 → 提高强策略权重 → 每个 agent 抽到好策略的概率一起上升（独立模式下表现为「队伍里好策略占比」升高）。
 
 ### 3.3 Behavior 切换冷却
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `--min_behavior_steps` | 64 | 至少连续这么多步才允许切换 |
-| `--behavior_switch_prob` | 0.2 | 冷却满足后，每步以该概率重采样 |
+| `mid_episode_policy_switch` | true | 是否允许 trial 内中途换策略；`false` 则只在 episode reset 时 resample |
+| `--min_behavior_steps` | 64 | 至少连续这么多步才允许切换（仅 `mid_episode_policy_switch=true` 时生效） |
+| `--behavior_switch_prob` | 0.2 | 冷却满足后，每步以该概率重采样（仅中途切换开启时） |
 
-默认 **每次 env reset 都会强制重采样** behavior policy；同一 episode 内仍受冷却约束（`min_behavior_steps` + `behavior_switch_prob`）。
+默认 **每次 env reset 都会强制重采样** behavior policy。`mid_episode_policy_switch=true` 时，同一 episode 内另受冷却约束；关掉后整局策略固定到下次 reset。
 
 ### 3.3.1 按 Task 自适应胜率（可选）
 
@@ -106,6 +112,8 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `adapt_pilot_records` | 4 | 每轮试跑 record 条数（临时） |
 | `adapt_max_iters` | 3 | 最多试跑/调整轮数 |
 | `adapt_strength_max` | 0.7 | 强组质量上限（保留弱策略） |
+
+与 `independent_ally_policies=true` 兼容：adapt 仍只改共享 CDF，从而抬高每个 ally 抽到强策略的概率。
 
 验收：`python tools/summarize_env_winrate.py --records_root ... --by_task`。若 `strength=strength_max` 且 `oracle_focus=1` 仍低于下限，记 `adapt_failed` 并保留尽力 mix。
 
@@ -266,9 +274,9 @@ record-XXXXXX/agent_centric/{ally_key}/
 
 ---
 
-## 5. TODO（未实现，后续消融）
+## 5. TODO（后续消融）
 
-- [ ] **同一时刻不同友军使用不同 behavior policy**（per-ally 异构 mix）。当前强制共享，便于先跑通 ICL 蒸馏与分布覆盖；异构混部需另设开关与测试。
+- [x] **同一时刻不同友军使用不同 behavior policy**：见 `independent_ally_policies`（§3.2）。
 
 ---
 

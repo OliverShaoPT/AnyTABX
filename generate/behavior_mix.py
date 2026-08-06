@@ -182,6 +182,8 @@ class BehaviorSwitcher:
     mix: tuple[BehaviorSpec, ...] = DEFAULT_BEHAVIOR_MIX
     min_behavior_steps: int = 64
     behavior_switch_prob: float = 0.2
+    # If False, keep the current policy until ``force_sample`` (episode reset).
+    mid_episode_policy_switch: bool = True
     rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(0))
 
     def __post_init__(self) -> None:
@@ -200,6 +202,8 @@ class BehaviorSwitcher:
 
     def maybe_switch(self) -> BehaviorSpec:
         self.steps_since_switch += 1
+        if not self.mid_episode_policy_switch:
+            return self.current
         if self.steps_since_switch < self.min_behavior_steps:
             return self.current
         if float(self.rng.random()) < self.behavior_switch_prob:
@@ -229,6 +233,13 @@ def sample_policy_index(key: jax.Array, cdf: jax.Array) -> jax.Array:
     return jnp.minimum(index, cdf.shape[0] - 1).astype(jnp.int32)
 
 
+def sample_policy_indices(key: jax.Array, cdf: jax.Array, n: int) -> jax.Array:
+    """Sample ``n`` independent mix indices. Returns ``(n,) int32``."""
+
+    keys = jax.random.split(key, int(n))
+    return jax.vmap(lambda k: sample_policy_index(k, cdf))(keys).astype(jnp.int32)
+
+
 def maybe_switch_policy_id(
     key: jax.Array,
     *,
@@ -238,7 +249,7 @@ def maybe_switch_policy_id(
     min_behavior_steps: int,
     behavior_switch_prob: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """JAX mid-episode switcher.
+    """JAX mid-episode switcher (scalar policy id).
 
     Returns ``(key, policy_id, steps_since_switch)`` after one step of cooldown logic.
     """
@@ -253,3 +264,30 @@ def maybe_switch_policy_id(
     new_id = jnp.where(do_switch, sampled, policy_id).astype(jnp.int32)
     new_steps = jnp.where(do_switch, jnp.int32(0), steps).astype(jnp.int32)
     return key, new_id, new_steps
+
+
+def maybe_switch_policy_ids(
+    key: jax.Array,
+    *,
+    policy_ids: jax.Array,
+    steps_since_switch: jax.Array,
+    cdf: jax.Array,
+    min_behavior_steps: int,
+    behavior_switch_prob: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-agent mid-episode switcher.
+
+    ``policy_ids`` / ``steps_since_switch`` are ``(n_ally,)``. Each agent switches
+    independently under the same cooldown / probability rules.
+    """
+
+    n = int(policy_ids.shape[0])
+    key, gate_key, sample_key = jax.random.split(key, 3)
+    steps = steps_since_switch + jnp.int32(1)
+    can_switch = steps >= jnp.int32(min_behavior_steps)
+    gates = jax.random.uniform(gate_key, (n,), dtype=jnp.float32)
+    do_switch = can_switch & (gates < jnp.float32(behavior_switch_prob))
+    sampled = sample_policy_indices(sample_key, cdf, n)
+    new_ids = jnp.where(do_switch, sampled, policy_ids).astype(jnp.int32)
+    new_steps = jnp.where(do_switch, jnp.int32(0), steps).astype(jnp.int32)
+    return key, new_ids, new_steps

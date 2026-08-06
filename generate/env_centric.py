@@ -261,6 +261,8 @@ def generate_one_record(
     ctx: RecordGenContext | None = None,
     scan_rollout: bool = True,
     rollout_fn: Any | None = None,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ) -> Path:
     """Generate one env-centric record.
 
@@ -282,10 +284,14 @@ def generate_one_record(
             behavior_mix=behavior_mix,
             ctx=ctx,
             rollout_fn=rollout_fn,
+            independent_ally_policies=independent_ally_policies,
+            mid_episode_policy_switch=mid_episode_policy_switch,
         )
 
     seed = sample_record_seed(seed, salt=record_id)
     mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
+    independent = bool(independent_ally_policies)
+    mid_switch = bool(mid_episode_policy_switch)
     if ctx is None:
         ctx = build_record_gen_context(package)
     elif ctx.package.name != package.name:
@@ -303,12 +309,6 @@ def generate_one_record(
     obs_dim = ctx.obs_dim
     oracle = ctx.oracle
     n_units_total = ctx.n_units_total
-    switcher = BehaviorSwitcher(
-        mix=mix,
-        min_behavior_steps=min_behavior_steps,
-        behavior_switch_prob=behavior_switch_prob,
-        rng=np.random.default_rng(seed),
-    )
     indiv_cfg = IndividualRewardConfig()
     # heuristic_policy parses obs with total unit count (allies + enemies).
     n_units_total = len(unit_keys)
@@ -317,14 +317,48 @@ def generate_one_record(
     key, reset_key = jax.random.split(key)
     obs, state = env.reset(reset_key, env_params)
 
-    spec = switcher.force_sample()
-    shared = SharedAllyPolicy.from_spec(
-        spec,
-        oracle=oracle,
-        ally_keys=ally_keys,
-        n_agents=n_units_total,
-        max_n_zone=env.max_n_zone,
-    )
+    if independent:
+        switchers = [
+            BehaviorSwitcher(
+                mix=mix,
+                min_behavior_steps=min_behavior_steps,
+                behavior_switch_prob=behavior_switch_prob,
+                mid_episode_policy_switch=mid_switch,
+                rng=np.random.default_rng(seed + 17 * (i + 1)),
+            )
+            for i in range(n_ally)
+        ]
+        specs = [s.force_sample() for s in switchers]
+        policies = [
+            SharedAllyPolicy.from_spec(
+                spec,
+                oracle=oracle,
+                ally_keys=[agent],
+                n_agents=n_units_total,
+                max_n_zone=env.max_n_zone,
+            )
+            for spec, agent in zip(specs, ally_keys)
+        ]
+        switcher = None
+        shared = None
+    else:
+        switcher = BehaviorSwitcher(
+            mix=mix,
+            min_behavior_steps=min_behavior_steps,
+            behavior_switch_prob=behavior_switch_prob,
+            mid_episode_policy_switch=mid_switch,
+            rng=np.random.default_rng(seed),
+        )
+        spec = switcher.force_sample()
+        shared = SharedAllyPolicy.from_spec(
+            spec,
+            oracle=oracle,
+            ally_keys=ally_keys,
+            n_agents=n_units_total,
+            max_n_zone=env.max_n_zone,
+        )
+        switchers = None
+        policies = None
 
     buffers: dict[str, list] = {
         "actions_behavior": [],
@@ -354,26 +388,57 @@ def generate_one_record(
     steps = 0
 
     while steps < total_timesteps:
-        # Shared behavior for all allies (v1).
-        spec = switcher.maybe_switch()
-        if spec.policy_id != shared.spec.policy_id:
-            shared = SharedAllyPolicy.from_spec(
-                spec,
-                oracle=oracle,
-                ally_keys=ally_keys,
-                n_agents=n_units_total,
-                max_n_zone=env.max_n_zone,
-            )
-
         avail = env.get_avail_actions(state)
         key, bkey, skey = jax.random.split(key, 3)
-        behavior = shared.act(
-            key=bkey,
-            obs_by_agent=obs,
-            avail_by_agent=avail,
-            ally_keys=ally_keys,
-            physics_params=state["physics_params"],
-        )
+        if independent:
+            assert switchers is not None and policies is not None
+            behavior = {}
+            policy_id_row = np.zeros((n_ally,), dtype=np.int32)
+            policy_tag_row = np.zeros((n_ally,), dtype=np.int32)
+            for i, agent in enumerate(ally_keys):
+                spec_i = switchers[i].maybe_switch()
+                if spec_i.policy_id != policies[i].spec.policy_id:
+                    policies[i] = SharedAllyPolicy.from_spec(
+                        spec_i,
+                        oracle=oracle,
+                        ally_keys=[agent],
+                        n_agents=n_units_total,
+                        max_n_zone=env.max_n_zone,
+                    )
+                key, sub = jax.random.split(key)
+                act_i = policies[i].act(
+                    key=sub,
+                    obs_by_agent=obs,
+                    avail_by_agent=avail,
+                    ally_keys=[agent],
+                    physics_params=state["physics_params"],
+                )
+                behavior[agent] = act_i[agent]
+                policy_id_row[i] = int(spec_i.policy_id)
+                policy_tag_row[i] = int(policy_tag_for_spec(spec_i))
+        else:
+            assert switcher is not None and shared is not None
+            # Shared behavior for all allies (default).
+            spec = switcher.maybe_switch()
+            if spec.policy_id != shared.spec.policy_id:
+                shared = SharedAllyPolicy.from_spec(
+                    spec,
+                    oracle=oracle,
+                    ally_keys=ally_keys,
+                    n_agents=n_units_total,
+                    max_n_zone=env.max_n_zone,
+                )
+            behavior = shared.act(
+                key=bkey,
+                obs_by_agent=obs,
+                avail_by_agent=avail,
+                ally_keys=ally_keys,
+                physics_params=state["physics_params"],
+            )
+            policy_id_row = np.full((n_ally,), int(shared.spec.policy_id), dtype=np.int32)
+            policy_tag_row = np.full(
+                (n_ally,), int(policy_tag_for_spec(shared.spec)), dtype=np.int32
+            )
         ref, ref_dist = reference_labels(
             oracle,
             obs_by_agent=obs,
@@ -428,12 +493,8 @@ def generate_one_record(
         buffers["is_win"].append(np.uint8(ally_win))
         buffers["reset"].append(np.uint8(is_reset_step))
         buffers["episode_id"].append(np.int32(episode_id))
-        # Per-ally channels (currently shared across allies).
-        tag = int(policy_tag_for_spec(shared.spec))
-        buffers["behavior_policy_id"].append(
-            np.full((n_ally,), int(shared.spec.policy_id), dtype=np.int32)
-        )
-        buffers["policy_tag"].append(np.full((n_ally,), tag, dtype=np.int32))
+        buffers["behavior_policy_id"].append(policy_id_row)
+        buffers["policy_tag"].append(policy_tag_row)
         buffers["visible_matrix"].append(visible)
         buffers["obs_flat"].append(
             np.stack(
@@ -456,15 +517,28 @@ def generate_one_record(
             obs, state = env.reset(reset_key, env_params)
             episode_id += 1
             is_reset_step = True
-            # Every episode reset resamples the shared behavior policy.
-            spec = switcher.force_sample()
-            shared = SharedAllyPolicy.from_spec(
-                spec,
-                oracle=oracle,
-                ally_keys=ally_keys,
-                n_agents=n_units_total,
-                max_n_zone=env.max_n_zone,
-            )
+            # Every episode reset resamples behavior (shared or per-agent).
+            if independent:
+                assert switchers is not None and policies is not None
+                for i, agent in enumerate(ally_keys):
+                    spec_i = switchers[i].force_sample()
+                    policies[i] = SharedAllyPolicy.from_spec(
+                        spec_i,
+                        oracle=oracle,
+                        ally_keys=[agent],
+                        n_agents=n_units_total,
+                        max_n_zone=env.max_n_zone,
+                    )
+            else:
+                assert switcher is not None
+                spec = switcher.force_sample()
+                shared = SharedAllyPolicy.from_spec(
+                    spec,
+                    oracle=oracle,
+                    ally_keys=ally_keys,
+                    n_agents=n_units_total,
+                    max_n_zone=env.max_n_zone,
+                )
 
     arrays = {
         "actions_behavior": np.stack(buffers["actions_behavior"], axis=0),
@@ -514,7 +588,9 @@ def generate_one_record(
         "seed": seed,
         "min_behavior_steps": min_behavior_steps,
         "behavior_switch_prob": behavior_switch_prob,
-        "shared_ally_policy": True,
+        "mid_episode_policy_switch": mid_switch,
+        "shared_ally_policy": not independent,
+        "independent_ally_policies": independent,
         "individual_reward_config": asdict(indiv_cfg),
         "behavior_mix": [asdict(s) for s in mix],
         "policy_tag_legend": policy_tag_legend_json(),

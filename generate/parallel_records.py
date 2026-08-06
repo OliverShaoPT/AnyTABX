@@ -269,6 +269,8 @@ def plan_jobs(
     adapt_pilot_records: int = 4,
     adapt_max_iters: int = 3,
     adapt_strength_max: float = 0.7,
+    independent_ally_policies: bool = False,
+    mid_episode_policy_switch: bool = True,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -322,6 +324,8 @@ def plan_jobs(
                 "adapt_pilot_records": int(adapt_pilot_records),
                 "adapt_max_iters": int(adapt_max_iters),
                 "adapt_strength_max": float(adapt_strength_max),
+                "independent_ally_policies": bool(independent_ally_policies),
+                "mid_episode_policy_switch": bool(mid_episode_policy_switch),
             }
         )
     return jobs
@@ -415,6 +419,12 @@ def run_from_config(config: dict[str, Any]) -> None:
         adapt_pilot_records=int(config.get("adapt_pilot_records", 4) or 4),
         adapt_max_iters=int(config.get("adapt_max_iters", 3) or 3),
         adapt_strength_max=float(config.get("adapt_strength_max", 0.7) or 0.7),
+        independent_ally_policies=bool(
+            config.get("independent_ally_policies", False)
+        ),
+        mid_episode_policy_switch=bool(
+            config.get("mid_episode_policy_switch", True)
+        ),
     )
 
     planned = _planned_record_count(jobs)
@@ -424,6 +434,8 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"scan_rollout={config.get('scan_rollout', True)} "
         f"parallel_envs={parallel_envs} "
         f"winrate_adapt={config.get('winrate_adapt', False)} "
+        f"independent_ally_policies={config.get('independent_ally_policies', False)} "
+        f"mid_episode_policy_switch={config.get('mid_episode_policy_switch', True)} "
         f"win_rate_min={config.get('win_rate_min', 0.30)} "
         f"win_rate_max={config.get('win_rate_max', None)} "
         f"tasks={len(packages)} total_records={total_records} "
@@ -596,6 +608,20 @@ def main(argv: list[str] | None = None) -> None:
         help="Max strong-group mass (default 0.7; keeps weak policies).",
     )
     parser.add_argument(
+        "--independent_ally_policies",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help="If true, each ally samples/resamples its behavior independently.",
+    )
+    parser.add_argument(
+        "--mid_episode_policy_switch",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help="If false, only resample behavior on episode reset (no mid-trial switch).",
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -643,6 +669,14 @@ def main(argv: list[str] | None = None) -> None:
         config["parallel_envs"] = max(1, int(args.parallel_envs))
     if args.winrate_adapt is not None:
         config["winrate_adapt"] = args.winrate_adapt == "true"
+    if args.independent_ally_policies is not None:
+        config["independent_ally_policies"] = (
+            args.independent_ally_policies == "true"
+        )
+    if args.mid_episode_policy_switch is not None:
+        config["mid_episode_policy_switch"] = (
+            args.mid_episode_policy_switch == "true"
+        )
     if args.win_rate_max is not None:
         token = str(args.win_rate_max).strip().lower()
         if token in {"null", "none", ""}:

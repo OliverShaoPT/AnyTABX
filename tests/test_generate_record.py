@@ -18,7 +18,10 @@ from generate.behavior_mix import (
     POLICY_TAG_MASK,
     BehaviorSwitcher,
     DEFAULT_BEHAVIOR_MIX,
+    maybe_switch_policy_ids,
+    mix_cdf_jax,
     policy_tag_for_spec,
+    sample_policy_indices,
 )
 from generate.dump_schema import (
     OWN_FEATURE_DIM,
@@ -39,7 +42,56 @@ from generate.winrate_adapt import (
 )
 
 
+class IndependentPolicySampleTest(unittest.TestCase):
+    def test_sample_policy_indices_shape_and_range(self) -> None:
+        import jax
+        import jax.numpy as jnp
+
+        cdf = mix_cdf_jax(DEFAULT_BEHAVIOR_MIX)
+        ids = sample_policy_indices(jax.random.key(0), cdf, 5)
+        self.assertEqual(tuple(ids.shape), (5,))
+        self.assertTrue(bool(jnp.all(ids >= 0)))
+        self.assertTrue(bool(jnp.all(ids < len(DEFAULT_BEHAVIOR_MIX))))
+
+    def test_maybe_switch_policy_ids_independent(self) -> None:
+        import jax
+        import jax.numpy as jnp
+
+        cdf = mix_cdf_jax(DEFAULT_BEHAVIOR_MIX)
+        n = 4
+        key = jax.random.key(1)
+        ids0 = jnp.zeros((n,), dtype=jnp.int32)
+        # Past cooldown + switch_prob=1 → all resample (may coincide by chance).
+        _key, ids1, steps = maybe_switch_policy_ids(
+            key,
+            policy_ids=ids0,
+            steps_since_switch=jnp.full((n,), 100, dtype=jnp.int32),
+            cdf=cdf,
+            min_behavior_steps=1,
+            behavior_switch_prob=1.0,
+        )
+        self.assertEqual(tuple(ids1.shape), (n,))
+        self.assertTrue(bool(jnp.all(steps == 0)))
+
+
 class BehaviorSwitcherTest(unittest.TestCase):
+    def test_mid_episode_switch_can_be_disabled(self) -> None:
+        switcher = BehaviorSwitcher(
+            mix=DEFAULT_BEHAVIOR_MIX,
+            min_behavior_steps=1,
+            behavior_switch_prob=1.0,
+            mid_episode_policy_switch=False,
+            rng=np.random.default_rng(0),
+        )
+        first = switcher.current.policy_id
+        for _ in range(20):
+            self.assertEqual(switcher.maybe_switch().policy_id, first)
+        # Reset path still resamples.
+        nxt = switcher.force_sample()
+        # May equal by chance; just ensure force_sample runs and resets cooldown.
+        self.assertEqual(switcher.steps_since_switch, 0)
+        self.assertIsNotNone(nxt)
+
     def test_min_steps_blocks_switch(self) -> None:
         switcher = BehaviorSwitcher(
             mix=DEFAULT_BEHAVIOR_MIX,

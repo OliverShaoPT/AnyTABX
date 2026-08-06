@@ -116,6 +116,8 @@ def _generate_ids(
     if not record_ids:
         return
     root = Path(output_root) if output_root is not None else Path(payload["output_root"])
+    independent = bool(payload.get("independent_ally_policies", False))
+    mid_switch = bool(payload.get("mid_episode_policy_switch", True))
     if scan_rollout and parallel_envs > 1:
         t_gen = time.perf_counter()
         batch_paths = generate_records_scan_batch(
@@ -131,6 +133,8 @@ def _generate_ids(
             rollout_fn=rollout_fn,
             parallel_envs=parallel_envs,
             adapt=adapt,
+            independent_ally_policies=independent,
+            mid_episode_policy_switch=mid_switch,
         )
         generate_s_total = time.perf_counter() - t_gen
         per_rec = generate_s_total / max(len(batch_paths), 1)
@@ -167,6 +171,8 @@ def _generate_ids(
                 rollout_fn=rollout_fn,
                 parallel_envs=1,
                 adapt=adapt,
+                independent_ally_policies=independent,
+                mid_episode_policy_switch=mid_switch,
             )
         else:
             path = generate_one_record(
@@ -181,6 +187,8 @@ def _generate_ids(
                 ctx=ctx,
                 scan_rollout=False,
                 rollout_fn=None,
+                independent_ally_policies=independent,
+                mid_episode_policy_switch=mid_switch,
             )
         generate_s = time.perf_counter() - t_gen
         paths.append(str(path))
@@ -483,6 +491,12 @@ def worker_main(payload: dict[str, Any]) -> str:
                         behavior_switch_prob=behavior_switch_prob,
                         total_timesteps=total_timesteps,
                         parallel_envs=parallel_envs,
+                        independent_ally_policies=bool(
+                            payload.get("independent_ally_policies", False)
+                        ),
+                        mid_episode_policy_switch=bool(
+                            payload.get("mid_episode_policy_switch", True)
+                        ),
                     )
                     compile_s += warmup_scan_rollout(
                         rollout_fn,
