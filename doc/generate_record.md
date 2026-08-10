@@ -303,7 +303,7 @@ record-XXXXXX/agent_centric/{ally_key}/
 |---|---|
 | `generate/pack_task_packages.py` | （legacy）bank + ckpt → packages |
 | `generate/configs/record_gen.yaml` | 全部生产参数（默认 GPU：`coach_root`、产量、设备、behavior） |
-| `generate/parallel_records.py` | 均匀分片 + GPU 并行编排（主入口） |
+| `generate/parallel_records.py` | 均匀分片 + GPU 并行编排（主入口；父进程 JAX-free，避免占 GPU 0） |
 | `generate/record_worker.py` | spawn worker（先设 CUDA 再 import JAX；进程内 warmup） |
 | `generate/progress.py` | 进度条与 setup/compile/generate 计时 |
 | `generate/scan_rollout.py` | 设备侧整 record `lax.scan`（`scan_rollout: true`） |

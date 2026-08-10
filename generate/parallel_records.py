@@ -18,10 +18,10 @@ from typing import Any
 
 from generate.dump_schema import ensure_dir
 from generate.progress import LocalQueue, ProgressTracker
-from generate.record_worker import force_jax_cpu_env, worker_main
+from generate.record_worker import worker_main
 
-# NOTE: do not import generate.task_package / src.tabx at module import time.
-# Those pull in JAX; for device=cpu we must set CUDA/JAX env first.
+# NOTE: do not import src.tabx / env_centric at module import time (they pull JAX).
+# Parent orchestration must stay JAX-free so it never grabs physical GPU 0.
 
 
 def _planned_record_count(jobs: list[dict[str, Any]]) -> int:
@@ -335,23 +335,24 @@ def plan_jobs(
 
 def run_from_config(config: dict[str, Any]) -> None:
     device = str(config.get("device", "gpu")).lower()
-    # Parent only discovers packages / orchestrates workers. Keep it off GPUs:
-    # importing task_package → sample_task → jax would otherwise init CUDA on
-    # physical GPU 0 and inflate nvidia-smi memory there (~tens of GB).
-    force_jax_cpu_env()
+    # Parent only discovers packages / orchestrates workers. Discovery is
+    # JAX-free (lazy imports in task_package); do not init JAX here — CPU JAX
+    # in a long-lived parent has caused host RAM growth, and any accidental
+    # JAX import before CUDA_VISIBLE_DEVICES is set would hog physical GPU 0.
+    from generate.task_package import discover_task_packages
+
     if device == "cpu":
         print(
-            "[parallel_records] device=cpu (debug only, not for production) → "
-            "JAX_PLATFORMS=cpu, JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1",
+            "[parallel_records] device=cpu (debug only, not for production); "
+            "workers pin JAX to CPU",
             flush=True,
         )
     else:
         print(
-            "[parallel_records] parent pinned to CPU (workers set CUDA_VISIBLE_DEVICES)",
+            "[parallel_records] parent stays JAX-free "
+            "(workers set CUDA_VISIBLE_DEVICES before import)",
             flush=True,
         )
-
-    from generate.task_package import discover_task_packages, pack_task_packages
 
     coach_root = config.get("coach_root") or config.get("task_packages_root")
     if not coach_root:
@@ -362,13 +363,18 @@ def run_from_config(config: dict[str, Any]) -> None:
     ckpt_root = config.get("ckpt_root")
 
     # Legacy: pack bank + ckpt tree into packages_root when empty.
+    # pack_task_packages imports sample_task → JAX; pin CPU for that short path.
     if task_bank and ckpt_root:
         packages_root.mkdir(parents=True, exist_ok=True)
         if not any(packages_root.rglob("task.json")):
+            from generate.record_worker import force_jax_cpu_env
+            from generate.task_package import pack_task_packages
+
             print(
                 f"[parallel_records] packing packages from {task_bank} → {packages_root}",
                 flush=True,
             )
+            force_jax_cpu_env()
             pack_task_packages(
                 task_bank_path=task_bank,
                 ckpt_root=ckpt_root,
@@ -493,9 +499,12 @@ def run_from_config(config: dict[str, Any]) -> None:
         )
         drain.start()
         try:
-            # Re-assert CPU env in each child before it imports JAX.
             pool_kwargs: dict[str, Any] = {"processes": len(jobs)}
             if device == "cpu":
+                # Belt-and-suspenders: children also call force_jax_cpu_env in
+                # worker_main before importing JAX.
+                from generate.record_worker import force_jax_cpu_env
+
                 pool_kwargs["initializer"] = force_jax_cpu_env
             with ctx.Pool(**pool_kwargs) as pool:
                 for _ in pool.imap_unordered(
