@@ -271,6 +271,7 @@ def plan_jobs(
     adapt_strength_max: float = 0.7,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_reference: bool = False,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -326,6 +327,7 @@ def plan_jobs(
                 "adapt_strength_max": float(adapt_strength_max),
                 "independent_ally_policies": bool(independent_ally_policies),
                 "mid_episode_policy_switch": bool(mid_episode_policy_switch),
+                "best_teacher_reference": bool(best_teacher_reference),
             }
         )
     return jobs
@@ -333,12 +335,19 @@ def plan_jobs(
 
 def run_from_config(config: dict[str, Any]) -> None:
     device = str(config.get("device", "gpu")).lower()
+    # Parent only discovers packages / orchestrates workers. Keep it off GPUs:
+    # importing task_package → sample_task → jax would otherwise init CUDA on
+    # physical GPU 0 and inflate nvidia-smi memory there (~tens of GB).
+    force_jax_cpu_env()
     if device == "cpu":
-        # Debug-only path: must run before importing task_package / tabx / jax.
-        force_jax_cpu_env()
         print(
             "[parallel_records] device=cpu (debug only, not for production) → "
             "JAX_PLATFORMS=cpu, JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1",
+            flush=True,
+        )
+    else:
+        print(
+            "[parallel_records] parent pinned to CPU (workers set CUDA_VISIBLE_DEVICES)",
             flush=True,
         )
 
@@ -425,6 +434,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         mid_episode_policy_switch=bool(
             config.get("mid_episode_policy_switch", True)
         ),
+        best_teacher_reference=bool(config.get("best_teacher_reference", False)),
     )
 
     planned = _planned_record_count(jobs)
@@ -434,6 +444,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"scan_rollout={config.get('scan_rollout', True)} "
         f"parallel_envs={parallel_envs} "
         f"winrate_adapt={config.get('winrate_adapt', False)} "
+        f"best_teacher_reference={config.get('best_teacher_reference', False)} "
         f"independent_ally_policies={config.get('independent_ally_policies', False)} "
         f"mid_episode_policy_switch={config.get('mid_episode_policy_switch', True)} "
         f"win_rate_min={config.get('win_rate_min', 0.30)} "
@@ -622,6 +633,16 @@ def main(argv: list[str] | None = None) -> None:
         help="If false, only resample behavior on episode reset (no mid-trial switch).",
     )
     parser.add_argument(
+        "--best_teacher_reference",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help=(
+            "If true, hard reference actions follow task.json coach_eval.best_policy; "
+            "soft dist stays RL. Also steers winrate_adapt focus."
+        ),
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -677,6 +698,8 @@ def main(argv: list[str] | None = None) -> None:
         config["mid_episode_policy_switch"] = (
             args.mid_episode_policy_switch == "true"
         )
+    if args.best_teacher_reference is not None:
+        config["best_teacher_reference"] = args.best_teacher_reference == "true"
     if args.win_rate_max is not None:
         token = str(args.win_rate_max).strip().lower()
         if token in {"null", "none", ""}:

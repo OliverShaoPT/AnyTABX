@@ -45,12 +45,24 @@ def _group_weights(mix: Sequence[BehaviorSpec], *, strong: bool) -> np.ndarray:
     return raw / total
 
 
-def _oracle_pure_target(mix: Sequence[BehaviorSpec], strong: np.ndarray) -> np.ndarray:
-    """Unit mass on ``oracle`` (pure) within the strong support; else keep ``strong``."""
+def _matches_focus_policy(spec: BehaviorSpec, focus_policy: str) -> bool:
+    focus = str(focus_policy or "oracle_pure")
+    if focus == "heuristic_advanced":
+        return spec.kind == "heuristic" and str(spec.heuristic or "") == "advanced"
+    # Default / oracle_pure
+    return spec.kind == "oracle"
+
+
+def _strong_focus_target(
+    mix: Sequence[BehaviorSpec],
+    strong: np.ndarray,
+    focus_policy: str,
+) -> np.ndarray:
+    """Unit mass on ``focus_policy`` within the strong support; else keep ``strong``."""
 
     target = np.zeros(len(mix), dtype=np.float64)
     for i, spec in enumerate(mix):
-        if is_strong_spec(spec) and spec.kind == "oracle":
+        if is_strong_spec(spec) and _matches_focus_policy(spec, focus_policy):
             target[i] = 1.0
     total = float(target.sum())
     if total <= 1e-12:
@@ -64,12 +76,13 @@ def reweight_mix(
     *,
     oracle_focus: float = 0.0,
     strength_max: float = DEFAULT_STRENGTH_MAX,
+    focus_policy: str = "oracle_pure",
 ) -> tuple[BehaviorSpec, ...]:
-    """Blend weak vs strong, then optionally concentrate strong mass on oracle_pure.
+    """Blend weak vs strong, then optionally concentrate strong mass on focus teacher.
 
     - ``strength`` is clipped to ``[0, strength_max]`` (default max 0.7 ⇒ ≥30% weak).
     - ``oracle_focus`` in ``[0, 1]``: 0 keeps relative strong weights; 1 puts all
-      strong mass on ``oracle_pure``.
+      strong mass on ``focus_policy`` (``oracle_pure`` or ``heuristic_advanced``).
     """
 
     s_max = float(np.clip(strength_max, 0.0, 1.0))
@@ -80,7 +93,7 @@ def reweight_mix(
     if weak.sum() <= 0 and strong.sum() <= 0:
         raise ValueError("behavior mix has no usable weights")
     if strong.sum() > 0 and f > 0:
-        target = _oracle_pure_target(mix, strong)
+        target = _strong_focus_target(mix, strong, focus_policy)
         strong = (1.0 - f) * strong + f * target
         strong = strong / max(float(strong.sum()), 1e-12)
     if weak.sum() <= 0:
@@ -239,7 +252,7 @@ def choose_adapt_params(
 
     Order when WR is too low:
       1. Raise ``strength`` up to ``strength_max`` (keep weak mass ≥ 1-strength_max).
-      2. Raise ``oracle_focus`` to concentrate strong mass on ``oracle_pure``.
+      2. Raise ``oracle_focus`` to concentrate strong mass on the focus teacher.
 
     Order when WR is too high (only if ``win_rate_max`` is set):
       1. Lower ``oracle_focus``.
@@ -284,12 +297,14 @@ def adapt_meta_dict(
     mix: Sequence[BehaviorSpec],
     oracle_focus: float = 0.0,
     strength_max: float = DEFAULT_STRENGTH_MAX,
+    focus_policy: str = "oracle_pure",
 ) -> dict[str, Any]:
     return {
         "enabled": True,
         "pilot": bool(pilot),
         "strength": None if strength is None else float(strength),
         "oracle_focus": float(oracle_focus),
+        "focus_policy": str(focus_policy),
         "strength_max": float(strength_max),
         "win_rate_min": float(win_rate_min),
         "win_rate_max": None if win_rate_max is None else float(win_rate_max),

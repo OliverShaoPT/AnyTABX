@@ -20,12 +20,17 @@ __all__ = [
     "SharedAllyPolicy",
     "reference_labels",
     "reference_labels_jax",
+    "reference_labels_best_teacher",
+    "reference_labels_best_teacher_jax",
     "reference_actions",
     "reference_action_distribution",
     "act_shared_jax",
     "stack_agent_obs",
     "stack_agent_avail",
 ]
+
+BEST_ORACLE = "oracle_pure"
+BEST_ADVANCED = "heuristic_advanced"
 
 
 @dataclass
@@ -161,6 +166,120 @@ def reference_labels(
         ally_keys=ally_keys,
     )
     return actions, np.asarray(dist, dtype=np.float32)
+
+
+def _advanced_hard_actions_jax(
+    *,
+    key: jax.Array,
+    obs_by_agent: dict[str, Any],
+    ally_keys: list[str],
+    n_agents: int,
+    max_n_zone: int,
+    physics_params: Any,
+    heuristic_params: TABXHeuristicParam,
+    last_visible: list[LastVisibleTarget],
+) -> tuple[dict[str, jax.Array], list[LastVisibleTarget], jax.Array]:
+    """Greedy advanced heuristic hard actions; updates per-ally last_visible."""
+
+    actions: dict[str, jax.Array] = {}
+    new_last: list[LastVisibleTarget] = []
+    for i, agent in enumerate(ally_keys):
+        key, sub = jax.random.split(key)
+        action, lv = heuristic_policy(
+            sub,
+            obs_by_agent[agent],
+            last_visible[i],
+            n_agents,
+            max_n_zone,
+            heuristic_params,
+            physics_params,
+        )
+        actions[agent] = jnp.asarray(action, dtype=jnp.int32).reshape(())
+        new_last.append(lv)
+    return actions, new_last, key
+
+
+def reference_labels_best_teacher_jax(
+    oracle: OracleCoach,
+    *,
+    key: jax.Array,
+    obs_by_agent: dict[str, Any],
+    avail_by_agent: dict[str, Any],
+    ally_keys: list[str],
+    best_policy: str,
+    n_agents: int,
+    max_n_zone: int,
+    physics_params: Any,
+    advanced_params: TABXHeuristicParam | None,
+    ref_last_visible: list[LastVisibleTarget],
+) -> tuple[dict[str, jax.Array], jax.Array, list[LastVisibleTarget], jax.Array]:
+    """Hard labels from best teacher; soft dist always from RL coach.
+
+    Returns:
+      actions, distribution (n_ally, A), updated ref_last_visible, key
+    """
+
+    oracle_actions, dist = reference_labels_jax(
+        oracle,
+        obs_by_agent=obs_by_agent,
+        avail_by_agent=avail_by_agent,
+        ally_keys=ally_keys,
+    )
+    if str(best_policy) != BEST_ADVANCED:
+        return oracle_actions, dist, ref_last_visible, key
+    if advanced_params is None:
+        raise ValueError("advanced_params required when best_policy is heuristic_advanced")
+    adv_actions, new_last, key = _advanced_hard_actions_jax(
+        key=key,
+        obs_by_agent=obs_by_agent,
+        ally_keys=ally_keys,
+        n_agents=n_agents,
+        max_n_zone=max_n_zone,
+        physics_params=physics_params,
+        heuristic_params=advanced_params,
+        last_visible=ref_last_visible,
+    )
+    return adv_actions, dist, new_last, key
+
+
+def reference_labels_best_teacher(
+    oracle: OracleCoach,
+    *,
+    key: jax.Array,
+    obs_by_agent: dict[str, Any],
+    avail_by_agent: dict[str, Any],
+    ally_keys: list[str],
+    best_policy: str,
+    n_agents: int,
+    max_n_zone: int,
+    physics_params: Any,
+    advanced_params: TABXHeuristicParam | None,
+    ref_last_visible: dict[str, LastVisibleTarget] | list[LastVisibleTarget],
+) -> tuple[dict[str, jnp.ndarray], np.ndarray, dict[str, LastVisibleTarget]]:
+    """Host-friendly best-teacher reference labels."""
+
+    if isinstance(ref_last_visible, dict):
+        last_list = [ref_last_visible[a] for a in ally_keys]
+    else:
+        last_list = list(ref_last_visible)
+    actions, dist, new_last, _key = reference_labels_best_teacher_jax(
+        oracle,
+        key=key,
+        obs_by_agent=obs_by_agent,
+        avail_by_agent=avail_by_agent,
+        ally_keys=ally_keys,
+        best_policy=best_policy,
+        n_agents=n_agents,
+        max_n_zone=max_n_zone,
+        physics_params=physics_params,
+        advanced_params=advanced_params,
+        ref_last_visible=last_list,
+    )
+    return (
+        actions,
+        np.asarray(dist, dtype=np.float32),
+        {agent: new_last[i] for i, agent in enumerate(ally_keys)},
+    )
 
 
 def act_shared_jax(

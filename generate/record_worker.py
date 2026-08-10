@@ -118,6 +118,8 @@ def _generate_ids(
     root = Path(output_root) if output_root is not None else Path(payload["output_root"])
     independent = bool(payload.get("independent_ally_policies", False))
     mid_switch = bool(payload.get("mid_episode_policy_switch", True))
+    best_teacher_reference = bool(payload.get("best_teacher_reference", False))
+    best_policy = str(payload.get("best_policy") or "oracle_pure")
     if scan_rollout and parallel_envs > 1:
         t_gen = time.perf_counter()
         batch_paths = generate_records_scan_batch(
@@ -135,6 +137,8 @@ def _generate_ids(
             adapt=adapt,
             independent_ally_policies=independent,
             mid_episode_policy_switch=mid_switch,
+            best_teacher_reference=best_teacher_reference,
+            best_policy=best_policy,
         )
         generate_s_total = time.perf_counter() - t_gen
         per_rec = generate_s_total / max(len(batch_paths), 1)
@@ -173,6 +177,8 @@ def _generate_ids(
                 adapt=adapt,
                 independent_ally_policies=independent,
                 mid_episode_policy_switch=mid_switch,
+                best_teacher_reference=best_teacher_reference,
+                best_policy=best_policy,
             )
         else:
             path = generate_one_record(
@@ -189,6 +195,8 @@ def _generate_ids(
                 rollout_fn=None,
                 independent_ally_policies=independent,
                 mid_episode_policy_switch=mid_switch,
+                best_teacher_reference=best_teacher_reference,
+                best_policy=best_policy,
             )
         generate_s = time.perf_counter() - t_gen
         paths.append(str(path))
@@ -253,6 +261,12 @@ def _adapt_mix_for_package(
     measured_wr: float | None = None
     status = "adapt_failed"
     pilot_rounds = 0
+    # With best_teacher_reference, focus strong mass on task best teacher.
+    focus_policy = (
+        str(payload.get("best_policy") or "oracle_pure")
+        if bool(payload.get("best_teacher_reference", False))
+        else "oracle_pure"
+    )
 
     out_root = Path(payload["output_root"])
     pilot_parent = out_root / ".adapt_pilot"
@@ -274,6 +288,7 @@ def _adapt_mix_for_package(
             mix=active_mix,
             oracle_focus=0.0 if using_base else oracle_focus,
             strength_max=strength_max,
+            focus_policy=focus_policy,
         )
         round_paths: list[str] = []
         _generate_ids(
@@ -336,6 +351,7 @@ def _adapt_mix_for_package(
                 strength,
                 oracle_focus=oracle_focus,
                 strength_max=strength_max,
+                focus_policy=focus_policy,
             )
             using_base = False
             needs_verify = True
@@ -380,6 +396,7 @@ def _adapt_mix_for_package(
     print(
         f"[record_worker] adapt package={package.name} status={status} "
         f"strength={strength:.2f} oracle_focus={oracle_focus:.2f} "
+        f"focus_policy={focus_policy} "
         f"wr={measured_wr} band=[{win_rate_min},{win_rate_max}]",
         flush=True,
     )
@@ -394,6 +411,7 @@ def _adapt_mix_for_package(
         mix=active_mix,
         oracle_focus=0.0 if using_base else oracle_focus,
         strength_max=strength_max,
+        focus_policy=focus_policy,
     )
     _generate_ids(
         package=package,
@@ -441,6 +459,8 @@ def worker_main(payload: dict[str, Any]) -> str:
     )
     from generate.task_package import discover_task_packages
 
+    from generate.coach_eval import BEST_ORACLE, read_best_policy, read_coach_eval
+
     packages = {p.name: p for p in discover_task_packages(payload["packages_root"])}
     base_mix = behavior_mix_from_config(payload.get("behavior_mix"))
     scan_rollout = bool(payload.get("scan_rollout", True))
@@ -448,6 +468,7 @@ def worker_main(payload: dict[str, Any]) -> str:
     if not scan_rollout:
         parallel_envs = 1
     winrate_adapt = bool(payload.get("winrate_adapt", False))
+    best_teacher_reference = bool(payload.get("best_teacher_reference", False))
     # Adapt needs scan path (runtime CDF). Fall back to no-adapt if scan off.
     if winrate_adapt and not scan_rollout:
         print(
@@ -461,6 +482,7 @@ def worker_main(payload: dict[str, Any]) -> str:
     # Reuse env+oracle (+ optional scan fn) per package inside this process.
     contexts: dict[str, Any] = {}
     rollout_fns: dict[str, Any] = {}
+    package_best_policy: dict[str, str] = {}
     paths: list[str] = []
     try:
         for item in payload["items"]:
@@ -470,6 +492,20 @@ def worker_main(payload: dict[str, Any]) -> str:
                 t_setup = time.perf_counter()
                 ctx = build_record_gen_context(package)
                 setup_s = time.perf_counter() - t_setup
+                if best_teacher_reference:
+                    if read_coach_eval(package) is None:
+                        print(
+                            f"[record_worker] package={package.name}: "
+                            "best_teacher_reference on but coach_eval missing; "
+                            f"fallback best_policy={BEST_ORACLE}",
+                            flush=True,
+                        )
+                        best_policy = BEST_ORACLE
+                    else:
+                        best_policy = read_best_policy(package, default=BEST_ORACLE)
+                else:
+                    best_policy = BEST_ORACLE
+                package_best_policy[package.name] = best_policy
                 # Warm *every* behavior in the mix so generate-time switches
                 # do not re-enter XLA compile (as much as JAX allows).
                 compile_s = warmup_record_gen_context(
@@ -484,6 +520,7 @@ def worker_main(payload: dict[str, Any]) -> str:
                         warmup_scan_rollout,
                     )
 
+                    teacher = best_policy if best_teacher_reference else BEST_ORACLE
                     rollout_fn = build_scan_rollout_fn(
                         ctx,
                         mix=base_mix,
@@ -497,6 +534,7 @@ def worker_main(payload: dict[str, Any]) -> str:
                         mid_episode_policy_switch=bool(
                             payload.get("mid_episode_policy_switch", True)
                         ),
+                        best_teacher_policy=teacher,
                     )
                     compile_s += warmup_scan_rollout(
                         rollout_fn,
@@ -517,15 +555,23 @@ def worker_main(payload: dict[str, Any]) -> str:
                         "setup_s": round(setup_s, 3),
                         "compile_s": round(compile_s, 3),
                         "parallel_envs": parallel_envs,
+                        "best_policy": package_best_policy[package.name],
                     },
                 )
+
+            # Per-package teacher for adapt / reference meta (payload copy).
+            item_payload = dict(payload)
+            item_payload["best_teacher_reference"] = best_teacher_reference
+            item_payload["best_policy"] = package_best_policy.get(
+                package.name, BEST_ORACLE
+            )
 
             record_ids = [int(r) for r in item["record_ids"]]
             if winrate_adapt:
                 _adapt_mix_for_package(
                     package=package,
                     record_ids=record_ids,
-                    payload=payload,
+                    payload=item_payload,
                     ctx=ctx,
                     rollout_fn=rollout_fns.get(package.name),
                     base_mix=base_mix,
@@ -542,7 +588,7 @@ def worker_main(payload: dict[str, Any]) -> str:
                 _generate_ids(
                     package=package,
                     record_ids=record_ids,
-                    payload=payload,
+                    payload=item_payload,
                     ctx=ctx,
                     rollout_fn=rollout_fns.get(package.name),
                     mix=base_mix,

@@ -25,7 +25,12 @@ from generate.behavior_mix import (
 from generate.dump_schema import write_env_centric_record
 from generate.env_centric import RecordGenContext, sample_record_seed
 from generate.oracle_loader import OracleCoach
-from generate.policies import act_shared_jax, reference_labels_jax
+from generate.policies import (
+    BEST_ADVANCED,
+    BEST_ORACLE,
+    act_shared_jax,
+    reference_labels_best_teacher_jax,
+)
 from generate.task_package import TaskPackage
 from src.tabx.eval_task import load_heuristic_params
 from src.tabx.heuristic_policy import LastVisibleTarget
@@ -188,6 +193,7 @@ def _make_single_env_rollout(
     total_timesteps: int,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_policy: str = BEST_ORACLE,
 ):
     """Unjitted ``(seed, cdf) -> traj`` for one env (vmappable over seed)."""
 
@@ -202,6 +208,10 @@ def _make_single_env_rollout(
     indiv_cfg = IndividualRewardConfig()
     independent = bool(independent_ally_policies)
     allow_mid_switch = bool(mid_episode_policy_switch)
+    best_policy = str(best_teacher_policy or BEST_ORACLE)
+    advanced_params = (
+        load_heuristic_params("advanced") if best_policy == BEST_ADVANCED else None
+    )
     # Map mix position -> policy_id / quality tag (usually identity, but honor config).
     policy_ids = jnp.asarray([int(s.policy_id) for s in mix], dtype=jnp.int32)
     policy_tags = jnp.asarray(policy_tag_table(mix), dtype=jnp.int32)
@@ -228,6 +238,7 @@ def _make_single_env_rollout(
             mix_index = sample_policy_index(init_policy_key, cdf).astype(jnp.int32)
             steps0 = jnp.int32(0)
         last_visible = _init_last_visible(n_ally)
+        ref_last_visible = _init_last_visible(n_ally)
 
         carry0 = (
             obs,
@@ -238,6 +249,7 @@ def _make_single_env_rollout(
             jnp.int32(0),  # episode_id
             jnp.bool_(True),  # is_reset_step
             last_visible,
+            ref_last_visible,
         )
 
         def body(carry, t):
@@ -250,6 +262,7 @@ def _make_single_env_rollout(
                 episode_id,
                 is_reset_step,
                 last_visible,
+                ref_last_visible,
             ) = carry
 
             if allow_mid_switch:
@@ -285,8 +298,8 @@ def _make_single_env_rollout(
                 policy_tag_agents = jnp.full((n_ally,), policy_tag, dtype=jnp.int32)
 
             avail = env.get_avail_actions(state)
-            # Same split pattern as env_centric (key, bkey, skey).
-            key, bkey, skey = jax.random.split(key, 3)
+            # Same split pattern as env_centric (key, bkey, skey[, rkey]).
+            key, bkey, skey, rkey = jax.random.split(key, 4)
             if independent:
                 behavior, last_visible, _bkey_out = _act_independent_allies(
                     key=bkey,
@@ -306,11 +319,18 @@ def _make_single_env_rollout(
                     (bkey, obs, avail, state["physics_params"], last_visible),
                 )
 
-            ref, ref_dist = reference_labels_jax(
+            ref, ref_dist, ref_last_visible, _rkey = reference_labels_best_teacher_jax(
                 oracle,
+                key=rkey,
                 obs_by_agent=obs,
                 avail_by_agent=avail,
                 ally_keys=ally_keys,
+                best_policy=best_policy,
+                n_agents=n_agents,
+                max_n_zone=max_n_zone,
+                physics_params=state["physics_params"],
+                advanced_params=advanced_params,
+                ref_last_visible=ref_last_visible,
             )
 
             unit_pack = _extract_unit_arrays_jax(state["state"], unit_keys)
@@ -395,6 +415,7 @@ def _make_single_env_rollout(
                     _steps,
                     episode_in,
                     _last,
+                    _ref_last,
                 ) = operands
                 key_in, reset_key, sample_key = jax.random.split(key_in, 3)
                 obs_r, state_r = env.reset(reset_key, env_params)
@@ -405,6 +426,7 @@ def _make_single_env_rollout(
                     idx = sample_policy_index(sample_key, cdf).astype(jnp.int32)
                     steps_r = jnp.int32(0)
                 last_r = _init_last_visible(n_ally)
+                ref_last_r = _init_last_visible(n_ally)
                 return (
                     obs_r,
                     state_r,
@@ -414,6 +436,7 @@ def _make_single_env_rollout(
                     (episode_in + jnp.int32(1)).astype(jnp.int32),
                     jnp.bool_(True),
                     last_r,
+                    ref_last_r,
                 )
 
             def _continue_branch(operands):
@@ -425,6 +448,7 @@ def _make_single_env_rollout(
                     steps_in,
                     episode_in,
                     last_in,
+                    ref_last_in,
                 ) = operands
                 return (
                     obs_in,
@@ -435,6 +459,7 @@ def _make_single_env_rollout(
                     episode_in,
                     jnp.bool_(False),
                     last_in,
+                    ref_last_in,
                 )
 
             new_carry = jax.lax.cond(
@@ -449,6 +474,7 @@ def _make_single_env_rollout(
                     steps_since_switch,
                     episode_id,
                     last_visible,
+                    ref_last_visible,
                 ),
             )
             return new_carry, out
@@ -471,6 +497,7 @@ def build_scan_rollout_fn(
     parallel_envs: int = 1,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_policy: str = BEST_ORACLE,
 ):
     """Return jitted rollout.
 
@@ -487,6 +514,7 @@ def build_scan_rollout_fn(
         total_timesteps=total_timesteps,
         independent_ally_policies=independent_ally_policies,
         mid_episode_policy_switch=mid_episode_policy_switch,
+        best_teacher_policy=best_teacher_policy,
     )
     b = max(1, int(parallel_envs))
     if b <= 1:
@@ -568,6 +596,8 @@ def _record_meta(
     adapt: dict[str, Any] | None = None,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_reference: bool = False,
+    best_policy: str = BEST_ORACLE,
 ) -> dict[str, Any]:
     indiv_cfg = IndividualRewardConfig()
     independent = bool(independent_ally_policies)
@@ -591,6 +621,8 @@ def _record_meta(
         "mid_episode_policy_switch": mid_switch,
         "shared_ally_policy": not independent,
         "independent_ally_policies": independent,
+        "best_teacher_reference": bool(best_teacher_reference),
+        "best_policy": str(best_policy),
         "individual_reward_config": asdict(indiv_cfg),
         "behavior_mix": [asdict(s) for s in mix],
         "policy_tag_legend": policy_tag_legend_json(),
@@ -630,6 +662,8 @@ def _write_one_from_arrays(
     adapt: dict[str, Any] | None = None,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_reference: bool = False,
+    best_policy: str = BEST_ORACLE,
 ) -> Path:
     safe_id = package.task_id.replace("/", "_")
     record_dir = (
@@ -651,6 +685,8 @@ def _write_one_from_arrays(
         adapt=adapt,
         independent_ally_policies=independent_ally_policies,
         mid_episode_policy_switch=mid_episode_policy_switch,
+        best_teacher_reference=best_teacher_reference,
+        best_policy=best_policy,
     )
     write_env_centric_record(record_dir, arrays, meta)
     return record_dir
@@ -672,6 +708,8 @@ def generate_one_record_scan(
     adapt: dict[str, Any] | None = None,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_reference: bool = False,
+    best_policy: str = BEST_ORACLE,
 ) -> Path:
     """Generate one record (single-env scan). For B>1 use ``generate_records_scan_batch``."""
 
@@ -687,6 +725,7 @@ def generate_one_record_scan(
             f"RecordGenContext package mismatch: ctx={ctx.package.name} vs {package.name}"
         )
 
+    teacher = str(best_policy if best_teacher_reference else BEST_ORACLE)
     if rollout_fn is None:
         rollout_fn = build_scan_rollout_fn(
             ctx,
@@ -697,6 +736,7 @@ def generate_one_record_scan(
             parallel_envs=1,
             independent_ally_policies=independent_ally_policies,
             mid_episode_policy_switch=mid_episode_policy_switch,
+            best_teacher_policy=teacher,
         )
 
     traj = rollout_fn(jnp.asarray(seed_i % (2**32), dtype=jnp.uint32), cdf)
@@ -716,6 +756,8 @@ def generate_one_record_scan(
         adapt=adapt,
         independent_ally_policies=independent_ally_policies,
         mid_episode_policy_switch=mid_episode_policy_switch,
+        best_teacher_reference=best_teacher_reference,
+        best_policy=teacher,
     )
 
 
@@ -735,6 +777,8 @@ def generate_records_scan_batch(
     adapt: dict[str, Any] | None = None,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_reference: bool = False,
+    best_policy: str = BEST_ORACLE,
 ) -> list[str]:
     """Generate ``len(record_ids)`` records using fixed-B vmap batches + padding."""
 
@@ -749,6 +793,7 @@ def generate_records_scan_batch(
             f"RecordGenContext package mismatch: ctx={ctx.package.name} vs {package.name}"
         )
 
+    teacher = str(best_policy if best_teacher_reference else BEST_ORACLE)
     b = max(1, int(parallel_envs))
     if rollout_fn is None:
         rollout_fn = build_scan_rollout_fn(
@@ -760,6 +805,7 @@ def generate_records_scan_batch(
             parallel_envs=b,
             independent_ally_policies=independent_ally_policies,
             mid_episode_policy_switch=mid_episode_policy_switch,
+            best_teacher_policy=teacher,
         )
 
     paths: list[str] = []
@@ -780,6 +826,8 @@ def generate_records_scan_batch(
                 adapt=adapt,
                 independent_ally_policies=independent_ally_policies,
                 mid_episode_policy_switch=mid_episode_policy_switch,
+                best_teacher_reference=best_teacher_reference,
+                best_policy=teacher,
             )
             paths.append(str(path))
         return paths
@@ -814,6 +862,8 @@ def generate_records_scan_batch(
                 adapt=adapt,
                 independent_ally_policies=independent_ally_policies,
                 mid_episode_policy_switch=mid_episode_policy_switch,
+                best_teacher_reference=best_teacher_reference,
+                best_policy=teacher,
             )
             paths.append(str(path))
         # Padded slots (valid:b) are discarded; keeps a single JIT for fixed B.

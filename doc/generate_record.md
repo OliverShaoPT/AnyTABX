@@ -32,6 +32,12 @@
 
 Generate record **只需要** `coach_root`：递归发现上述叶子，每个子文件夹对应一个环境。
 
+训练结束（`marl_baseline`，`COACH_EVAL=true` 默认开）会在该叶子 `task.json` 的 `tasks[0].metadata.coach_eval` 写入 `oracle_pure` / `heuristic_advanced` 胜率与 `best_policy`。评测用 `vmap` 并行 episode（默认 `COACH_EVAL_PARALLEL_ENVS=32`）。也可事后跑：
+
+```bash
+python tools/compare_oracle_vs_advanced.py --coach_root ... --write_task_json --parallel_envs 32
+```
+
 ```bash
 # 编辑 generate/configs/record_gen.yaml 里的 coach_root，然后：
 ./generate/generate_records.sh
@@ -68,10 +74,12 @@ python -m generate.env_centric ... --seed 0
 | 序列 | 含义 |
 |---|---|
 | `actions_behavior` | 行为策略动作，**进入** `env.step` |
-| `actions_reference` | 同一 obs 上 **纯 oracle** 硬标签（argmax） |
-| `actions_reference_distribution` | 同一 obs 上 oracle RL 的 soft 分布 `(T, n_ally, A)`，供 KL（HVAC `label_action_distribution`） |
+| `actions_reference` | 同一 obs 上硬标签：默认 **oracle argmax**；`best_teacher_reference=true` 时用 `task.json` → `metadata.coach_eval.best_policy`（`oracle_pure` 或 `heuristic_advanced`） |
+| `actions_reference_distribution` | **始终** oracle RL 的 soft 分布 `(T, n_ally, A)`，供 KL（HVAC `label_action_distribution`） |
 
 Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank manifest）。
+
+`coach_eval` 由训练结束时的 oracle vs advanced 评测写入（或 `tools/compare_oracle_vs_advanced.py --write_task_json`）。缺字段时开关打开会回退到 `oracle_pure`。
 
 ### 3.2 Ally policy 采样模式
 
@@ -99,10 +107,10 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 1. 在临时目录用 `adapt_pilot_records` 条 **试跑**估胜率（**不计入**最终输出，试跑后删除）
 2. 只重加权 ally mix（**不改 enemy**）：
    - 先调 `strength`（强组质量上限 `adapt_strength_max`，默认 0.7，弱组至少保留 30%）
-   - 仍偏低再调 `oracle_focus`，把强组内质量往 `oracle_pure` 集中
+   - 仍偏低再调 `oracle_focus`，把强组内质量往 **focus teacher** 集中（默认 `oracle_pure`；`best_teacher_reference=true` 时跟 `coach_eval.best_policy`）
    - 强组 = `oracle_pure` / 低ε `oracle_eps` / `advanced`；高ε `oracle_eps0.3` 算弱组
 3. Mix CDF 为运行时输入，权重变化不必重新 JIT
-4. 找到（或尽力）最终 mix 后，**再生成全部正式 records**（`meta.adapt` 记 strength / oracle_focus / WR / status）
+4. 找到（或尽力）最终 mix 后，**再生成全部正式 records**（`meta.adapt` 记 strength / oracle_focus / focus_policy / WR / status）
 
 | 配置 | 默认 | 含义 |
 |---|---|---|
@@ -112,6 +120,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `adapt_pilot_records` | 4 | 每轮试跑 record 条数（临时） |
 | `adapt_max_iters` | 3 | 最多试跑/调整轮数 |
 | `adapt_strength_max` | 0.7 | 强组质量上限（保留弱策略） |
+| `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy` |
 
 与 `independent_ally_policies=true` 兼容：adapt 仍只改共享 CDF，从而抬高每个 ally 抽到强策略的概率。
 

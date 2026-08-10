@@ -26,8 +26,16 @@ from generate.behavior_mix import (
 )
 from generate.dump_schema import ensure_dir, write_env_centric_record
 from generate.oracle_loader import OracleCoach, load_oracle_coach
-from generate.policies import SharedAllyPolicy, reference_labels
+from generate.policies import (
+    BEST_ADVANCED,
+    BEST_ORACLE,
+    SharedAllyPolicy,
+    reference_labels,
+    reference_labels_best_teacher,
+)
 from generate.task_package import TaskPackage, discover_task_packages, load_package_task_bank
+from src.tabx.eval_task import load_heuristic_params
+from src.tabx.heuristic_policy import LastVisibleTarget
 from src.tabx import TABX
 from src.tabx.sample_task import build_batched_env_params_from_tasks
 from src.tabx.wrappers.individual_reward import IndividualRewardConfig, compute_shaped_rewards
@@ -263,6 +271,8 @@ def generate_one_record(
     rollout_fn: Any | None = None,
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
+    best_teacher_reference: bool = False,
+    best_policy: str = BEST_ORACLE,
 ) -> Path:
     """Generate one env-centric record.
 
@@ -286,12 +296,15 @@ def generate_one_record(
             rollout_fn=rollout_fn,
             independent_ally_policies=independent_ally_policies,
             mid_episode_policy_switch=mid_episode_policy_switch,
+            best_teacher_reference=best_teacher_reference,
+            best_policy=best_policy,
         )
 
     seed = sample_record_seed(seed, salt=record_id)
     mix = behavior_mix or DEFAULT_BEHAVIOR_MIX
     independent = bool(independent_ally_policies)
     mid_switch = bool(mid_episode_policy_switch)
+    teacher = str(best_policy if best_teacher_reference else BEST_ORACLE)
     if ctx is None:
         ctx = build_record_gen_context(package)
     elif ctx.package.name != package.name:
@@ -312,6 +325,10 @@ def generate_one_record(
     indiv_cfg = IndividualRewardConfig()
     # heuristic_policy parses obs with total unit count (allies + enemies).
     n_units_total = len(unit_keys)
+    advanced_params = (
+        load_heuristic_params("advanced") if teacher == BEST_ADVANCED else None
+    )
+    ref_last_visible = {agent: LastVisibleTarget() for agent in ally_keys}
 
     key = jax.random.key(seed % (2**32))
     key, reset_key = jax.random.split(key)
@@ -439,11 +456,19 @@ def generate_one_record(
             policy_tag_row = np.full(
                 (n_ally,), int(policy_tag_for_spec(shared.spec)), dtype=np.int32
             )
-        ref, ref_dist = reference_labels(
+        key, rkey = jax.random.split(key)
+        ref, ref_dist, ref_last_visible = reference_labels_best_teacher(
             oracle,
+            key=rkey,
             obs_by_agent=obs,
             avail_by_agent=avail,
             ally_keys=ally_keys,
+            best_policy=teacher,
+            n_agents=n_units_total,
+            max_n_zone=env.max_n_zone,
+            physics_params=state["physics_params"],
+            advanced_params=advanced_params,
+            ref_last_visible=ref_last_visible,
         )
 
         unit_pack = _extract_unit_arrays(state["state"], unit_keys)
@@ -517,6 +542,7 @@ def generate_one_record(
             obs, state = env.reset(reset_key, env_params)
             episode_id += 1
             is_reset_step = True
+            ref_last_visible = {agent: LastVisibleTarget() for agent in ally_keys}
             # Every episode reset resamples behavior (shared or per-agent).
             if independent:
                 assert switchers is not None and policies is not None
@@ -591,6 +617,8 @@ def generate_one_record(
         "mid_episode_policy_switch": mid_switch,
         "shared_ally_policy": not independent,
         "independent_ally_policies": independent,
+        "best_teacher_reference": bool(best_teacher_reference),
+        "best_policy": teacher,
         "individual_reward_config": asdict(indiv_cfg),
         "behavior_mix": [asdict(s) for s in mix],
         "policy_tag_legend": policy_tag_legend_json(),

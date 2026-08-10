@@ -67,6 +67,13 @@ adapt_pilot_records: 4        # records per pilot round (temp dir; not kept)
 adapt_max_iters: 3
 adapt_strength_max: 0.7       # max strong-group mass (≥30% weak retained)
 
+# --- Best teacher reference (reads tasks[0].metadata.coach_eval from task.json) ---
+# false (default): hard reference = oracle argmax; adapt focus → oracle_pure.
+# true: hard reference = coach_eval.best_policy (oracle_pure | heuristic_advanced);
+#       soft actions_reference_distribution always stays RL softmax;
+#       winrate_adapt oracle_focus concentrates strong mass on that best_policy.
+best_teacher_reference: false
+
 # --- Behavior policy mixture (weights renormalized) ---
 # Ordered by quality so policy_id == policy_tag (0=weakest … 7=oracle; 8=mask at convert).
 behavior_mix:

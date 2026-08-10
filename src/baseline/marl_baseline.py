@@ -70,6 +70,13 @@ class MARLConfig:
     WORLD_STATE_TYPE: Literal["concat", "global"] = "global"
     POSITION_PERMUTATION: bool = False
     FLIP: bool = False
+    # Post-train oracle_pure vs heuristic_advanced eval → task.json metadata.coach_eval
+    COACH_EVAL: bool = True
+    COACH_EVAL_EPISODES: int = 64
+    COACH_EVAL_TIE_EPS: float = 0.02
+    COACH_EVAL_MAX_EPISODE_STEPS: int = 512
+    # vmap batch width for coach_eval episodes (capped by COACH_EVAL_EPISODES).
+    COACH_EVAL_PARALLEL_ENVS: int = 32
     # Shared optimization
     LR: float = 4e-4
     GAMMA: float = 0.99
@@ -552,6 +559,33 @@ class BaseMARLTrainer(ABC):
             if not self.best_path.exists():
                 save_params(self.checkpoint_params(session), self.best_path)
                 stopper.best = float(np.mean(stopper.returns[-stopper.window :]))
+            if self.config.COACH_EVAL:
+                try:
+                    from generate.coach_eval import evaluate_and_write_coach_leaf
+
+                    eval_result = evaluate_and_write_coach_leaf(
+                        self.output,
+                        num_episodes=int(self.config.COACH_EVAL_EPISODES),
+                        seed=int(self.config.seed),
+                        max_episode_steps=int(
+                            self.config.COACH_EVAL_MAX_EPISODE_STEPS
+                        ),
+                        tie_eps=float(self.config.COACH_EVAL_TIE_EPS),
+                        parallel_envs=int(self.config.COACH_EVAL_PARALLEL_ENVS),
+                    )
+                    print(
+                        f"[coach_eval] wrote task.json metadata.coach_eval "
+                        f"best_policy={eval_result.get('best_policy')} "
+                        f"oracle={eval_result['oracle_pure']['win_rate']:.3f} "
+                        f"advanced={eval_result['heuristic_advanced']['win_rate']:.3f}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[coach_eval] skipped after train failure: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
         finally:
             recorder.close()
             run.finish()

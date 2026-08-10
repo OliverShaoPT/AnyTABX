@@ -228,9 +228,12 @@ def split_one_record(
                 "done": "1 marks the step whose transition ended the episode",
                 "truncation": "1 if episode ended by hitting max_episode_steps",
                 "is_win": "1 if team 0 (ally) won on this terminal step; else 0",
-                "reference_action": "argmax of oracle RL policy (hard label)",
+                "reference_action": (
+                    "hard label: oracle argmax by default; with "
+                    "best_teacher_reference may be heuristic_advanced"
+                ),
                 "reference_action_distribution": (
-                    "oracle RL softmax probs (T, action_dim); KL soft target "
+                    "always oracle RL softmax probs (T, action_dim); KL soft target "
                     "(HVAC label_action_distribution)"
                 ),
                 "policy_tag": (

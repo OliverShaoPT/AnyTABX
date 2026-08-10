@@ -11,7 +11,12 @@ Usage:
     --gpu_ids 4,5,6,7 \\
     --workers_per_gpu 1 \\
     --num_episodes 64 \\
+    --parallel_envs 32 \\
+    --write_task_json \\
     --json_out /tmp/oracle_vs_advanced.json
+
+``--parallel_envs``: vmap batch size for episode rollouts inside each package
+(default 32). Multi-GPU ``--gpu_ids`` still parallelizes across packages.
 """
 
 from __future__ import annotations
@@ -31,23 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # Bump when changing eval logic; printed at startup so you can verify the remote copy.
-SCRIPT_VERSION = "2026-08-05-iswin-v2"
-
-
-ORACLE_SPEC = {
-    "policy_id": 7,
-    "name": "oracle_pure",
-    "kind": "oracle",
-    "weight": 1.0,
-    "epsilon": 0.0,
-}
-ADVANCED_SPEC = {
-    "policy_id": 4,
-    "name": "heuristic_advanced",
-    "kind": "heuristic",
-    "weight": 1.0,
-    "heuristic": "advanced",
-}
+SCRIPT_VERSION = "2026-08-10-coach-eval-lib"
 
 
 def _parse_gpu_ids(value: str | None) -> list[str]:
@@ -59,130 +48,6 @@ def _parse_gpu_ids(value: str | None) -> list[str]:
     if len(ids) != len(set(ids)):
         raise ValueError("gpu_ids must not contain duplicates")
     return ids
-
-
-def _wr(counts: dict[str, int]) -> float:
-    wins = int(counts.get("win", 0))
-    losses = int(counts.get("loss", 0))
-    decisive = wins + losses
-    if decisive <= 0:
-        return 0.0
-    return wins / decisive
-
-
-def _run_policy_episodes(
-    *,
-    ctx,
-    spec_dict: dict[str, Any],
-    num_episodes: int,
-    seed: int,
-    max_episode_steps: int,
-) -> dict[str, int]:
-    """Roll out episodes; outcome uses env ``info['is_win']`` only (no unit.health)."""
-
-    import jax
-    from generate.behavior_mix import BehaviorSpec
-    from generate.policies import SharedAllyPolicy
-    from src.tabx.heuristic_policy import LastVisibleTarget
-
-    spec = BehaviorSpec(
-        policy_id=int(spec_dict["policy_id"]),
-        name=str(spec_dict["name"]),
-        kind=str(spec_dict["kind"]),
-        weight=float(spec_dict.get("weight", 1.0)),
-        heuristic=spec_dict.get("heuristic"),
-        epsilon=None
-        if spec_dict.get("epsilon") is None
-        else float(spec_dict["epsilon"]),
-    )
-    shared = SharedAllyPolicy.from_spec(
-        spec,
-        oracle=ctx.oracle,
-        ally_keys=ctx.ally_keys,
-        n_agents=ctx.n_units_total,
-        max_n_zone=ctx.env.max_n_zone,
-    )
-    counts = {"win": 0, "draw": 0, "loss": 0, "episodes": 0, "truncated": 0}
-    key = jax.random.key(int(seed) % (2**32))
-    env = ctx.env
-    env_params = ctx.env_params
-    ally_keys = ctx.ally_keys
-
-    for _ep in range(int(num_episodes)):
-        key, reset_key = jax.random.split(key)
-        obs, state = env.reset(reset_key, env_params)
-        shared.last_visible = {agent: LastVisibleTarget() for agent in ally_keys}
-        outcome = "loss"
-        truncated = False
-        for _t in range(int(max_episode_steps)):
-            avail = env.get_avail_actions(state)
-            key, bkey, skey = jax.random.split(key, 3)
-            behavior = shared.act(
-                key=bkey,
-                obs_by_agent=obs,
-                avail_by_agent=avail,
-                ally_keys=ally_keys,
-                physics_params=state["physics_params"],
-            )
-            obs, state, _rewards, dones, info = env.step(skey, state, dict(behavior))
-            if bool(dones["__all__"]):
-                is_win = int(info["is_win"].reshape(-1)[0])
-                truncated = bool(info["truncation"].reshape(-1)[0])
-                outcome = "win" if is_win else "loss"
-                break
-        else:
-            truncated = True
-            outcome = "loss"
-
-        counts[outcome] += 1
-        counts["episodes"] += 1
-        if truncated:
-            counts["truncated"] += 1
-    return counts
-
-
-def _eval_package(
-    package,
-    *,
-    num_episodes: int,
-    seed: int,
-    max_episode_steps: int,
-) -> dict[str, Any]:
-    from generate.env_centric import build_record_gen_context
-
-    ctx = build_record_gen_context(package)
-    oracle_counts = _run_policy_episodes(
-        ctx=ctx,
-        spec_dict=ORACLE_SPEC,
-        num_episodes=num_episodes,
-        seed=seed,
-        max_episode_steps=max_episode_steps,
-    )
-    advanced_counts = _run_policy_episodes(
-        ctx=ctx,
-        spec_dict=ADVANCED_SPEC,
-        num_episodes=num_episodes,
-        seed=seed + 10_000_003,
-        max_episode_steps=max_episode_steps,
-    )
-    o_wr = _wr(oracle_counts)
-    a_wr = _wr(advanced_counts)
-    return {
-        "package_name": package.name,
-        "task_id": package.task_id,
-        "task_index": int(package.task_index),
-        "package_path": str(package.path),
-        "enemy_heuristic": (ctx.manifest or {}).get("heuristic"),
-        "oracle_pure": {
-            **oracle_counts,
-            "win_rate": o_wr,
-        },
-        "heuristic_advanced": {
-            **advanced_counts,
-            "win_rate": a_wr,
-        },
-        "delta_oracle_minus_advanced": o_wr - a_wr,
-    }
 
 
 def worker_main(payload: dict[str, Any]) -> str:
@@ -209,6 +74,12 @@ def worker_main(payload: dict[str, Any]) -> str:
 
         force_jax_cpu_env()
 
+    from generate.coach_eval import (
+        DEFAULT_TIE_EPS,
+        evaluate_package_oracle_vs_advanced,
+        write_coach_eval_to_task_json,
+        coach_eval_for_task_metadata,
+    )
     from generate.task_package import discover_task_packages
 
     coach_root = Path(payload["coach_root"])
@@ -228,6 +99,8 @@ def worker_main(payload: dict[str, Any]) -> str:
             flush=True,
         )
 
+    write_task = bool(payload.get("write_task_json", False))
+    tie_eps = float(payload.get("tie_eps", DEFAULT_TIE_EPS))
     results: list[dict[str, Any]] = []
     for i, package in enumerate(ordered):
         print(
@@ -236,14 +109,19 @@ def worker_main(payload: dict[str, Any]) -> str:
             flush=True,
         )
         try:
-            results.append(
-                _eval_package(
-                    package,
-                    num_episodes=int(payload["num_episodes"]),
-                    seed=int(payload["seed"]) + int(package.task_index) * 997,
-                    max_episode_steps=int(payload["max_episode_steps"]),
-                )
+            row = evaluate_package_oracle_vs_advanced(
+                package,
+                num_episodes=int(payload["num_episodes"]),
+                seed=int(payload["seed"]) + int(package.task_index) * 997,
+                max_episode_steps=int(payload["max_episode_steps"]),
+                tie_eps=tie_eps,
+                parallel_envs=payload.get("parallel_envs"),
             )
+            if write_task:
+                write_coach_eval_to_task_json(
+                    package.task_json, coach_eval_for_task_metadata(row)
+                )
+            results.append(row)
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[compare_oracle] worker={worker_id} ERROR {package.name}: {exc}\n"
@@ -304,10 +182,10 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
     err = [r for r in rows if "error" in r]
     print(
         f"{'task':<48} {'oracle':>8} {'advanced':>8} {'delta':>8} "
-        f"{'o_w/d/l':>12} {'a_w/d/l':>12}",
+        f"{'best':>18} {'o_w/d/l':>12} {'a_w/d/l':>12}",
         flush=True,
     )
-    print("-" * 110, flush=True)
+    print("-" * 130, flush=True)
     for r in sorted(ok, key=lambda x: (int(x.get("task_index", 0)), x["package_name"])):
         o = r["oracle_pure"]
         a = r["heuristic_advanced"]
@@ -316,6 +194,7 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
             f"{o['win_rate']:>7.1%} "
             f"{a['win_rate']:>7.1%} "
             f"{r['delta_oracle_minus_advanced']:>+7.1%} "
+            f"{str(r.get('best_policy', '')):>18} "
             f"{o['win']}/{o['draw']}/{o['loss']:>4} "
             f"{a['win']}/{a['draw']}/{a['loss']:>4}",
             flush=True,
@@ -324,17 +203,18 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
         mean_o = sum(r["oracle_pure"]["win_rate"] for r in ok) / len(ok)
         mean_a = sum(r["heuristic_advanced"]["win_rate"] for r in ok) / len(ok)
         oracle_better = sum(
-            1 for r in ok if r["delta_oracle_minus_advanced"] > 1e-9
+            1 for r in ok if r.get("best_policy") == "oracle_pure"
+            and r["delta_oracle_minus_advanced"] > 1e-9
         )
         advanced_better = sum(
-            1 for r in ok if r["delta_oracle_minus_advanced"] < -1e-9
+            1 for r in ok if r.get("best_policy") == "heuristic_advanced"
         )
-        print("-" * 110, flush=True)
+        print("-" * 130, flush=True)
         print(
             f"[compare_oracle] tasks={len(ok)} "
             f"mean oracle={mean_o:.1%} mean advanced={mean_a:.1%} "
             f"delta={mean_o - mean_a:+.1%} "
-            f"(oracle_better={oracle_better} advanced_better={advanced_better})",
+            f"(best_oracle={oracle_better} best_advanced={advanced_better})",
             flush=True,
         )
     if err:
@@ -366,7 +246,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--jax_platform", type=str, default="cuda")
     parser.add_argument("--num_episodes", type=int, default=64)
     parser.add_argument("--max_episode_steps", type=int, default=512)
+    parser.add_argument(
+        "--parallel_envs",
+        type=int,
+        default=32,
+        help="vmap batch size for parallel episode rollouts (default 32).",
+    )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tie_eps", type=float, default=0.02)
+    parser.add_argument(
+        "--write_task_json",
+        action="store_true",
+        help="Write coach_eval into each package task.json metadata.",
+    )
     parser.add_argument(
         "--task_index",
         type=int,
@@ -381,7 +273,6 @@ def main(argv: list[str] | None = None) -> None:
     if not coach_root.is_dir():
         raise FileNotFoundError(f"coach_root not found: {coach_root}")
 
-    # Discover packages in the parent (no JAX needed).
     from generate.task_package import discover_task_packages
 
     packages = discover_task_packages(coach_root, seed=args.coach_seed)
@@ -421,7 +312,10 @@ def main(argv: list[str] | None = None) -> None:
                 "jax_platform": args.jax_platform,
                 "num_episodes": int(args.num_episodes),
                 "max_episode_steps": int(args.max_episode_steps),
+                "parallel_envs": int(args.parallel_envs),
                 "seed": int(args.seed),
+                "tie_eps": float(args.tie_eps),
+                "write_task_json": bool(args.write_task_json),
                 "result_path": str(scratch / f"worker_{slot.worker_id:02d}.json"),
             }
         )
@@ -433,7 +327,8 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"[compare_oracle] coach_root={coach_root} packages={len(packages)} "
         f"device={args.device} slots={len(jobs)} "
-        f"episodes/policy={args.num_episodes} max_steps={args.max_episode_steps}",
+        f"episodes/policy={args.num_episodes} parallel_envs={args.parallel_envs} "
+        f"max_steps={args.max_episode_steps}",
         flush=True,
     )
     for job in jobs:
@@ -461,7 +356,9 @@ def main(argv: list[str] | None = None) -> None:
             "coach_root": str(coach_root.resolve()),
             "num_episodes": int(args.num_episodes),
             "max_episode_steps": int(args.max_episode_steps),
+            "parallel_envs": int(args.parallel_envs),
             "seed": int(args.seed),
+            "tie_eps": float(args.tie_eps),
             "device": args.device,
             "gpu_ids": gpu_ids,
             "results": sorted(
