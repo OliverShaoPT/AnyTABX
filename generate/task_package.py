@@ -27,7 +27,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from src.tabx.sample_task import load_task_bank, save_task_bank
+# Intentionally no top-level import of ``src.tabx.sample_task``: that module
+# imports JAX. Parent orchestrators (compare_oracle / parallel_records) only need
+# filesystem discovery and must stay JAX-free to avoid GPU/CPU allocator bloat.
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,8 @@ def _infer_index_from_path(path: Path) -> int:
 
 
 def load_package_task_bank(package: TaskPackage) -> dict[str, Any]:
+    from src.tabx.sample_task import load_task_bank
+
     return load_task_bank(package.task_json)
 
 
@@ -245,6 +249,8 @@ def pack_task_packages(
     written next to weights. Prefer pointing generate-record at ``coach_root``
     directly when trainers already emit self-contained leaves.
     """
+
+    from src.tabx.sample_task import load_task_bank, save_task_bank
 
     bank = load_task_bank(task_bank_path)
     ckpt_root = Path(ckpt_root)

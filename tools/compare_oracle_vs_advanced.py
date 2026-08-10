@@ -273,6 +273,9 @@ def main(argv: list[str] | None = None) -> None:
     if not coach_root.is_dir():
         raise FileNotFoundError(f"coach_root not found: {coach_root}")
 
+    # Parent only discovers packages / orchestrates workers. Discovery is
+    # JAX-free (lazy imports in task_package); do not init JAX here — CPU JAX
+    # in a long-lived parent has caused host RAM growth in the past.
     from generate.task_package import discover_task_packages
 
     packages = discover_task_packages(coach_root, seed=args.coach_seed)
