@@ -79,28 +79,23 @@ def resolve_policy_tag(
 
 
 def build_policy_mask(
-    policy_ids: np.ndarray,
+    length: int,
     *,
     mask_prob: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Segment mask: decide at each policy switch; hold until next switch.
+    """Whole-sequence mask: one Bernoulli draw per sample.
 
-    ``1`` = masked. Decision at t=0 and whenever ``policy_ids[t] != policy_ids[t-1]``.
+    ``1`` = masked. If the draw hits, every step in the sequence is masked.
     """
 
-    policy_ids = np.asarray(policy_ids).reshape(-1)
-    t = int(policy_ids.shape[0])
+    t = max(0, int(length))
     mask = np.zeros((t,), dtype=np.uint8)
     if t == 0:
         return mask
     p = float(np.clip(mask_prob, 0.0, 1.0))
-    masked = bool(rng.random() < p)
-    mask[0] = np.uint8(masked)
-    for i in range(1, t):
-        if int(policy_ids[i]) != int(policy_ids[i - 1]):
-            masked = bool(rng.random() < p)
-        mask[i] = np.uint8(masked)
+    if bool(rng.random() < p):
+        mask[:] = np.uint8(1)
     return mask
 
 
@@ -177,8 +172,8 @@ def split_one_record(
             arrays, meta, ally_index=ally_index, t=t
         )
         rng = np.random.default_rng(base_seed + record_salt + 17 * ally_index)
-        # Switch detection uses per-agent policy_id (tag changes with it today).
-        policy_mask = build_policy_mask(policy_id_1d, mask_prob=mask_prob, rng=rng)
+        # One draw per agent sequence; if masked, overwrite the whole tag series.
+        policy_mask = build_policy_mask(t, mask_prob=mask_prob, rng=rng)
         # Tag 8 = mask: overwrite quality tag on masked steps.
         policy_tag_1d = policy_tag_1d.copy()
         policy_tag_1d[policy_mask.astype(bool)] = np.int32(POLICY_TAG_MASK)
@@ -241,8 +236,8 @@ def split_one_record(
                     f"masked steps overwritten to tag={POLICY_TAG_MASK}"
                 ),
                 "policy_mask": (
-                    "1=masked. Drawn at each behavior_policy_id switch with "
-                    "mask_prob; held until the next switch; coincides with policy_tag==8"
+                    "1=masked. One Bernoulli(mask_prob) draw per agent sequence; "
+                    "if hit, the whole sequence is masked (policy_tag==8)"
                 ),
                 "alignment": "All arrays share the same time index t",
             },
@@ -357,8 +352,8 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=0.3,
         help=(
-            "At each behavior_policy_id switch, probability to mask until the "
-            "next switch (writes policy_mask.npy; 1=masked). Default: 0.3"
+            "Per agent sequence, probability to mask the entire policy_tag "
+            "series (writes policy_mask.npy; 1=masked). Default: 0.3"
         ),
     )
     parser.add_argument(

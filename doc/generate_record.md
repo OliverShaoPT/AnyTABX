@@ -239,7 +239,7 @@ python -m generate.agent_centric --records_root ./data/records
 python -m generate.agent_centric --record_dir ./data/records/task_00000_xxx/record-000000
 ```
 
-**`policy_mask`（转换时生成）**：`--mask_prob` 控制（默认 `0.3`）。每次 `behavior_policy_id` **切换**时以该概率决定是否 mask；若 mask，则一直 mask 到下次 switch。`1`=masked。`t=0` 也算一次决策点。同时将这些步的 `policy_tag` 设为 **8（mask）**。
+**`policy_mask`（转换时生成）**：`--mask_prob` 控制（默认 `0.3`）。每个 agent 序列只采样一次；若命中则 **整条序列** 的 `policy_tag` 都设为 **8（mask）**，`policy_mask` 全为 `1`。
 
 **扁平布局**（`--output_root`）：
 

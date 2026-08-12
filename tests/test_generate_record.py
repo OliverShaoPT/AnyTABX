@@ -186,7 +186,7 @@ class AgentCentricSplitTest(unittest.TestCase):
                     np.load(ally0 / "reference_action.npy"),
                 )
             )
-            # mask_prob=1 → every segment masked; tags overwritten to 8
+            # mask_prob=1 → whole sequence masked; tags overwritten to 8
             self.assertTrue(np.all(np.load(ally0 / "policy_mask.npy") == 1))
             self.assertTrue(
                 np.all(np.load(ally0 / "policy_tag.npy") == POLICY_TAG_MASK)
@@ -290,9 +290,7 @@ class PolicyTagMaskTest(unittest.TestCase):
         for spec in DEFAULT_BEHAVIOR_MIX:
             self.assertEqual(int(spec.policy_id), policy_tag_for_spec(spec), spec.name)
 
-    def test_build_policy_mask_holds_until_switch(self) -> None:
-        ids = np.array([0, 0, 0, 1, 1, 2], dtype=np.int32)
-
+    def test_build_policy_mask_whole_sequence(self) -> None:
         class Scripted:
             def __init__(self, values):
                 self.values = list(values)
@@ -303,10 +301,11 @@ class PolicyTagMaskTest(unittest.TestCase):
                 self.i += 1
                 return v
 
-        # p=0.5: 0.0→mask, 0.9→keep, 0.0→mask; held within each policy segment.
-        scripted = Scripted([0.0, 0.9, 0.0])
-        mask = build_policy_mask(ids, mask_prob=0.5, rng=scripted)  # type: ignore[arg-type]
-        self.assertTrue(np.array_equal(mask, np.array([1, 1, 1, 0, 0, 1], dtype=np.uint8)))
+        # One draw per sequence: 0.0→mask all, 0.9→keep all.
+        masked = build_policy_mask(6, mask_prob=0.5, rng=Scripted([0.0]))  # type: ignore[arg-type]
+        kept = build_policy_mask(6, mask_prob=0.5, rng=Scripted([0.9]))  # type: ignore[arg-type]
+        self.assertTrue(np.array_equal(masked, np.ones(6, dtype=np.uint8)))
+        self.assertTrue(np.array_equal(kept, np.zeros(6, dtype=np.uint8)))
 
 
 class WinrateAdaptTest(unittest.TestCase):
