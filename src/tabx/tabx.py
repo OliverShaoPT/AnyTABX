@@ -469,11 +469,18 @@ class GameManager:
             jnp.inf,
             jnp.square(position_diff).sum(axis=-1),
         )
+        # Padding / dead units sit at the origin; do not mark them visible
+        # (otherwise rel_pos = -own_pos is non-zero and steals FOV slots).
+        visible_matrix = (
+            sight_inside.squeeze().T
+            & unit_alive_vector.T
+            & jnp.logical_not(unit_is_disabled_vector.T)
+        )
 
         return self.replace(
             attack_target=maksed_relative_distnace.argmin(axis=1),
             attackable_matrix=attackable_matrix,
-            visible_matrix=(sight_inside).squeeze().T,
+            visible_matrix=visible_matrix,
             distance_matrix=position_diff,
         )
 

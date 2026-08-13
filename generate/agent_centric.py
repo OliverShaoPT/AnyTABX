@@ -23,6 +23,7 @@ from generate.dump_schema import (
     save_meta,
     save_npy,
     split_flat_obs,
+    OWN_IS_ALIVE_IDX,
 )
 
 
@@ -99,6 +100,19 @@ def build_policy_mask(
     return mask
 
 
+def _ally_is_padding(arrays: dict[str, np.ndarray], ally_index: int) -> bool:
+    """True if this ally slot never existed (schema padding / never-alive)."""
+    if "unit_is_alive" in arrays:
+        u = np.asarray(arrays["unit_is_alive"]).reshape(
+            np.asarray(arrays["unit_is_alive"]).shape[0], -1
+        )
+        if ally_index >= u.shape[1]:
+            return True
+        return float(np.max(u[:, ally_index])) < 0.5
+    obs = np.asarray(arrays["obs_flat"])[:, ally_index]
+    return float(np.max(obs[..., OWN_IS_ALIVE_IDX])) < 0.5
+
+
 def split_one_record(
     record_dir: Path,
     *,
@@ -146,6 +160,8 @@ def split_one_record(
     record_salt = int(meta.get("record_id", 0)) + 1009 * int(meta.get("task_index", 0) or 0)
 
     for ally_index, ally in enumerate(ally_keys):
+        if _ally_is_padding(arrays, ally_index):
+            continue
         static_list = []
         dyn_list = []
         mask_list = []
@@ -240,6 +256,10 @@ def split_one_record(
                     "if hit, the whole sequence is masked (policy_tag==8)"
                 ),
                 "alignment": "All arrays share the same time index t",
+                "padding": (
+                    "Ally slots that are never alive (schema is_disabled / "
+                    "unit_is_alive all-zero) are not written"
+                ),
             },
         }
         save_meta(agent_dir / "meta.json", agent_meta)

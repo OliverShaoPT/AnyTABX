@@ -11,6 +11,10 @@ import numpy as np
 OWN_FEATURE_DIM = 14
 OTHER_FEATURE_DIM = 16
 ZONE_FEATURE_DIM = 6
+# other-slot layout (TABX _get_obs): index 12 = is_alive
+OTHER_IS_ALIVE_IDX = 12
+# own-slot layout: index 12 = is_alive
+OWN_IS_ALIVE_IDX = 12
 
 ENV_CENTRIC_ARRAYS = (
     "actions_behavior",
@@ -115,6 +119,7 @@ def split_flat_obs(
         static = np.concatenate([own, zones.reshape(-1)], axis=0)
     else:
         static = own
-    # Invisible slots are zeroed in TABX.get_obs.
-    mask = np.any(np.abs(other) > 1e-8, axis=-1).astype(np.uint8)
+    # Alive & in-FOV (invisible / padding / dead slots have is_alive=0).
+    # Do not use any-nonzero: disabled ghosts at the origin have rel_pos != 0.
+    mask = (other[..., OTHER_IS_ALIVE_IDX] > 0.5).astype(np.uint8)
     return static.astype(np.float32), other.astype(np.float32), mask

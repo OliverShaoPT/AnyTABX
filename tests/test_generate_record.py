@@ -25,7 +25,9 @@ from generate.behavior_mix import (
 )
 from generate.dump_schema import (
     OWN_FEATURE_DIM,
+    OWN_IS_ALIVE_IDX,
     OTHER_FEATURE_DIM,
+    OTHER_IS_ALIVE_IDX,
     ZONE_FEATURE_DIM,
     discover_agent_centric_dirs,
     split_flat_obs,
@@ -107,6 +109,13 @@ class BehaviorSwitcherTest(unittest.TestCase):
         self.assertEqual(switcher.steps_since_switch, 0)
 
 
+def _mark_own_alive(obs_flat: np.ndarray) -> np.ndarray:
+    """Set own is_alive so dummy allies are not treated as schema padding."""
+    obs = np.asarray(obs_flat, dtype=np.float32).copy()
+    obs[..., OWN_IS_ALIVE_IDX] = 1.0
+    return obs
+
+
 class SplitFlatObsTest(unittest.TestCase):
     def test_shapes(self) -> None:
         n_units = 4
@@ -115,12 +124,21 @@ class SplitFlatObsTest(unittest.TestCase):
         dim = OWN_FEATURE_DIM + OTHER_FEATURE_DIM * n_other + ZONE_FEATURE_DIM * max_n_zone
         obs = np.zeros(dim, dtype=np.float32)
         obs[0] = 1.0
-        obs[OWN_FEATURE_DIM] = 2.0  # first other slot non-zero
+        obs[OWN_FEATURE_DIM + OTHER_IS_ALIVE_IDX] = 1.0  # first other slot alive
         static, dyn, mask = split_flat_obs(obs, n_units=n_units, max_n_zone=max_n_zone)
         self.assertEqual(static.shape[0], OWN_FEATURE_DIM + ZONE_FEATURE_DIM * max_n_zone)
         self.assertEqual(dyn.shape, (n_other, OTHER_FEATURE_DIM))
         self.assertEqual(mask.shape, (n_other,))
         self.assertEqual(int(mask[0]), 1)
+
+    def test_ghost_relpos_without_alive_is_invisible(self) -> None:
+        n_units = 3
+        n_other = n_units - 1
+        dim = OWN_FEATURE_DIM + OTHER_FEATURE_DIM * n_other
+        obs = np.zeros(dim, dtype=np.float32)
+        obs[OWN_FEATURE_DIM + 2] = -3.0  # rel_x of padding ghost at origin
+        _, _, mask = split_flat_obs(obs, n_units=n_units, max_n_zone=0)
+        self.assertEqual(int(mask[0]), 0)
 
 
 class AgentCentricSplitTest(unittest.TestCase):
@@ -151,7 +169,9 @@ class AgentCentricSplitTest(unittest.TestCase):
             "policy_tag": np.array(
                 [[0, 0], [0, 0], [3, 3], [3, 3], [7, 7]], dtype=np.int32
             ),
-            "obs_flat": np.zeros((t, n_ally, obs_dim), dtype=np.float32),
+            "obs_flat": _mark_own_alive(
+                np.zeros((t, n_ally, obs_dim), dtype=np.float32)
+            ),
         }
         meta = {
             "ally_keys": ["ally_0", "ally_1"],
@@ -192,6 +212,43 @@ class AgentCentricSplitTest(unittest.TestCase):
                 np.all(np.load(ally0 / "policy_tag.npy") == POLICY_TAG_MASK)
             )
 
+    def test_skips_never_alive_padding_ally(self) -> None:
+        t, n_ally, n_units = 3, 3, 5
+        obs_dim = OWN_FEATURE_DIM + OTHER_FEATURE_DIM * (n_units - 1)
+        dist = np.zeros((t, n_ally, 8), dtype=np.float32)
+        dist[..., 0] = 1.0
+        obs = np.zeros((t, n_ally, obs_dim), dtype=np.float32)
+        obs[:, :2, OWN_IS_ALIVE_IDX] = 1.0  # ally_2 never alive
+        arrays = {
+            "actions_behavior": np.zeros((t, n_ally), dtype=np.int32),
+            "actions_reference": np.zeros((t, n_ally), dtype=np.int32),
+            "actions_reference_distribution": dist,
+            "reward_team": np.zeros((t, n_ally), dtype=np.float32),
+            "reward_individual": np.zeros((t, n_ally), dtype=np.float32),
+            "done": np.zeros((t,), dtype=np.uint8),
+            "truncation": np.zeros((t,), dtype=np.uint8),
+            "is_win": np.zeros((t,), dtype=np.uint8),
+            "reset": np.array([1, 0, 0], dtype=np.uint8),
+            "episode_id": np.zeros((t,), dtype=np.int32),
+            "behavior_policy_id": np.zeros((t, n_ally), dtype=np.int32),
+            "obs_flat": obs,
+        }
+        meta = {
+            "ally_keys": ["ally_0", "ally_1", "ally_2"],
+            "n_units": n_units,
+            "max_n_zone": 0,
+            "task_index": 0,
+            "task_id": "dummy",
+            "record_id": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            record_dir = Path(tmp) / "record-000000"
+            write_env_centric_record(record_dir, arrays, meta)
+            paths = split_one_record(record_dir)
+            self.assertEqual(len(paths), 2)
+            names = {p.name for p in paths}
+            self.assertEqual(names, {"ally_0", "ally_1"})
+
     def test_flat_output_root(self) -> None:
         t, n_ally, n_units, max_n_zone = 3, 2, 4, 1
         obs_dim = (
@@ -214,7 +271,9 @@ class AgentCentricSplitTest(unittest.TestCase):
             "reset": np.array([1, 0, 0], dtype=np.uint8),
             "episode_id": np.zeros((t,), dtype=np.int32),
             "behavior_policy_id": np.zeros((t,), dtype=np.int32),
-            "obs_flat": np.zeros((t, n_ally, obs_dim), dtype=np.float32),
+            "obs_flat": _mark_own_alive(
+                np.zeros((t, n_ally, obs_dim), dtype=np.float32)
+            ),
         }
         meta = {
             "ally_keys": ["unit_00", "unit_01"],
@@ -253,7 +312,9 @@ class AgentCentricSplitTest(unittest.TestCase):
             "reset": np.array([1, 0], dtype=np.uint8),
             "episode_id": np.zeros((t,), dtype=np.int32),
             "behavior_policy_id": np.zeros((t,), dtype=np.int32),
-            "obs_flat": np.zeros((t, n_ally, obs_dim), dtype=np.float32),
+            "obs_flat": _mark_own_alive(
+                np.zeros((t, n_ally, obs_dim), dtype=np.float32)
+            ),
         }
         meta = {
             "ally_keys": ["unit_00"],
