@@ -74,6 +74,11 @@ adapt_strength_max: 0.7       # max strong-group mass (≥30% weak retained)
 #       winrate_adapt oracle_focus concentrates strong mass on that best_policy.
 best_teacher_reference: false
 
+# Comm dump: write game_manager.attack_target.npy (env_centric_v1_comm).
+# Default false keeps the old record schema. python -m generate.env_centric_comm
+# forces this true and uses the same GPU workers as parallel_records.
+dump_attack_target: false
+
 # --- Behavior policy mixture (weights renormalized) ---
 # Ordered by quality so policy_id == policy_tag (0=weakest … 7=oracle; 8=mask at convert).
 behavior_mix:

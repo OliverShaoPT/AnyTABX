@@ -37,6 +37,12 @@ from src.tabx.heuristic_policy import LastVisibleTarget
 from src.tabx.wrappers.individual_reward import IndividualRewardConfig, compute_shaped_rewards
 
 
+def _extract_attack_target_jax(state: dict[str, Any]) -> jax.Array:
+    """``game_manager.attack_target`` at the same tick as ``visible_matrix``."""
+
+    return jnp.asarray(state["game_manager"].attack_target, dtype=jnp.int32).reshape(-1)
+
+
 def _extract_unit_arrays_jax(state: dict[str, Any], unit_keys: list[str]) -> dict[str, jax.Array]:
     positions = []
     rotations = []
@@ -194,6 +200,7 @@ def _make_single_env_rollout(
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
     best_teacher_policy: str = BEST_ORACLE,
+    dump_attack_target: bool = False,
 ):
     """Unjitted ``(seed, cdf) -> traj`` for one env (vmappable over seed)."""
 
@@ -209,6 +216,7 @@ def _make_single_env_rollout(
     independent = bool(independent_ally_policies)
     allow_mid_switch = bool(mid_episode_policy_switch)
     best_policy = str(best_teacher_policy or BEST_ORACLE)
+    include_attack_target = bool(dump_attack_target)
     advanced_params = (
         load_heuristic_params("advanced") if best_policy == BEST_ADVANCED else None
     )
@@ -334,6 +342,11 @@ def _make_single_env_rollout(
             )
 
             unit_pack = _extract_unit_arrays_jax(state["state"], unit_keys)
+            if include_attack_target:
+                unit_pack = {
+                    **unit_pack,
+                    "attack_target": _extract_attack_target_jax(state["state"]),
+                }
             visible = jnp.asarray(
                 state["state"]["game_manager"].visible_matrix, dtype=jnp.uint8
             )
@@ -498,6 +511,7 @@ def build_scan_rollout_fn(
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
     best_teacher_policy: str = BEST_ORACLE,
+    dump_attack_target: bool = False,
 ):
     """Return jitted rollout.
 
@@ -515,6 +529,7 @@ def build_scan_rollout_fn(
         independent_ally_policies=independent_ally_policies,
         mid_episode_policy_switch=mid_episode_policy_switch,
         best_teacher_policy=best_teacher_policy,
+        dump_attack_target=dump_attack_target,
     )
     b = max(1, int(parallel_envs))
     if b <= 1:
@@ -560,6 +575,7 @@ def _cast_array(name: str, arr: np.ndarray) -> np.ndarray:
         "unit_team",
         "actions_behavior",
         "actions_reference",
+        "attack_target",
     }:
         return arr.astype(np.int32)
     return arr
@@ -641,6 +657,9 @@ def _record_meta(
         "switcher_rng": "jax",
         "parallel_envs": int(parallel_envs),
     }
+    if "attack_target" in arrays:
+        meta["schema"] = "env_centric_v1_comm"
+        meta["has_attack_target"] = True
     if adapt is not None:
         meta["adapt"] = adapt
     return meta
@@ -710,6 +729,7 @@ def generate_one_record_scan(
     mid_episode_policy_switch: bool = True,
     best_teacher_reference: bool = False,
     best_policy: str = BEST_ORACLE,
+    dump_attack_target: bool = False,
 ) -> Path:
     """Generate one record (single-env scan). For B>1 use ``generate_records_scan_batch``."""
 
@@ -737,6 +757,7 @@ def generate_one_record_scan(
             independent_ally_policies=independent_ally_policies,
             mid_episode_policy_switch=mid_episode_policy_switch,
             best_teacher_policy=teacher,
+            dump_attack_target=dump_attack_target,
         )
 
     traj = rollout_fn(jnp.asarray(seed_i % (2**32), dtype=jnp.uint32), cdf)
@@ -779,6 +800,7 @@ def generate_records_scan_batch(
     mid_episode_policy_switch: bool = True,
     best_teacher_reference: bool = False,
     best_policy: str = BEST_ORACLE,
+    dump_attack_target: bool = False,
 ) -> list[str]:
     """Generate ``len(record_ids)`` records using fixed-B vmap batches + padding."""
 
@@ -806,6 +828,7 @@ def generate_records_scan_batch(
             independent_ally_policies=independent_ally_policies,
             mid_episode_policy_switch=mid_episode_policy_switch,
             best_teacher_policy=teacher,
+            dump_attack_target=dump_attack_target,
         )
 
     paths: list[str] = []
@@ -828,6 +851,7 @@ def generate_records_scan_batch(
                 mid_episode_policy_switch=mid_episode_policy_switch,
                 best_teacher_reference=best_teacher_reference,
                 best_policy=teacher,
+                dump_attack_target=dump_attack_target,
             )
             paths.append(str(path))
         return paths

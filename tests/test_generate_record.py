@@ -495,5 +495,72 @@ class WinrateAdaptTest(unittest.TestCase):
         self.assertAlmostEqual(win_rate_from_counts(counts), 1.0)
 
 
+class IntentLabelTest(unittest.TestCase):
+    def test_pack_unpack_roundtrip(self) -> None:
+        from generate.intent_label import pack_intent, unpack_intent
+
+        packed = pack_intent(2, 7, max_n_units=20)
+        mode, focus = unpack_intent(packed, max_n_units=20)
+        self.assertEqual(int(mode), 2)
+        self.assertEqual(int(focus), 7)
+        idle = pack_intent(0, -1, max_n_units=20)
+        self.assertEqual(int(idle), 0)
+
+    def test_intent_from_reference_uses_env_focus_only_on_attack(self) -> None:
+        from generate.intent_label import (
+            MODE_ATTACK,
+            MODE_IDLE,
+            MODE_REPOSITION,
+            intent_from_reference,
+        )
+
+        ref = np.array([7, 4, 1], dtype=np.int32)
+        atk = np.array([3, 5, 9], dtype=np.int32)
+        mode, focus, msg = intent_from_reference(ref, atk, max_n_units=20)
+        self.assertEqual(int(mode[0]), MODE_IDLE)
+        self.assertEqual(int(focus[0]), -1)
+        self.assertEqual(int(mode[1]), MODE_ATTACK)
+        self.assertEqual(int(focus[1]), 5)
+        self.assertEqual(int(mode[2]), MODE_REPOSITION)
+        self.assertEqual(int(focus[2]), -1)
+        self.assertEqual(msg.shape, (3,))
+
+    def test_visible_ally_messages_requires_fov_and_alive(self) -> None:
+        from generate.intent_label import MSG_PAD_ID, visible_ally_messages
+
+        t, n = 2, 3
+        msg_all = np.array([[10, 11, 12], [20, 21, 22]], dtype=np.int32)
+        alive = np.ones((t, 3), dtype=np.uint8)
+        vis = np.zeros((t, n, n), dtype=np.uint8)
+        vis[0, 0, 1] = 1
+        vis[1, 0, 1] = 1
+        vis[1, 0, 2] = 1
+        alive[1, 2] = 0
+        msg, uids, valid = visible_ally_messages(
+            receiver_index=0,
+            ally_indices=np.array([0, 1, 2], dtype=np.int32),
+            ally_unit_ids=np.array([0, 1, 2], dtype=np.int32),
+            msg_all=msg_all,
+            visible_matrix=vis,
+            alive_all=alive,
+            receiver_alive=alive[:, 0],
+        )
+        self.assertEqual(msg.shape, (2, 2))
+        self.assertEqual(int(valid[0, 0]), 1)
+        self.assertEqual(int(msg[0, 0]), 11)
+        self.assertEqual(int(valid[0, 1]), 0)
+        self.assertEqual(int(msg[0, 1]), MSG_PAD_ID)
+        self.assertEqual(int(valid[1, 1]), 0)
+
+
+class EnvCentricCommEntryTest(unittest.TestCase):
+    def test_module_has_no_monkeypatch_hooks(self) -> None:
+        import generate.env_centric_comm as ecc
+
+        self.assertFalse(hasattr(ecc, "_HOOKS_INSTALLED"))
+        self.assertFalse(hasattr(ecc, "_PY_ATK"))
+        self.assertFalse(hasattr(ecc, "install_attack_target_hooks"))
+
+
 if __name__ == "__main__":
     unittest.main()

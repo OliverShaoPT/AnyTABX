@@ -120,6 +120,7 @@ def _generate_ids(
     mid_switch = bool(payload.get("mid_episode_policy_switch", True))
     best_teacher_reference = bool(payload.get("best_teacher_reference", False))
     best_policy = str(payload.get("best_policy") or "oracle_pure")
+    dump_attack_target = bool(payload.get("dump_attack_target", False))
     if scan_rollout and parallel_envs > 1:
         t_gen = time.perf_counter()
         batch_paths = generate_records_scan_batch(
@@ -139,6 +140,7 @@ def _generate_ids(
             mid_episode_policy_switch=mid_switch,
             best_teacher_reference=best_teacher_reference,
             best_policy=best_policy,
+            dump_attack_target=dump_attack_target,
         )
         generate_s_total = time.perf_counter() - t_gen
         per_rec = generate_s_total / max(len(batch_paths), 1)
@@ -179,6 +181,7 @@ def _generate_ids(
                 mid_episode_policy_switch=mid_switch,
                 best_teacher_reference=best_teacher_reference,
                 best_policy=best_policy,
+                dump_attack_target=dump_attack_target,
             )
         else:
             path = generate_one_record(
@@ -197,6 +200,7 @@ def _generate_ids(
                 mid_episode_policy_switch=mid_switch,
                 best_teacher_reference=best_teacher_reference,
                 best_policy=best_policy,
+                dump_attack_target=dump_attack_target,
             )
         generate_s = time.perf_counter() - t_gen
         paths.append(str(path))
@@ -535,6 +539,9 @@ def worker_main(payload: dict[str, Any]) -> str:
                             payload.get("mid_episode_policy_switch", True)
                         ),
                         best_teacher_policy=teacher,
+                        dump_attack_target=bool(
+                            payload.get("dump_attack_target", False)
+                        ),
                     )
                     compile_s += warmup_scan_rollout(
                         rollout_fn,

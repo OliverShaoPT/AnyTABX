@@ -272,6 +272,7 @@ def plan_jobs(
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
     best_teacher_reference: bool = False,
+    dump_attack_target: bool = False,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -328,6 +329,7 @@ def plan_jobs(
                 "independent_ally_policies": bool(independent_ally_policies),
                 "mid_episode_policy_switch": bool(mid_episode_policy_switch),
                 "best_teacher_reference": bool(best_teacher_reference),
+                "dump_attack_target": bool(dump_attack_target),
             }
         )
     return jobs
@@ -441,6 +443,7 @@ def run_from_config(config: dict[str, Any]) -> None:
             config.get("mid_episode_policy_switch", True)
         ),
         best_teacher_reference=bool(config.get("best_teacher_reference", False)),
+        dump_attack_target=bool(config.get("dump_attack_target", False)),
     )
 
     planned = _planned_record_count(jobs)
@@ -451,6 +454,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"parallel_envs={parallel_envs} "
         f"winrate_adapt={config.get('winrate_adapt', False)} "
         f"best_teacher_reference={config.get('best_teacher_reference', False)} "
+        f"dump_attack_target={config.get('dump_attack_target', False)} "
         f"independent_ally_policies={config.get('independent_ally_policies', False)} "
         f"mid_episode_policy_switch={config.get('mid_episode_policy_switch', True)} "
         f"win_rate_min={config.get('win_rate_min', 0.30)} "
@@ -532,7 +536,11 @@ def _parse_gpu_ids(raw: str | None) -> list[int] | None:
     return [int(part.strip()) for part in raw.split(",") if part.strip() != ""]
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None,
+    *,
+    dump_attack_target: bool | None = None,
+) -> None:
     parser = argparse.ArgumentParser(
         description="Evenly generate env-centric records in parallel (GPU production)"
     )
@@ -652,6 +660,16 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--dump_attack_target",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help=(
+            "If true, dump game_manager.attack_target (env_centric_v1_comm). "
+            "Needed for generate.agent_centric_comm."
+        ),
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -709,6 +727,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     if args.best_teacher_reference is not None:
         config["best_teacher_reference"] = args.best_teacher_reference == "true"
+    if args.dump_attack_target is not None:
+        config["dump_attack_target"] = args.dump_attack_target == "true"
+    if dump_attack_target is not None:
+        config["dump_attack_target"] = bool(dump_attack_target)
     if args.win_rate_max is not None:
         token = str(args.win_rate_max).strip().lower()
         if token in {"null", "none", ""}:

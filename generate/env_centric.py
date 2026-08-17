@@ -273,6 +273,7 @@ def generate_one_record(
     mid_episode_policy_switch: bool = True,
     best_teacher_reference: bool = False,
     best_policy: str = BEST_ORACLE,
+    dump_attack_target: bool = False,
 ) -> Path:
     """Generate one env-centric record.
 
@@ -298,6 +299,7 @@ def generate_one_record(
             mid_episode_policy_switch=mid_episode_policy_switch,
             best_teacher_reference=best_teacher_reference,
             best_policy=best_policy,
+            dump_attack_target=dump_attack_target,
         )
 
     seed = sample_record_seed(seed, salt=record_id)
@@ -399,6 +401,8 @@ def generate_one_record(
         "unit_is_alive": [],
         "unit_team": [],
     }
+    if dump_attack_target:
+        buffers["attack_target"] = []
 
     episode_id = 0
     is_reset_step = True
@@ -521,6 +525,12 @@ def generate_one_record(
         buffers["behavior_policy_id"].append(policy_id_row)
         buffers["policy_tag"].append(policy_tag_row)
         buffers["visible_matrix"].append(visible)
+        if dump_attack_target:
+            buffers["attack_target"].append(
+                _to_numpy(state["state"]["game_manager"].attack_target)
+                .reshape(-1)
+                .astype(np.int32)
+            )
         buffers["obs_flat"].append(
             np.stack(
                 [
@@ -591,6 +601,8 @@ def generate_one_record(
         "unit_is_alive": np.stack(buffers["unit_is_alive"], axis=0),
         "unit_team": np.stack(buffers["unit_team"], axis=0),
     }
+    if dump_attack_target:
+        arrays["attack_target"] = np.stack(buffers["attack_target"], axis=0)
 
     safe_id = package.task_id.replace("/", "_")
     record_dir = (
@@ -634,6 +646,9 @@ def generate_one_record(
         "scan_rollout": False,
         "switcher_rng": "numpy",
     }
+    if dump_attack_target:
+        meta["schema"] = "env_centric_v1_comm"
+        meta["has_attack_target"] = True
     write_env_centric_record(record_dir, arrays, meta)
     return record_dir
 
