@@ -15,8 +15,20 @@ wheels/
 # W&B
 wandb/
 
+# Local generated runs and reports
+/output/
+/outputs/
+
 # jupyter notebook
 *.ipynb
+
+# Runtime, test, and tool caches
+.jax_cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
 # Saves
 ckpt/
@@ -30,6 +42,13 @@ ckpt*/
 *.npy
 *.npz
 *.gif
+*.log
+
+# Local model artifacts
+*.safetensors
+*.ckpt
+*.pt
+*.pth
 
 # Generated task/scenario exports
 initial_scenes.png
