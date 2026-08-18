@@ -1,0 +1,120 @@
+# Parallel env-centric record generation.
+# Launch: ./generate/generate_records.sh
+# Or:     ./generate/generate_records.sh path/to/other.yaml
+
+# --- I/O ---
+# Single root: recursively find coach leaves that each contain
+#   task.json + config.json + best/final.safetensors
+# (written by marl_baseline / train_parallel).
+coach_root: ./ckpt/marl_baseline
+# Optional: keep only leaves whose meta.json seed matches.
+coach_seed: null
+output_root: ./data/records
+task_index: null              # e.g. [0, 1, 2]; null = all discovered tasks
+
+# --- Volume (even split across tasks) ---
+# Everyone gets total_records // n_tasks; remainder (+1) goes to the first tasks.
+total_records: 1000
+total_timesteps: 3000
+start_index: 0                # first record id per task → record-000000
+
+# --- Parallelism (production: GPU) ---
+# device=gpu is the production path. device=cpu is debug-only — do not mass-produce.
+device: gpu
+cpu_workers: 2                # debug-only when device=cpu
+# schedule:
+#   task   (default) — whole-task affinity; amortize JAX compile in-process
+#                      active_workers = min(slots, n_tasks)
+#   record — LEGACY stripe across (task, record_id); cold multi-process JIT;
+#            do not use for GPU production
+schedule: task
+stagger_s: 1.0                # worker_id * stagger_s sleep before start (JIT stagger)
+# GPU: slots = len(gpu_ids) * workers_per_gpu
+# With parallel_envs>=8 prefer workers_per_gpu=1 to limit VRAM.
+gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+workers_per_gpu: 1
+jax_platform: cuda            # JAX_PLATFORMS for GPU workers
+
+# --- RNG ---
+# null → per-record time+pid sampling (generate.env_centric.sample_record_seed)
+seed: null
+
+# --- Behavior switching ---
+min_behavior_steps: 64
+behavior_switch_prob: 0.2
+# true (default): allow mid-episode policy resample after cooldown.
+# false: keep policy fixed within a trial; only resample on episode reset.
+mid_episode_policy_switch: true
+# false (default): all allies share one sampled policy per trial.
+# true: each ally samples independently; resample per ally on every episode reset.
+# Mid-episode switches (if enabled) also apply per ally. winrate_adapt still
+# reweights the shared mix CDF (raises P(strong) for every agent).
+independent_ally_policies: false
+# Device-side lax.scan for a whole record (one host sync at dump). Set false
+# for the legacy per-step Python loop (numpy BehaviorSwitcher).
+scan_rollout: true
+# vmap batch size B: each scan call runs B envs in parallel (pad last batch to B
+# so one JIT is reused). N records → ceil(N/B) calls. Prefer workers_per_gpu=1
+# when B is large (VRAM). 1 = single-env scan.
+parallel_envs: 8
+
+# --- Per-task win-rate adapt (ally mix weights only; enemy unchanged) ---
+# Temp pilots find a mix in-band, then all final records are written with that mix.
+winrate_adapt: false
+win_rate_min: 0.30
+win_rate_max: null            # null = no upper bound; set e.g. 0.70 to cap
+adapt_pilot_records: 4        # records per pilot round (temp dir; not kept)
+adapt_max_iters: 3
+adapt_strength_max: 0.7       # max strong-group mass (≥30% weak retained)
+
+# --- Best teacher reference (reads tasks[0].metadata.coach_eval from task.json) ---
+# false (default): hard reference = oracle argmax; adapt focus → oracle_pure.
+# true: hard reference = coach_eval.best_policy (oracle_pure | heuristic_advanced);
+#       soft actions_reference_distribution always stays RL softmax;
+#       winrate_adapt oracle_focus concentrates strong mass on that best_policy.
+best_teacher_reference: false
+
+# --- Behavior policy mixture (weights renormalized) ---
+# Ordered by quality so policy_id == policy_tag (0=weakest … 7=oracle; 8=mask at convert).
+behavior_mix:
+  - policy_id: 0
+    name: heuristic_random
+    kind: heuristic
+    weight: 0.12
+    heuristic: random
+  - policy_id: 1
+    name: heuristic_novice
+    kind: heuristic
+    weight: 0.14
+    heuristic: novice
+  - policy_id: 2
+    name: heuristic_medium_eps0.5
+    kind: heuristic
+    weight: 0.10
+    heuristic: medium
+    epsilon: 0.5
+  - policy_id: 3
+    name: heuristic_medium
+    kind: heuristic
+    weight: 0.16
+    heuristic: medium
+  - policy_id: 4
+    name: heuristic_advanced
+    kind: heuristic
+    weight: 0.12
+    heuristic: advanced
+  - policy_id: 5
+    name: oracle_eps0.3
+    kind: oracle_eps
+    weight: 0.14
+    epsilon: 0.3
+  - policy_id: 6
+    name: oracle_eps0.1
+    kind: oracle_eps
+    weight: 0.12
+    epsilon: 0.1
+  - policy_id: 7
+    name: oracle_pure
+    kind: oracle
+    weight: 0.10
+    epsilon: 0.0

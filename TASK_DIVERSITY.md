@@ -913,3 +913,26 @@ diversity_features:
 最关键的设计原则是：
 
 > 先让“什么是好 task”可测量、可复现，再扩大生成空间。否则生成器越强，只会更快地产生大量重复、退化或难度不可解释的战局。
+
+Valid task sampling ablation
+[0.30, 0.70]
+sample accepted = 10/99
+sample accept_rate ≈ 10.1%
+final valid = 4/10
+final valid_rate = 40%
+
+[0.25, 0.75]
+sample accepted = 10/20
+sample accept_rate = 50.0%
+final valid = 6/10
+final valid_rate = 60%
+
+[0.20, 0.80]
+sample accepted = 10/29
+sample accept_rate ≈ 34.5%
+final valid = 5/10
+final valid_rate = 50%
+
+[0.25, 0.75] 比 [0.30,0.70] 明显提高 sample accept rate 和 final valid rate；
+继续放宽到 [0.20,0.80] 后，final valid rate 反而下降。
+所以目前推荐把 sample win-rate filter band 调成 [0.25,0.75]。

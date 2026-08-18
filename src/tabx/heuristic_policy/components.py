@@ -7,8 +7,8 @@ from flax import struct
 
 @struct.dataclass
 class LastVisibleTarget:
-    abs_position: chex.Array = jnp.array([0.0, 0.0])
-    ever_visible: chex.Array = jnp.array([False])
+    abs_position: chex.Array = struct.field(default_factory=lambda: jnp.array([0.0, 0.0]))
+    ever_visible: chex.Array = struct.field(default_factory=lambda: jnp.array([False]))
 
 
 @dataclass
