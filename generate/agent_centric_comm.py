@@ -19,6 +19,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 from generate.agent_centric import (
     _ally_is_padding,
@@ -258,29 +259,89 @@ def split_records_root_comm(
     return record_dirs
 
 
+def _annotate_one_record_job(
+    payload: tuple[str, list[str], int],
+) -> tuple[str, int, str | None]:
+    record_dir_s, leaf_dirs_s, max_n_units = payload
+    try:
+        annotate_agent_leaves(
+            Path(record_dir_s),
+            [Path(p) for p in leaf_dirs_s],
+            max_n_units=int(max_n_units),
+        )
+        return record_dir_s, len(leaf_dirs_s), None
+    except Exception as exc:  # noqa: BLE001
+        return record_dir_s, 0, f"{type(exc).__name__}: {exc}"
+
+
 def annotate_existing_leaves(
     leaves_root: Path,
     *,
     max_n_units: int = DEFAULT_MAX_N_UNITS,
+    workers: int = 1,
 ) -> int:
     """Re-write comm fields + dyn unit_id on existing leaves. Does not re-split."""
 
-    leaves = discover_agent_centric_dirs(Path(leaves_root))
+    leaves_root = Path(leaves_root)
+    print(f"[agent_centric_comm] scanning {leaves_root} ...", flush=True)
+    leaves = discover_agent_centric_dirs(leaves_root)
     by_record: dict[Path, list[Path]] = {}
+    skipped = 0
     for d in leaves:
         meta_path = d / "meta.json"
         if not meta_path.is_file():
+            skipped += 1
             continue
         ameta = load_meta(meta_path)
         src = ameta.get("source_record")
         if not src:
+            skipped += 1
             continue
         by_record.setdefault(Path(src), []).append(d)
+    jobs = [
+        (str(rec), [str(p) for p in dirs], int(max_n_units))
+        for rec, dirs in by_record.items()
+    ]
+    n_workers = max(1, min(int(workers), len(jobs) or 1))
+    print(
+        f"[agent_centric_comm] annotate_only: {len(leaves)} leaves, "
+        f"{len(jobs)} source records, skip={skipped}, workers={n_workers}",
+        flush=True,
+    )
+    if not jobs:
+        return 0
+
+    errors: list[str] = []
     n = 0
-    for rec, dirs in by_record.items():
-        annotate_agent_leaves(rec, dirs, max_n_units=max_n_units)
-        n += len(dirs)
-        print(f"[agent_centric_comm] annotate {rec} -> {len(dirs)} leaves", flush=True)
+    pbar = tqdm(total=len(jobs), desc="annotate_only", unit="record")
+
+    def _consume(path_s: str, n_leaves: int, err: str | None) -> None:
+        nonlocal n
+        if err:
+            errors.append(f"{path_s}: {err}")
+            tqdm.write(f"[agent_centric_comm] ERROR {path_s}: {err}")
+        else:
+            n += n_leaves
+        pbar.set_postfix(leaves=n, errors=len(errors))
+        pbar.update(1)
+
+    try:
+        if n_workers == 1:
+            for job in jobs:
+                _consume(*_annotate_one_record_job(job))
+        else:
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                futures = [
+                    pool.submit(_annotate_one_record_job, job) for job in jobs
+                ]
+                for fut in as_completed(futures):
+                    _consume(*fut.result())
+    finally:
+        pbar.close()
+    if errors:
+        raise RuntimeError(
+            f"annotate_only failed on {len(errors)} record(s); first: {errors[0]}"
+        )
     return n
 
 
@@ -303,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--annotate_only",
         action="store_true",
-        help="Patch existing agent-centric leaves (unit_id channel); do not re-split",
+        help="Patch existing agent-centric leaves (unit_id + dual msg/move); do not re-split",
     )
     args = parser.parse_args(argv)
     output_root = Path(args.output_root) if args.output_root else None
@@ -311,7 +372,11 @@ def main(argv: list[str] | None = None) -> None:
         root = Path(args.output_root or args.records_root or args.record_dir or "")
         if not root:
             raise SystemExit("--annotate_only needs --output_root or --records_root")
-        n = annotate_existing_leaves(root, max_n_units=int(args.max_n_units))
+        n = annotate_existing_leaves(
+            root,
+            max_n_units=int(args.max_n_units),
+            workers=int(args.workers),
+        )
         print(f"[agent_centric_comm] annotate_only updated {n} leaves", flush=True)
         return
     if args.record_dir:
