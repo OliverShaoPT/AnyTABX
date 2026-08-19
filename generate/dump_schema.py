@@ -9,12 +9,15 @@ from typing import Any
 import numpy as np
 
 OWN_FEATURE_DIM = 14
-OTHER_FEATURE_DIM = 16
+OTHER_FEATURE_DIM = 16  # env / obs_flat; agent-centric comm may append unit_id
 ZONE_FEATURE_DIM = 6
 # other-slot layout (TABX _get_obs): index 12 = is_alive
 OTHER_IS_ALIVE_IDX = 12
 # own-slot layout: index 12 = is_alive
 OWN_IS_ALIVE_IDX = 12
+# Appended only in comm agent-centric / airsoul wrapper — not in TABX.get_obs.
+OTHER_UNIT_ID_IDX = 16
+OTHER_FEATURE_DIM_WITH_UNIT_ID = 17
 
 ENV_CENTRIC_ARRAYS = (
     "actions_behavior",
@@ -123,3 +126,50 @@ def split_flat_obs(
     # Do not use any-nonzero: disabled ghosts at the origin have rel_pos != 0.
     mask = (other[..., OTHER_IS_ALIVE_IDX] > 0.5).astype(np.uint8)
     return static.astype(np.float32), other.astype(np.float32), mask
+
+
+def rolled_other_unit_ids(ego_index: int, n_units: int) -> np.ndarray:
+    """Global ``unit_keys`` index for each dyn slot after ``roll(-ego)[:, 1:]``.
+
+    Slot ``j`` is unit ``(ego_index + 1 + j) % n_units``. Env ``get_obs`` is
+    unchanged; this is reconstructed from the same roll convention.
+    """
+
+    n = int(n_units)
+    if n < 2:
+        return np.zeros((0,), dtype=np.float32)
+    ego = int(ego_index) % n
+    return ((np.arange(n - 1, dtype=np.int32) + ego + 1) % n).astype(np.float32)
+
+
+def append_other_unit_ids(
+    dyn: np.ndarray, ego_index: int, n_units: int
+) -> np.ndarray:
+    """Append unit_keys index as last feature. Idempotent if already present."""
+
+    dyn = np.asarray(dyn, dtype=np.float32)
+    squeeze = False
+    if dyn.ndim == 2:
+        dyn = dyn[None]
+        squeeze = True
+    if dyn.ndim != 3:
+        raise ValueError(f"dyn expected [T, M, F] or [M, F], got {dyn.shape}")
+    _t, m, f = dyn.shape
+    if f >= OTHER_FEATURE_DIM_WITH_UNIT_ID:
+        out = dyn
+    elif f != OTHER_FEATURE_DIM:
+        raise ValueError(
+            f"dyn feature dim {f}, expected {OTHER_FEATURE_DIM} or "
+            f"{OTHER_FEATURE_DIM_WITH_UNIT_ID}"
+        )
+    else:
+        ids = rolled_other_unit_ids(ego_index, n_units)
+        if ids.shape[0] < m:
+            ids = np.pad(ids, (0, m - int(ids.shape[0])))
+        elif ids.shape[0] > m:
+            ids = ids[:m]
+        ch = np.broadcast_to(ids.reshape(1, m, 1), (_t, m, 1)).astype(np.float32)
+        out = np.concatenate([dyn, np.array(ch, copy=True)], axis=-1)
+    if squeeze:
+        return out[0]
+    return out

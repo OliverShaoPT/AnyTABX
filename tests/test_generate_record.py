@@ -27,9 +27,12 @@ from generate.dump_schema import (
     OWN_FEATURE_DIM,
     OWN_IS_ALIVE_IDX,
     OTHER_FEATURE_DIM,
+    OTHER_FEATURE_DIM_WITH_UNIT_ID,
     OTHER_IS_ALIVE_IDX,
     ZONE_FEATURE_DIM,
+    append_other_unit_ids,
     discover_agent_centric_dirs,
+    rolled_other_unit_ids,
     split_flat_obs,
     write_env_centric_record,
 )
@@ -139,6 +142,26 @@ class SplitFlatObsTest(unittest.TestCase):
         obs[OWN_FEATURE_DIM + 2] = -3.0  # rel_x of padding ghost at origin
         _, _, mask = split_flat_obs(obs, n_units=n_units, max_n_zone=0)
         self.assertEqual(int(mask[0]), 0)
+
+
+class RolledOtherUnitIdsTest(unittest.TestCase):
+    def test_matches_jax_roll_drop_self(self) -> None:
+        n = 5
+        np.testing.assert_array_equal(
+            rolled_other_unit_ids(0, n), np.array([1, 2, 3, 4], dtype=np.float32)
+        )
+        np.testing.assert_array_equal(
+            rolled_other_unit_ids(1, n), np.array([2, 3, 4, 0], dtype=np.float32)
+        )
+
+    def test_append_idempotent_and_shape(self) -> None:
+        t, m, n = 3, 4, 5
+        dyn = np.zeros((t, m, OTHER_FEATURE_DIM), dtype=np.float32)
+        out = append_other_unit_ids(dyn, ego_index=1, n_units=n)
+        self.assertEqual(out.shape, (t, m, OTHER_FEATURE_DIM_WITH_UNIT_ID))
+        np.testing.assert_array_equal(out[0, :, -1], rolled_other_unit_ids(1, n))
+        again = append_other_unit_ids(out, ego_index=1, n_units=n)
+        np.testing.assert_array_equal(again, out)
 
 
 class AgentCentricSplitTest(unittest.TestCase):
@@ -505,6 +528,14 @@ class IntentLabelTest(unittest.TestCase):
         self.assertEqual(int(focus), 7)
         idle = pack_intent(0, -1, max_n_units=20)
         self.assertEqual(int(idle), 0)
+
+    def test_move_from_action_maps_locomotion(self) -> None:
+        from generate.intent_label import MOVE_NONE, move_from_action
+
+        acts = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int32)
+        move = move_from_action(acts)
+        self.assertEqual(move.tolist(), [1, 2, 3, 4, 0, 5, 6, 0, 0])
+        self.assertEqual(int(move_from_action(7)), MOVE_NONE)
 
     def test_intent_from_reference_uses_env_focus_only_on_attack(self) -> None:
         from generate.intent_label import (

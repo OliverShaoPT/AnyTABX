@@ -1,7 +1,7 @@
-"""Teacher intent labels for TABX explicit communication.
+"""Intent labels for TABX explicit communication.
 
-``m*`` is a packed discrete id (mode + global focus unit id), derived from
-reference / teacher actions — not from executed behavior.
+Packed ``msg_id`` is mode + global focus unit id. Annotate writes both
+teacher (reference) and behavior action streams; MessageHead GT is teacher.
 """
 
 from __future__ import annotations
@@ -19,8 +19,14 @@ N_INTENT_MODES = 3
 
 MSG_PAD_ID = 0  # pack(idle, none); always masked by visible_ally_valid
 ALLY_ID_PAD = -1
+MOVE_NONE = 0  # not walking / not turning (idle, attack, dead, unknown)
 
 DEFAULT_MAX_N_UNITS = 20
+N_MOVE = 7  # 0=none, 1-6 = UP/DOWN/LEFT/RIGHT/TURN_R/TURN_L
+
+# Env UnitAction 0-7 (+ airsoul dead=8) → move id.
+# UP=0, DOWN=1, LEFT=2, RIGHT=3, ATTACK=4, TURN_RIGHT=5, TURN_LEFT=6, IDLE=7
+_MOVE_FROM_ACTION = np.array([1, 2, 3, 4, 0, 5, 6, 0, 0], dtype=np.int32)
 
 
 def msg_vocab_size(max_n_units: int = DEFAULT_MAX_N_UNITS) -> int:
@@ -93,6 +99,23 @@ def intent_from_reference(
         mode = np.where(alive_b, mode, np.int32(MODE_IDLE))
         focus = np.where(alive_b, focus, np.int32(-1))
     return mode, focus, np.asarray(msg_id, dtype=np.int32)
+
+
+def move_from_action(action: np.ndarray | int) -> np.ndarray | int:
+    """Map env action to ``{0=not-moving, 1-6}``.
+
+    1-6 follow UnitAction UP/DOWN/LEFT/RIGHT/TURN_RIGHT/TURN_LEFT.
+    IDLE, ATTACK, dead, and out-of-range ids map to 0.
+    """
+
+    scalar = np.isscalar(action)
+    a = np.asarray(action, dtype=np.int32)
+    table = _MOVE_FROM_ACTION
+    clipped = np.clip(a, 0, int(table.shape[0]) - 1)
+    out = table[clipped]
+    if scalar:
+        return int(np.asarray(out).reshape(()))
+    return out.astype(np.int32)
 
 
 def visible_ally_messages(

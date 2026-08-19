@@ -1,9 +1,12 @@
-"""Agent-centric split that writes teacher intent communication fields.
+"""Agent-centric split that writes teacher/behavior intent communication fields.
 
-Calls the existing ``split_one_record`` (unchanged leaf schema), then adds:
+Calls the existing ``split_one_record`` (env obs layout unchanged), then adds:
 
-  reference_message.npy   [T]
-  visible_ally.npz        keys msg/id/valid, each [T, n_real_ally-1]
+  reference_message.npy   [T]   teacher packed id (MessageHead target)
+  behavior_message.npy    [T]   behavior packed id (on disk; not L_msg GT)
+  visible_ally.npz        msg / msg_behavior / move / move_behavior / id / valid
+  obs_dynamic last channel  global unit_keys index (reconstructed from roll;
+                            TABX.get_obs / obs_flat stay 16-d)
 """
 
 from __future__ import annotations
@@ -24,6 +27,9 @@ from generate.agent_centric import (
 )
 from generate.dump_schema import (
     OWN_IS_ALIVE_IDX,
+    append_other_unit_ids,
+    discover_agent_centric_dirs,
+    load_meta,
     read_env_centric_record,
     save_meta,
     save_npy,
@@ -31,6 +37,7 @@ from generate.dump_schema import (
 from generate.intent_label import (
     DEFAULT_MAX_N_UNITS,
     intent_from_reference,
+    move_from_action,
     visible_ally_messages,
 )
 
@@ -55,6 +62,8 @@ def annotate_agent_leaves(
         raise KeyError(f"{record_dir} missing visible_matrix.npy")
     if "actions_reference" not in arrays:
         raise KeyError(f"{record_dir} missing actions_reference.npy")
+    if "actions_behavior" not in arrays:
+        raise KeyError(f"{record_dir} missing actions_behavior.npy")
 
     ally_keys = list(meta["ally_keys"])
     n_ally = len(ally_keys)
@@ -87,9 +96,19 @@ def annotate_agent_leaves(
         alive_ally = obs[:, real_idx, OWN_IS_ALIVE_IDX] > 0.5
 
     ref_real = ref[:, real_idx]
-    _, _, msg_all = intent_from_reference(
+    _, _, msg_teacher = intent_from_reference(
         ref_real, atk_ally, alive_ally, max_n_units=max_n_units
     )
+    move_teacher = move_from_action(ref_real)
+
+    beh = np.asarray(arrays["actions_behavior"], dtype=np.int32)
+    if beh.ndim == 1:
+        beh = np.repeat(beh[:, None], n_ally, axis=1)
+    beh_real = beh[:, real_idx]
+    _, _, msg_behavior = intent_from_reference(
+        beh_real, atk_ally, alive_ally, max_n_units=max_n_units
+    )
+    move_behavior = move_from_action(beh_real)
     vis = np.asarray(arrays["visible_matrix"])
 
     by_index = {}
@@ -105,34 +124,57 @@ def annotate_agent_leaves(
             continue
         agent_dir, ameta = by_index[recv]
         recv_col = int(np.where(real_idx == recv)[0][0])
-        msg, uids, valid = visible_ally_messages(
+        vis_kw = dict(
             receiver_index=recv,
             ally_indices=real_idx,
             ally_unit_ids=ally_unit_ids,
-            msg_all=msg_all,
             visible_matrix=vis,
             alive_all=alive_ally,
             receiver_alive=alive_ally[:, recv_col],
         )
-        save_npy(agent_dir / "reference_message.npy", msg_all[:, recv_col])
+        msg, uids, valid = visible_ally_messages(msg_all=msg_teacher, **vis_kw)
+        msg_b, _, _ = visible_ally_messages(msg_all=msg_behavior, **vis_kw)
+        move, _, _ = visible_ally_messages(msg_all=move_teacher, **vis_kw)
+        move_b, _, _ = visible_ally_messages(msg_all=move_behavior, **vis_kw)
+        save_npy(agent_dir / "reference_message.npy", msg_teacher[:, recv_col])
+        save_npy(agent_dir / "behavior_message.npy", msg_behavior[:, recv_col])
         np.savez_compressed(
             agent_dir / "visible_ally.npz",
             msg=np.asarray(msg, dtype=np.int32),
+            msg_behavior=np.asarray(msg_b, dtype=np.int32),
+            move=np.asarray(move, dtype=np.int32),
+            move_behavior=np.asarray(move_b, dtype=np.int32),
             id=np.asarray(uids, dtype=np.int32),
             valid=np.asarray(valid, dtype=np.uint8),
         )
+        n_units = int(ameta.get("n_units") or len(unit_keys))
+        ego_uid = int(ally_unit_ids[recv_col])
+        dyn_path = agent_dir / "obs_dynamic.npy"
+        if dyn_path.is_file():
+            dyn = np.load(dyn_path)
+            dyn = append_other_unit_ids(dyn, ego_uid, n_units)
+            save_npy(dyn_path, dyn)
+            ameta["obs_dynamic_shape"] = list(dyn.shape[1:])
         notes = dict(ameta.get("notes") or {})
         notes["reference_message"] = (
             "teacher intent packed id (mode+focus); MessageHead target only"
         )
+        notes["behavior_message"] = (
+            "behavior-action packed id (mode+focus); on disk only, not L_msg GT"
+        )
         notes["visible_ally"] = (
-            "npz keys msg/id/valid; other real allies in agent_index order; "
-            "teacher m*; invalid slots PAD / -1 / 0"
+            "npz keys msg/msg_behavior/move/move_behavior/id/valid; "
+            "other real allies in agent_index order; invalid slots PAD / 0 / -1 / 0"
+        )
+        notes["obs_dynamic_unit_id"] = (
+            "last channel = global unit_keys index of that roll slot; "
+            "not present in env get_obs / obs_flat"
         )
         ameta["notes"] = notes
-        ameta["comm_schema"] = "agent_centric_v1_comm"
+        ameta["comm_schema"] = "agent_centric_v2_comm"
         ameta["max_n_units_comm"] = int(max_n_units)
         ameta["n_other_ally"] = int(msg.shape[1])
+        ameta["unit_id"] = ego_uid
         save_meta(agent_dir / "meta.json", ameta)
 
 
@@ -216,9 +258,35 @@ def split_records_root_comm(
     return record_dirs
 
 
+def annotate_existing_leaves(
+    leaves_root: Path,
+    *,
+    max_n_units: int = DEFAULT_MAX_N_UNITS,
+) -> int:
+    """Re-write comm fields + dyn unit_id on existing leaves. Does not re-split."""
+
+    leaves = discover_agent_centric_dirs(Path(leaves_root))
+    by_record: dict[Path, list[Path]] = {}
+    for d in leaves:
+        meta_path = d / "meta.json"
+        if not meta_path.is_file():
+            continue
+        ameta = load_meta(meta_path)
+        src = ameta.get("source_record")
+        if not src:
+            continue
+        by_record.setdefault(Path(src), []).append(d)
+    n = 0
+    for rec, dirs in by_record.items():
+        annotate_agent_leaves(rec, dirs, max_n_units=max_n_units)
+        n += len(dirs)
+        print(f"[agent_centric_comm] annotate {rec} -> {len(dirs)} leaves", flush=True)
+    return n
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Split env-centric records and write teacher comm fields"
+        description="Split env-centric records and write teacher/behavior comm fields"
     )
     parser.add_argument("--record_dir", type=str, default=None)
     parser.add_argument("--records_root", type=str, default=None)
@@ -232,8 +300,20 @@ def main(argv: list[str] | None = None) -> None:
         default=max(1, min(8, (os.cpu_count() or 1))),
     )
     parser.add_argument("--max_n_units", type=int, default=DEFAULT_MAX_N_UNITS)
+    parser.add_argument(
+        "--annotate_only",
+        action="store_true",
+        help="Patch existing agent-centric leaves (unit_id channel); do not re-split",
+    )
     args = parser.parse_args(argv)
     output_root = Path(args.output_root) if args.output_root else None
+    if args.annotate_only:
+        root = Path(args.output_root or args.records_root or args.record_dir or "")
+        if not root:
+            raise SystemExit("--annotate_only needs --output_root or --records_root")
+        n = annotate_existing_leaves(root, max_n_units=int(args.max_n_units))
+        print(f"[agent_centric_comm] annotate_only updated {n} leaves", flush=True)
+        return
     if args.record_dir:
         paths = split_one_record_comm(
             Path(args.record_dir),
