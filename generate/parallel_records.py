@@ -272,6 +272,10 @@ def plan_jobs(
     independent_ally_policies: bool = False,
     mid_episode_policy_switch: bool = True,
     best_teacher_reference: bool = False,
+    coach_eval_episodes: int = 64,
+    coach_eval_tie_eps: float = 0.02,
+    coach_eval_max_episode_steps: int = 512,
+    coach_eval_parallel_envs: int = 32,
     dump_attack_target: bool = False,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
@@ -329,6 +333,10 @@ def plan_jobs(
                 "independent_ally_policies": bool(independent_ally_policies),
                 "mid_episode_policy_switch": bool(mid_episode_policy_switch),
                 "best_teacher_reference": bool(best_teacher_reference),
+                "coach_eval_episodes": int(coach_eval_episodes),
+                "coach_eval_tie_eps": float(coach_eval_tie_eps),
+                "coach_eval_max_episode_steps": int(coach_eval_max_episode_steps),
+                "coach_eval_parallel_envs": int(coach_eval_parallel_envs),
                 "dump_attack_target": bool(dump_attack_target),
             }
         )
@@ -443,6 +451,14 @@ def run_from_config(config: dict[str, Any]) -> None:
             config.get("mid_episode_policy_switch", True)
         ),
         best_teacher_reference=bool(config.get("best_teacher_reference", False)),
+        coach_eval_episodes=int(config.get("coach_eval_episodes", 64) or 64),
+        coach_eval_tie_eps=float(config.get("coach_eval_tie_eps", 0.02) or 0.02),
+        coach_eval_max_episode_steps=int(
+            config.get("coach_eval_max_episode_steps", 512) or 512
+        ),
+        coach_eval_parallel_envs=int(
+            config.get("coach_eval_parallel_envs", 32) or 32
+        ),
         dump_attack_target=bool(config.get("dump_attack_target", False)),
     )
 
@@ -454,6 +470,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"parallel_envs={parallel_envs} "
         f"winrate_adapt={config.get('winrate_adapt', False)} "
         f"best_teacher_reference={config.get('best_teacher_reference', False)} "
+        f"coach_eval_episodes={config.get('coach_eval_episodes', 64)} "
         f"dump_attack_target={config.get('dump_attack_target', False)} "
         f"independent_ally_policies={config.get('independent_ally_policies', False)} "
         f"mid_episode_policy_switch={config.get('mid_episode_policy_switch', True)} "
@@ -656,9 +673,14 @@ def main(
         default=None,
         help=(
             "If true, hard reference actions follow task.json coach_eval.best_policy; "
-            "soft dist stays RL. Also steers winrate_adapt focus."
+            "soft dist stays RL. Also steers winrate_adapt focus. "
+            "Missing coach_eval is evaluated and written before generate."
         ),
     )
+    parser.add_argument("--coach_eval_episodes", type=int, default=None)
+    parser.add_argument("--coach_eval_tie_eps", type=float, default=None)
+    parser.add_argument("--coach_eval_max_episode_steps", type=int, default=None)
+    parser.add_argument("--coach_eval_parallel_envs", type=int, default=None)
     parser.add_argument(
         "--dump_attack_target",
         type=str,
@@ -727,6 +749,18 @@ def main(
         )
     if args.best_teacher_reference is not None:
         config["best_teacher_reference"] = args.best_teacher_reference == "true"
+    if args.coach_eval_episodes is not None:
+        config["coach_eval_episodes"] = max(1, int(args.coach_eval_episodes))
+    if args.coach_eval_tie_eps is not None:
+        config["coach_eval_tie_eps"] = float(args.coach_eval_tie_eps)
+    if args.coach_eval_max_episode_steps is not None:
+        config["coach_eval_max_episode_steps"] = max(
+            1, int(args.coach_eval_max_episode_steps)
+        )
+    if args.coach_eval_parallel_envs is not None:
+        config["coach_eval_parallel_envs"] = max(
+            1, int(args.coach_eval_parallel_envs)
+        )
     if args.dump_attack_target is not None:
         config["dump_attack_target"] = args.dump_attack_target == "true"
     if dump_attack_target is not None:

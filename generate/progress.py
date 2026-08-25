@@ -89,6 +89,19 @@ class ProgressTracker:
             self._last_heartbeat_at = time.time()
             self._write_snapshot(status="running")
             self._print_line(final=False)
+        elif kind == "coach_eval_done":
+            self.last_event = event
+            self._append_jsonl(event)
+            self._last_heartbeat_at = time.time()
+            print(
+                f"[parallel_records] coach_eval worker={event.get('worker_id')} "
+                f"pkg={event.get('package_name')} "
+                f"best_policy={event.get('best_policy')} "
+                f"oracle_wr={event.get('oracle_wr')} "
+                f"advanced_wr={event.get('advanced_wr')} "
+                f"wrote={event.get('wrote')}",
+                flush=True,
+            )
         elif kind == "adapt_done":
             self.last_event = event
             self._append_jsonl(event)

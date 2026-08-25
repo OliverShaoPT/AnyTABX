@@ -292,12 +292,18 @@ def evaluate_package_oracle_vs_advanced(
     max_episode_steps: int = 512,
     tie_eps: float = DEFAULT_TIE_EPS,
     parallel_envs: int | None = None,
+    ctx: Any | None = None,
 ) -> dict[str, Any]:
-    """Compare oracle_pure vs heuristic_advanced; include ``best_policy``."""
+    """Compare oracle_pure vs heuristic_advanced; include ``best_policy``.
 
-    from generate.env_centric import build_record_gen_context
+    Pass an existing ``RecordGenContext`` as ``ctx`` to reuse env/oracle (e.g.
+    inside ``record_worker`` before generate).
+    """
 
-    ctx = build_record_gen_context(package)
+    if ctx is None:
+        from generate.env_centric import build_record_gen_context
+
+        ctx = build_record_gen_context(package)
     n = max(1, int(num_episodes))
     if parallel_envs is None:
         batch = min(n, DEFAULT_PARALLEL_ENVS)
@@ -452,3 +458,57 @@ def evaluate_and_write_coach_leaf(
         package.task_json, coach_eval_for_task_metadata(result)
     )
     return result
+
+
+def ensure_coach_eval(
+    package: TaskPackage,
+    *,
+    ctx: Any | None = None,
+    num_episodes: int = 64,
+    seed: int = 0,
+    max_episode_steps: int = 512,
+    tie_eps: float = DEFAULT_TIE_EPS,
+    parallel_envs: int | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Return ``coach_eval`` for ``package``, evaluating+writing if missing.
+
+    Used by parallel record generation when ``best_teacher_reference`` is on but
+    the coach leaf was trained without ``COACH_EVAL`` / never wrote ``coach_eval``.
+
+    Returns a dict with:
+      - ``coach_eval``: metadata block
+      - ``best_policy``: ``oracle_pure`` | ``heuristic_advanced``
+      - ``wrote``: whether ``task.json`` was updated this call
+      - ``eval_result``: full eval row when a new eval ran, else ``None``
+    """
+
+    existing = None if force else read_coach_eval(package)
+    if existing is not None:
+        best = str(existing.get("best_policy") or BEST_ORACLE)
+        if best not in {BEST_ORACLE, BEST_ADVANCED}:
+            best = BEST_ORACLE
+        return {
+            "coach_eval": existing,
+            "best_policy": best,
+            "wrote": False,
+            "eval_result": None,
+        }
+
+    result = evaluate_package_oracle_vs_advanced(
+        package,
+        num_episodes=num_episodes,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        tie_eps=tie_eps,
+        parallel_envs=parallel_envs,
+        ctx=ctx,
+    )
+    block = coach_eval_for_task_metadata(result)
+    write_coach_eval_to_task_json(package.task_json, block)
+    return {
+        "coach_eval": block,
+        "best_policy": str(block["best_policy"]),
+        "wrote": True,
+        "eval_result": result,
+    }

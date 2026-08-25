@@ -72,7 +72,13 @@ adapt_strength_max: 0.7       # max strong-group mass (≥30% weak retained)
 # true: hard reference = coach_eval.best_policy (oracle_pure | heuristic_advanced);
 #       soft actions_reference_distribution always stays RL softmax;
 #       winrate_adapt oracle_focus concentrates strong mass on that best_policy.
+#       If coach_eval is missing, each worker pre-evals oracle vs advanced for that
+#       task (parallel across workers), writes task.json, then starts generate.
 best_teacher_reference: false
+coach_eval_episodes: 64
+coach_eval_tie_eps: 0.02
+coach_eval_max_episode_steps: 512
+coach_eval_parallel_envs: 32
 
 # Comm dump: write game_manager.attack_target.npy (env_centric_v1_comm).
 # Default false keeps the old record schema. python -m generate.env_centric_comm

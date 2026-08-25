@@ -85,7 +85,7 @@ python -m generate.env_centric ... --seed 0
 
 Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank manifest）。
 
-`coach_eval` 由训练结束时的 oracle vs advanced 评测写入（或 `tools/compare_oracle_vs_advanced.py --write_task_json`）。缺字段时开关打开会回退到 `oracle_pure`。
+`coach_eval` 由训练结束时的 oracle vs advanced 评测写入（或 `tools/compare_oracle_vs_advanced.py --write_task_json`）。`best_teacher_reference=true` 且叶子缺 `coach_eval` 时，每个 worker 在该 task 首次 setup 后会 **前测并写回** `task.json`，再进入 warmup / generate（多 worker 并行测不同 task）。
 
 ### 3.2 Ally policy 采样模式
 
@@ -131,7 +131,9 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `adapt_pilot_records`    | 4     | 每轮试跑 record 条数（临时）                            |
 | `adapt_max_iters`        | 3     | 最多试跑/调整轮数                                     |
 | `adapt_strength_max`     | 0.7   | 强组质量上限（保留弱策略）                                 |
-| `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy` |
+| `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy`；缺字段时 generate 前自动评测写回 |
+| `coach_eval_episodes` | 64 | 前测 / 缺字段补评时每策略 episode 数 |
+| `coach_eval_parallel_envs` | 32 | 前测 vmap batch |
 
 
 与 `independent_ally_policies=true` 兼容：adapt 仍只改共享 CDF，从而抬高每个 ally 抽到强策略的概率。

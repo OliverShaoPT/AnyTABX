@@ -110,5 +110,54 @@ class WriteCoachEvalTest(unittest.TestCase):
             )
 
 
+class EnsureCoachEvalTest(unittest.TestCase):
+    def test_reuse_existing_without_rewrite(self) -> None:
+        from generate.coach_eval import ensure_coach_eval
+        from generate.task_package import TaskPackage
+
+        bank = {
+            "schema_version": "1.0",
+            "manifest": {},
+            "tasks": [
+                {
+                    "task_id": "t0",
+                    "metadata": {
+                        "coach_eval": {
+                            "best_policy": BEST_ADVANCED,
+                            "num_episodes": 4,
+                            "max_episode_steps": 64,
+                            "parallel_envs": 4,
+                            "seed": 0,
+                            "tie_eps": 0.02,
+                            "oracle_pure": {"win_rate": 0.2},
+                            "heuristic_advanced": {"win_rate": 0.8},
+                            "delta_oracle_minus_advanced": -0.6,
+                        }
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf = root / "leaf"
+            leaf.mkdir()
+            path = leaf / "task.json"
+            path.write_text(json.dumps(bank), encoding="utf-8")
+            package = TaskPackage(
+                path=leaf,
+                root=root,
+                task_index=0,
+                task_id="t0",
+                task_json=path,
+                oracle_dir=leaf,
+                oracle_config=leaf / "config.json",
+                oracle_ckpt=leaf / "best.safetensors",
+            )
+            out = ensure_coach_eval(package)
+            self.assertFalse(out["wrote"])
+            self.assertEqual(out["best_policy"], BEST_ADVANCED)
+            self.assertIsNone(out["eval_result"])
+
+
 if __name__ == "__main__":
     unittest.main()

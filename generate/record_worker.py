@@ -463,7 +463,7 @@ def worker_main(payload: dict[str, Any]) -> str:
     )
     from generate.task_package import discover_task_packages
 
-    from generate.coach_eval import BEST_ORACLE, read_best_policy, read_coach_eval
+    from generate.coach_eval import BEST_ORACLE, ensure_coach_eval
 
     packages = {p.name: p for p in discover_task_packages(payload["packages_root"])}
     base_mix = behavior_mix_from_config(payload.get("behavior_mix"))
@@ -473,6 +473,14 @@ def worker_main(payload: dict[str, Any]) -> str:
         parallel_envs = 1
     winrate_adapt = bool(payload.get("winrate_adapt", False))
     best_teacher_reference = bool(payload.get("best_teacher_reference", False))
+    coach_eval_episodes = max(1, int(payload.get("coach_eval_episodes", 64) or 64))
+    coach_eval_tie_eps = float(payload.get("coach_eval_tie_eps", 0.02) or 0.02)
+    coach_eval_max_episode_steps = max(
+        1, int(payload.get("coach_eval_max_episode_steps", 512) or 512)
+    )
+    coach_eval_parallel_envs = max(
+        1, int(payload.get("coach_eval_parallel_envs", 32) or 32)
+    )
     # Adapt needs scan path (runtime CDF). Fall back to no-adapt if scan off.
     if winrate_adapt and not scan_rollout:
         print(
@@ -497,16 +505,49 @@ def worker_main(payload: dict[str, Any]) -> str:
                 ctx = build_record_gen_context(package)
                 setup_s = time.perf_counter() - t_setup
                 if best_teacher_reference:
-                    if read_coach_eval(package) is None:
+                    # Missing coach_eval → pre-eval oracle vs advanced, write
+                    # task.json, then generate with the winner as hard reference.
+                    ensure = ensure_coach_eval(
+                        package,
+                        ctx=ctx,
+                        num_episodes=coach_eval_episodes,
+                        seed=int(payload.get("seed") or 0)
+                        + 997 * int(package.task_index),
+                        max_episode_steps=coach_eval_max_episode_steps,
+                        tie_eps=coach_eval_tie_eps,
+                        parallel_envs=coach_eval_parallel_envs,
+                    )
+                    best_policy = str(ensure["best_policy"])
+                    if ensure["wrote"]:
+                        ev = ensure.get("eval_result") or {}
+                        o = (ev.get("oracle_pure") or {}).get("win_rate")
+                        a = (ev.get("heuristic_advanced") or {}).get("win_rate")
                         print(
                             f"[record_worker] package={package.name}: "
-                            "best_teacher_reference on but coach_eval missing; "
-                            f"fallback best_policy={BEST_ORACLE}",
+                            f"wrote coach_eval best_policy={best_policy} "
+                            f"oracle_wr={o} advanced_wr={a}",
                             flush=True,
                         )
-                        best_policy = BEST_ORACLE
+                        _report(
+                            payload,
+                            {
+                                "event": "coach_eval_done",
+                                "worker_id": worker_id,
+                                "device": device,
+                                "gpu_id": payload.get("gpu_id"),
+                                "package_name": package.name,
+                                "best_policy": best_policy,
+                                "wrote": True,
+                                "oracle_wr": o,
+                                "advanced_wr": a,
+                            },
+                        )
                     else:
-                        best_policy = read_best_policy(package, default=BEST_ORACLE)
+                        print(
+                            f"[record_worker] package={package.name}: "
+                            f"reuse coach_eval best_policy={best_policy}",
+                            flush=True,
+                        )
                 else:
                     best_policy = BEST_ORACLE
                 package_best_policy[package.name] = best_policy
