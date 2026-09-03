@@ -486,16 +486,16 @@ class WinrateAdaptTest(unittest.TestCase):
         )
         self.assertIsNone(stuck)
 
-    def test_summarize_arrays_hp_draw_and_win(self) -> None:
+    def test_summarize_arrays_uses_is_win(self) -> None:
         done = np.array([0, 1, 0, 1], dtype=np.uint8)
-        is_win = np.array([0, 0, 0, 0], dtype=np.uint8)
-        # N=2 units: team0, team1
+        is_win = np.array([0, 0, 0, 1], dtype=np.uint8)
+        # health/team ignored; outcome follows env is_win (elim / timeout).
         health = np.array(
             [
                 [10.0, 10.0],
-                [5.0, 5.0],  # draw
+                [5.0, 5.0],
                 [10.0, 10.0],
-                [8.0, 2.0],  # win
+                [8.0, 2.0],
             ],
             dtype=np.float32,
         )
@@ -512,10 +512,10 @@ class WinrateAdaptTest(unittest.TestCase):
             done=done, is_win=is_win, unit_health=health, unit_team=team
         )
         self.assertEqual(counts["episodes"], 2)
-        self.assertEqual(counts["draw"], 1)
+        self.assertEqual(counts["draw"], 0)
         self.assertEqual(counts["win"], 1)
-        self.assertEqual(counts["loss"], 0)
-        self.assertAlmostEqual(win_rate_from_counts(counts), 1.0)
+        self.assertEqual(counts["loss"], 1)
+        self.assertAlmostEqual(win_rate_from_counts(counts), 0.5)
 
 
 class IntentLabelTest(unittest.TestCase):

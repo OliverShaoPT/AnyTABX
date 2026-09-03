@@ -156,7 +156,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `episode_id.npy` | 同 record 内第几个 episode                        |
 
 
-说明：`done=1` 且 `truncation=0` 多为正常胜负终局；`done=1` 且 `truncation=1` 为超时（超时仍可能按 HP 判 `is_win`）。
+说明：`done=1` 且 `truncation=0` 多为歼灭终局（ally 全灭敌方才 `is_win=1`）；`done=1` 且 `truncation=1` 为超时——敌方仍存活则 ally 判负（`is_win=0`）。
 
 ### 3.5 输出布局
 

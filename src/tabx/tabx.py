@@ -953,11 +953,23 @@ class TABX(BaseMAEnv):
         delta_hp = team_hp_ratio - state["game_manager"].last_team_hp_ratio
         reward_matrix = (jnp.identity(self.max_team) - 0.5) * 2.0
 
-        # The team with the highest hp ratio gets reward 1.0 when the episode is done or truncated
-        decision_win_reward = (
-            jnp.full_like(team_hp_ratio, self.lose_reward)
-            .at[self.max_team - 1 - jnp.argmax(jnp.round(team_hp_ratio[::-1], 4))]
-            .set(self.win_reward)
+        # Win only by eliminating every other team while still alive yourself.
+        # Timeout with the enemy still alive → ally (team 0) loses; other
+        # surviving teams take the win reward (2-team: enemy wins on timeout).
+        n_done = team_dones.astype(jnp.int32).sum()
+        elim_win = (~team_dones) & (n_done == (self.max_team - 1))
+        decision_win_reward = jnp.full(
+            (self.max_team,), self.lose_reward, dtype=team_hp_ratio.dtype
+        )
+        decision_win_reward = jnp.where(
+            elim_win, self.win_reward, decision_win_reward
+        )
+        no_elim_winner = ~elim_win.any()
+        timeout_survivor_win = truncation & no_elim_winner & (~team_dones)
+        # Ally never wins on pure timeout; must have wiped the enemy.
+        timeout_survivor_win = timeout_survivor_win.at[0].set(False)
+        decision_win_reward = jnp.where(
+            timeout_survivor_win, self.win_reward, decision_win_reward
         )
         win_reward = jnp.where(dones["__all__"], decision_win_reward, 0.0)[..., None]
         # dense reward

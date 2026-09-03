@@ -125,22 +125,16 @@ def team_hp_totals(
 def classify_episode(
     *,
     is_win: int,
-    health: np.ndarray | None,
-    team: np.ndarray | None,
-    is_alive: np.ndarray | None,
+    health: np.ndarray | None = None,
+    team: np.ndarray | None = None,
+    is_alive: np.ndarray | None = None,
 ) -> str:
-    if health is not None and team is not None:
-        hp0, hp1 = team_hp_totals(health, team, is_alive=is_alive)
-        total = hp0 + hp1
-        if total <= 1e-12:
-            return "draw"
-        r0 = round(hp0 / total, 4)
-        r1 = round(hp1 / total, 4)
-        if r0 == r1:
-            return "draw"
-        if r0 > r1:
-            return "win"
-        return "loss"
+    """Classify terminal as win/loss from env ``is_win`` (elimination / timeout).
+
+    ``health`` / ``team`` / ``is_alive`` are ignored; kept for call-site compat.
+    """
+
+    del health, team, is_alive
     return "win" if int(is_win) else "loss"
 
 

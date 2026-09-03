@@ -202,10 +202,9 @@ UP, DOWN, LEFT, RIGHT, ATTACK, TURN_RIGHT, TURN_LEFT, IDLE
 
 当前目标固定为击败对方：
 
-- 一方全部死亡/disabled 时结束。
-- 达到 `max_episode_steps` 时按团队剩余 HP ratio 判胜。
-- HP ratio 平局偏向敌方。
-- dense reward 使用双方 HP ratio 的变化。
+- 一方全部死亡/disabled 时结束；**只有歼灭对方才算 ally 胜**。
+- 达到 `max_episode_steps` 且敌方仍存活 → ally 判负（超时不按 HP 判胜）。
+- dense reward 仍使用双方 HP ratio 的变化。
 - terminal reward 默认胜 `+1`、负 `-1`。
 
 目前没有随机任务目标、护送、占点、守时、资源收集等机制。
@@ -651,7 +650,7 @@ easy：胜率偏高，但不是极短碾压
 
 ### 5.4 第四门：公平性与侧偏
 
-当前超时 HP ratio 平局偏向敌方，所以“同配置双方 AI 胜率 50%”不是天然成立的。
+超时且双方都存活时 ally 判负（不再按 HP ratio 判胜），所以“同配置双方 AI 胜率 50%”不是天然成立的。
 
 每个 task 建议做成对评测：
 
