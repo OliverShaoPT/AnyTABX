@@ -293,6 +293,7 @@ def evaluate_package_oracle_vs_advanced(
     tie_eps: float = DEFAULT_TIE_EPS,
     parallel_envs: int | None = None,
     ctx: Any | None = None,
+    train_like_sample: bool = False,
 ) -> dict[str, Any]:
     """Compare oracle_pure vs heuristic_advanced; include ``best_policy``.
 
@@ -303,7 +304,9 @@ def evaluate_package_oracle_vs_advanced(
     if ctx is None:
         from generate.env_centric import build_record_gen_context
 
-        ctx = build_record_gen_context(package)
+        ctx = build_record_gen_context(
+            package, train_like_sample=bool(train_like_sample)
+        )
     n = max(1, int(num_episodes))
     if parallel_envs is None:
         batch = min(n, DEFAULT_PARALLEL_ENVS)
@@ -344,6 +347,15 @@ def evaluate_package_oracle_vs_advanced(
         "heuristic_advanced": {**advanced_counts, "win_rate": a_wr},
         "delta_oracle_minus_advanced": o_wr - a_wr,
         "best_policy": best,
+        "train_like_sample": bool(getattr(ctx.oracle, "train_like_sample", False)),
+        "train_update_steps": getattr(ctx.oracle, "train_update_steps", None),
+        "train_update_source": getattr(ctx.oracle, "train_update_source", ""),
+        "train_epsilon": float(getattr(ctx.oracle, "train_epsilon", 0.0) or 0.0),
+        "oracle_act": (
+            "train_like"
+            if getattr(ctx.oracle, "train_like_sample", False)
+            else "greedy"
+        ),
     }
 
 
@@ -364,6 +376,11 @@ def coach_eval_for_task_metadata(eval_result: dict[str, Any]) -> dict[str, Any]:
             eval_result["delta_oracle_minus_advanced"]
         ),
         "best_policy": str(eval_result["best_policy"]),
+        "oracle_act": str(eval_result.get("oracle_act", "greedy")),
+        "train_like_sample": bool(eval_result.get("train_like_sample", False)),
+        "train_update_steps": eval_result.get("train_update_steps"),
+        "train_update_source": str(eval_result.get("train_update_source") or ""),
+        "train_epsilon": float(eval_result.get("train_epsilon") or 0.0),
     }
 
 
@@ -442,6 +459,7 @@ def evaluate_and_write_coach_leaf(
     max_episode_steps: int = 512,
     tie_eps: float = DEFAULT_TIE_EPS,
     parallel_envs: int | None = None,
+    train_like_sample: bool = False,
 ) -> dict[str, Any]:
     """Eval one coach leaf and write ``coach_eval`` into its ``task.json``."""
 
@@ -453,6 +471,7 @@ def evaluate_and_write_coach_leaf(
         max_episode_steps=max_episode_steps,
         tie_eps=tie_eps,
         parallel_envs=parallel_envs,
+        train_like_sample=bool(train_like_sample),
     )
     write_coach_eval_to_task_json(
         package.task_json, coach_eval_for_task_metadata(result)
@@ -470,6 +489,7 @@ def ensure_coach_eval(
     tie_eps: float = DEFAULT_TIE_EPS,
     parallel_envs: int | None = None,
     force: bool = False,
+    train_like_sample: bool = False,
 ) -> dict[str, Any]:
     """Return ``coach_eval`` for ``package``, evaluating+writing if missing.
 
@@ -503,6 +523,7 @@ def ensure_coach_eval(
         tie_eps=tie_eps,
         parallel_envs=parallel_envs,
         ctx=ctx,
+        train_like_sample=bool(train_like_sample),
     )
     block = coach_eval_for_task_metadata(result)
     write_coach_eval_to_task_json(package.task_json, block)

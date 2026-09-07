@@ -32,7 +32,7 @@
 
 Generate record **只需要** `coach_root`：递归发现上述叶子，每个子文件夹对应一个环境。
 
-训练结束（`marl_baseline`，`COACH_EVAL=true` 默认开）会在该叶子 `task.json` 的 `tasks[0].metadata.coach_eval` 写入 `oracle_pure` / `heuristic_advanced` 胜率与 `best_policy`。评测用 `vmap` 并行 episode（默认 `COACH_EVAL_PARALLEL_ENVS=32`）。也可事后跑：
+训练结束（`marl_baseline`，`COACH_EVAL=true` 默认开）会在该叶子 `task.json` 的 `tasks[0].metadata.coach_eval` 写入 `oracle_pure` / `heuristic_advanced` 胜率与 `best_policy`。评测默认 greedy argmax；`COACH_EVAL_TRAIN_LIKE_SAMPLE=true` 则与训练采集同分布（同时写入 `checkpoint_meta.json` 供事后反推 ε）。评测用 `vmap` 并行 episode（默认 `COACH_EVAL_PARALLEL_ENVS=32`）。也可事后跑：
 
 ```bash
 python tools/compare_oracle_vs_advanced.py --coach_root ... --write_task_json --parallel_envs 32
@@ -134,6 +134,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy`；缺字段时 generate 前自动评测写回 |
 | `coach_eval_episodes` | 64 | 前测 / 缺字段补评时每策略 episode 数 |
 | `coach_eval_parallel_envs` | 32 | 前测 vmap batch |
+| `oracle_train_like_sample` | false | `true` 时 `oracle_pure` / coach_eval 与训练采集同分布：PPO 对 logits 做 categorical sample（旧 MAPPO/IPPO 叶子只需 `config.json` + actor 权重，不依赖 `checkpoint_meta.json`）；Q 用 checkpoint 保存时的 ε-greedy。ε 由 `checkpoint_meta.json` 的 `best_update_steps`/`final_update_steps` 反推（缺文件则读 `training_metrics.csv`，再退回 `total_updates` → `EPS_FINISH`）。`oracle_eps` mix 仍用自己的 ε。硬标签 `actions_reference` 仍是 argmax。 |
 
 
 与 `independent_ally_policies=true` 兼容：adapt 仍只改共享 CDF，从而抬高每个 ally 抽到强策略的概率。

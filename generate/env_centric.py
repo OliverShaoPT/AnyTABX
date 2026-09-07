@@ -145,7 +145,11 @@ def build_env_and_params(package: TaskPackage):
     return env, env_params, task, manifest
 
 
-def build_record_gen_context(package: TaskPackage) -> RecordGenContext:
+def build_record_gen_context(
+    package: TaskPackage,
+    *,
+    train_like_sample: bool = False,
+) -> RecordGenContext:
     """Build env + oracle once; reuse across records for the same package."""
 
     env, env_params, task, manifest = build_env_and_params(package)
@@ -153,7 +157,12 @@ def build_record_gen_context(package: TaskPackage) -> RecordGenContext:
     unit_keys = list(env.unit_keys)
     action_dim = int(env.action_space(ally_keys[0]).n)
     obs_dim = int(env.observation_space(ally_keys[0]).shape[0])
-    oracle = load_oracle_coach(package.oracle_dir, obs_dim=obs_dim, action_dim=action_dim)
+    oracle = load_oracle_coach(
+        package.oracle_dir,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        train_like_sample=bool(train_like_sample),
+    )
     return RecordGenContext(
         package=package,
         env=env,

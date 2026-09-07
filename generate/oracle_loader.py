@@ -1,7 +1,8 @@
-"""Load a trained MARL coach checkpoint and produce greedy / ε-greedy actions."""
+"""Load a trained MARL coach checkpoint and produce greedy / train-like actions."""
 
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,10 +16,128 @@ from src.baseline.marl_baseline import PolicyNetwork, QNetwork
 from src.baseline.utils import load_params
 
 AlgorithmFamily = Literal["ppo", "q"]
+CHECKPOINT_META_NAME = "checkpoint_meta.json"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def total_updates_from_config(config: dict[str, Any]) -> int:
+    """Match ``BaseMARLTrainer.total_updates``."""
+
+    return max(
+        1,
+        int(config["TOTAL_TIMESTEPS"])
+        // int(config["NUM_ENVS"])
+        // int(config["NUM_STEPS"]),
+    )
+
+
+def q_epsilon_at_update(
+    update: int | float,
+    *,
+    total_updates: int,
+    eps_start: float = 1.0,
+    eps_finish: float = 0.05,
+    eps_decay: float = 0.1,
+) -> float:
+    """Linear ε schedule used by ``marl_baseline`` Q trainers (and RNN Q)."""
+
+    decay_updates = max(1, int(total_updates * float(eps_decay)))
+    fraction = min(max(float(update), 0.0) / float(decay_updates), 1.0)
+    return float(eps_start) + fraction * (float(eps_finish) - float(eps_start))
+
+
+def q_epsilon_from_config(config: dict[str, Any], update: int | float) -> float:
+    return q_epsilon_at_update(
+        update,
+        total_updates=total_updates_from_config(config),
+        eps_start=float(config.get("EPS_START", 1.0)),
+        eps_finish=float(config.get("EPS_FINISH", 0.05)),
+        eps_decay=float(config.get("EPS_DECAY", 0.1)),
+    )
+
+
+def _ckpt_kind(ckpt_path: Path) -> str:
+    name = ckpt_path.name.lower()
+    if name.startswith("best"):
+        return "best"
+    if name.startswith("final"):
+        return "final"
+    return "other"
+
+
+def _update_from_metrics_csv(path: Path, *, prefer_best: bool) -> int | None:
+    if not path.is_file():
+        return None
+    last: int | None = None
+    last_at_best: int | None = None
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            raw = row.get("update_steps")
+            if raw is None or raw == "":
+                continue
+            update = int(float(raw))
+            last = update
+            window = row.get("early_stop/window_return")
+            best = row.get("early_stop/best_return")
+            if window and best:
+                try:
+                    if abs(float(window) - float(best)) <= 1e-6:
+                        last_at_best = update
+                except ValueError:
+                    pass
+    if prefer_best:
+        return last_at_best if last_at_best is not None else last
+    return last
+
+
+def resolve_checkpoint_update(
+    oracle_dir: str | Path,
+    ckpt_path: str | Path,
+    config: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    """Recover the training update of a saved ckpt.
+
+    Preference: ``checkpoint_meta.json`` → last matching ``training_metrics.csv``
+    row → scheduled ``total_updates`` (end of ε decay).
+    """
+
+    oracle_dir = Path(oracle_dir)
+    ckpt_path = Path(ckpt_path)
+    kind = _ckpt_kind(ckpt_path)
+    meta_path = oracle_dir / CHECKPOINT_META_NAME
+    if meta_path.is_file():
+        meta = _read_json(meta_path)
+        key = "best_update_steps" if kind == "best" else "final_update_steps"
+        if kind == "other":
+            key = (
+                "best_update_steps"
+                if meta.get("best_update_steps") is not None
+                else "final_update_steps"
+            )
+        raw = meta.get(key)
+        if raw is None and kind != "best":
+            raw = meta.get("best_update_steps")
+        if raw is not None:
+            return int(raw), f"checkpoint_meta.{key}"
+
+    csv_update = _update_from_metrics_csv(
+        oracle_dir / "training_metrics.csv",
+        prefer_best=(kind == "best"),
+    )
+    if csv_update is not None:
+        return csv_update, "training_metrics.csv"
+
+    cfg = config or {}
+    try:
+        if all(key in cfg for key in ("TOTAL_TIMESTEPS", "NUM_ENVS", "NUM_STEPS")):
+            return total_updates_from_config(cfg), "config.total_updates"
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 0, "fallback_zero"
 
 
 def algorithm_family(algorithm: str) -> AlgorithmFamily:
@@ -40,6 +159,10 @@ class OracleCoach:
     action_dim: int
     params: Any
     apply_fn: Any
+    train_like_sample: bool = False
+    train_epsilon: float = 0.0
+    train_update_steps: int | None = None
+    train_update_source: str = ""
 
     def _masked_scores(
         self,
@@ -96,12 +219,26 @@ class OracleCoach:
         *,
         key: jax.Array,
         epsilon: float = 0.0,
+        train_like: bool | None = None,
     ) -> jax.Array:
-        """On-device actions for a batch of agents. obs/avail: (A, ...)."""
+        """On-device actions for a batch of agents. obs/avail: (A, ...).
+
+        ``train_like=True`` matches training collection:
+          PPO → categorical sample from logits
+          Q   → ε-greedy with ``epsilon`` (reconstructed from saved update)
+        Default is greedy argmax (or ε-greedy when ``epsilon>0``).
+        """
 
         scores, avail_j = self._masked_scores(obs, avail)
+        use_train = self.train_like_sample if train_like is None else bool(train_like)
+        if use_train and self.family == "ppo":
+            return jax.random.categorical(key, scores).astype(jnp.int32)
+
         greedy = jnp.argmax(scores, axis=-1)
-        eps = jnp.asarray(epsilon, dtype=jnp.float32)
+        eps_value = float(epsilon)
+        if use_train and self.family == "q" and eps_value <= 0.0:
+            eps_value = float(self.train_epsilon)
+        eps = jnp.asarray(eps_value, dtype=jnp.float32)
 
         def _explore(operands):
             greedy_a, avail_a, rng = operands
@@ -118,6 +255,27 @@ class OracleCoach:
 
         return jax.lax.cond(eps > 0.0, _explore, _greedy, (greedy, avail_j, key))
 
+    def act_behavior_jax(
+        self,
+        obs: np.ndarray | jax.Array,
+        avail: np.ndarray | jax.Array,
+        *,
+        key: jax.Array,
+        spec_kind: str,
+        spec_epsilon: float = 0.0,
+    ) -> jax.Array:
+        """Behavior-mix action: ``oracle_eps`` keeps its ε; else honor train-like."""
+
+        if spec_kind == "oracle_eps":
+            return self.act_jax(
+                obs, avail, key=key, epsilon=float(spec_epsilon), train_like=False
+            )
+        if self.train_like_sample:
+            return self.act_jax(
+                obs, avail, key=key, epsilon=float(self.train_epsilon), train_like=True
+            )
+        return self.act_jax(obs, avail, key=key, epsilon=0.0, train_like=False)
+
     def act(
         self,
         obs: np.ndarray | jax.Array,
@@ -125,14 +283,19 @@ class OracleCoach:
         *,
         key: jax.Array | None = None,
         epsilon: float = 0.0,
+        train_like: bool | None = None,
     ) -> np.ndarray:
         """Return actions for a batch of agents. obs/avail: (A, ...)."""
 
-        if epsilon <= 0.0 or key is None:
+        use_train = self.train_like_sample if train_like is None else bool(train_like)
+        if key is None:
             scores, _ = self._masked_scores(obs, avail)
             return np.asarray(jnp.argmax(scores, axis=-1), dtype=np.int32)
         return np.asarray(
-            self.act_jax(obs, avail, key=key, epsilon=epsilon), dtype=np.int32
+            self.act_jax(
+                obs, avail, key=key, epsilon=epsilon, train_like=use_train
+            ),
+            dtype=np.int32,
         )
 
 
@@ -141,6 +304,7 @@ def load_oracle_coach(
     *,
     obs_dim: int,
     action_dim: int,
+    train_like_sample: bool = False,
 ) -> OracleCoach:
     oracle_dir = Path(oracle_dir)
     config_path = oracle_dir / "config.json"
@@ -167,11 +331,25 @@ def load_oracle_coach(
         # Touch apply graph with dummy shapes for clarity.
         _ = model.init(jax.random.key(0), jnp.zeros((1, obs_dim)), jnp.ones((1, action_dim), dtype=bool))
         apply_fn = model.apply
+        # MAPPO/IPPO train-like is categorical(logits). Old leaves have no
+        # checkpoint_meta / ε schedule; missing update info must not block load.
+        update_steps, update_source = _safe_checkpoint_update(
+            oracle_dir, ckpt_path, config
+        )
+        train_epsilon = 0.0
     else:
         params = raw["agent"] if isinstance(raw, dict) and "agent" in raw else raw
         model = QNetwork(action_dim, hidden)
         _ = model.init(jax.random.key(0), jnp.zeros((1, obs_dim)))
         apply_fn = model.apply
+        update_steps, update_source = _safe_checkpoint_update(
+            oracle_dir, ckpt_path, config
+        )
+        try:
+            train_epsilon = q_epsilon_from_config(config, update_steps)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            train_epsilon = float(config.get("EPS_FINISH", 0.05))
+            update_source = f"{update_source}+eps_finish_fallback"
 
     return OracleCoach(
         algorithm=algorithm,
@@ -180,4 +358,21 @@ def load_oracle_coach(
         action_dim=action_dim,
         params=params,
         apply_fn=apply_fn,
+        train_like_sample=bool(train_like_sample),
+        train_epsilon=float(train_epsilon),
+        train_update_steps=int(update_steps),
+        train_update_source=str(update_source),
     )
+
+
+def _safe_checkpoint_update(
+    oracle_dir: Path,
+    ckpt_path: Path,
+    config: dict[str, Any],
+) -> tuple[int, str]:
+    """Never raise: old coach leaves may lack meta / metrics / schedule keys."""
+
+    try:
+        return resolve_checkpoint_update(oracle_dir, ckpt_path, config)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError, OSError):
+        return 0, "missing_update_meta"

@@ -277,6 +277,7 @@ def plan_jobs(
     coach_eval_max_episode_steps: int = 512,
     coach_eval_parallel_envs: int = 32,
     dump_attack_target: bool = False,
+    oracle_train_like_sample: bool = False,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -338,6 +339,7 @@ def plan_jobs(
                 "coach_eval_max_episode_steps": int(coach_eval_max_episode_steps),
                 "coach_eval_parallel_envs": int(coach_eval_parallel_envs),
                 "dump_attack_target": bool(dump_attack_target),
+                "oracle_train_like_sample": bool(oracle_train_like_sample),
             }
         )
     return jobs
@@ -460,6 +462,9 @@ def run_from_config(config: dict[str, Any]) -> None:
             config.get("coach_eval_parallel_envs", 32) or 32
         ),
         dump_attack_target=bool(config.get("dump_attack_target", False)),
+        oracle_train_like_sample=bool(
+            config.get("oracle_train_like_sample", False)
+        ),
     )
 
     planned = _planned_record_count(jobs)
@@ -472,6 +477,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"best_teacher_reference={config.get('best_teacher_reference', False)} "
         f"coach_eval_episodes={config.get('coach_eval_episodes', 64)} "
         f"dump_attack_target={config.get('dump_attack_target', False)} "
+        f"oracle_train_like_sample={config.get('oracle_train_like_sample', False)} "
         f"independent_ally_policies={config.get('independent_ally_policies', False)} "
         f"mid_episode_policy_switch={config.get('mid_episode_policy_switch', True)} "
         f"win_rate_min={config.get('win_rate_min', 0.30)} "
@@ -692,6 +698,16 @@ def main(
         ),
     )
     parser.add_argument(
+        "--oracle_train_like_sample",
+        type=str,
+        choices=("true", "false"),
+        default=None,
+        help=(
+            "If true, oracle_pure matches training action sample "
+            "(PPO categorical / Q ε at saved update). Default greedy argmax."
+        ),
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -763,6 +779,10 @@ def main(
         )
     if args.dump_attack_target is not None:
         config["dump_attack_target"] = args.dump_attack_target == "true"
+    if args.oracle_train_like_sample is not None:
+        config["oracle_train_like_sample"] = (
+            args.oracle_train_like_sample == "true"
+        )
     if dump_attack_target is not None:
         config["dump_attack_target"] = bool(dump_attack_target)
     if args.win_rate_max is not None:

@@ -77,6 +77,9 @@ class MARLConfig:
     COACH_EVAL_MAX_EPISODE_STEPS: int = 512
     # vmap batch width for coach_eval episodes (capped by COACH_EVAL_EPISODES).
     COACH_EVAL_PARALLEL_ENVS: int = 32
+    # If true, coach_eval / later oracle_pure use the same action sample as
+    # training (PPO: categorical; Q: ε-greedy at the saved checkpoint update).
+    COACH_EVAL_TRAIN_LIKE_SAMPLE: bool = False
     # Shared optimization
     LR: float = 4e-4
     GAMMA: float = 0.99
@@ -419,7 +422,19 @@ class BaseMARLTrainer(ABC):
         self.final_path = self.output / "final.safetensors"
         self.metrics_path = self.output / "training_metrics.csv"
         self.early_stop_events_path = self.output / "early_stop_events.jsonl"
+        self.checkpoint_meta_path = self.output / "checkpoint_meta.json"
         self._compiled_update = jax.jit(self.update_once) if config.jit else self.update_once
+
+    def _write_checkpoint_meta(self, **fields: Any) -> None:
+        data: dict[str, Any] = {}
+        if self.checkpoint_meta_path.is_file():
+            data = json.loads(self.checkpoint_meta_path.read_text(encoding="utf-8"))
+        data.update({key: value for key, value in fields.items() if value is not None})
+        data["total_updates"] = int(self.total_updates)
+        data["algorithm"] = self.config.algorithm
+        self.checkpoint_meta_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     def _agents(self, values: dict[str, jax.Array]) -> jax.Array:
         return jnp.nan_to_num(
@@ -553,11 +568,14 @@ class BaseMARLTrainer(ABC):
                         )
                     if status.improved:
                         save_params(self.checkpoint_params(session), self.best_path)
+                        self._write_checkpoint_meta(best_update_steps=int(completed))
                     if stopped:
                         break
             save_params(self.checkpoint_params(session), self.final_path)
+            self._write_checkpoint_meta(final_update_steps=int(completed))
             if not self.best_path.exists():
                 save_params(self.checkpoint_params(session), self.best_path)
+                self._write_checkpoint_meta(best_update_steps=int(completed))
                 stopper.best = float(np.mean(stopper.returns[-stopper.window :]))
             if self.config.COACH_EVAL:
                 try:
@@ -572,6 +590,9 @@ class BaseMARLTrainer(ABC):
                         ),
                         tie_eps=float(self.config.COACH_EVAL_TIE_EPS),
                         parallel_envs=int(self.config.COACH_EVAL_PARALLEL_ENVS),
+                        train_like_sample=bool(
+                            self.config.COACH_EVAL_TRAIN_LIKE_SAMPLE
+                        ),
                     )
                     print(
                         f"[coach_eval] wrote task.json metadata.coach_eval "
@@ -589,7 +610,7 @@ class BaseMARLTrainer(ABC):
         finally:
             recorder.close()
             run.finish()
-        return TrainingSummary(
+        summary = TrainingSummary(
             algorithm=self.config.algorithm,
             task_index=self.config.task_index,
             task_id=self.task_id,
@@ -607,6 +628,11 @@ class BaseMARLTrainer(ABC):
             best_checkpoint=str(self.best_path),
             final_checkpoint=str(self.final_path),
         )
+        (self.output / "summary.json").write_text(
+            json.dumps(asdict(summary), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return summary
 
 
 class PPOTrainer(BaseMARLTrainer):

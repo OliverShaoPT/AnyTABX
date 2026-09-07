@@ -57,6 +57,8 @@ class Config:
     LN_EPS: float = 1e-6
     REW_SCALE: float = 10.0  # scale the reward to the original scale of TABX
     TEST_DURING_TRAINING: bool = True
+    # If true, online test uses the current training ε-greedy instead of argmax.
+    EVAL_TRAIN_LIKE_SAMPLE: bool = False
     TEST_INTERVAL: float = 0.05  # as a fraction of updates, i.e. log every 5% of training process
     TEST_NUM_STEPS: int = 512
     TEST_NUM_ENVS: int = 128  # number of episodes to average over, can affect performance
@@ -433,7 +435,7 @@ def make_train(config, env, env_params, test_env_params):
 
             def _greedy_env_step(step_state, unused):
                 params, env_state, last_obs, last_dones, hstate, rng = step_state
-                rng, key_s = jax.random.split(rng)
+                rng, key_s, key_a = jax.random.split(rng, 3)
                 _obs = batchify(last_obs)[:, np.newaxis]
                 _dones = batchify(last_dones)[:, np.newaxis]
                 hstate, q_vals = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
@@ -441,7 +443,15 @@ def make_train(config, env, env_params, test_env_params):
                 )
                 q_vals = q_vals.squeeze(axis=1)
                 valid_actions = jax.vmap(env.get_avail_actions)(env_state)
-                actions = get_greedy_actions(q_vals, batchify(valid_actions))
+                avail = batchify(valid_actions)
+                if config.get("EVAL_TRAIN_LIKE_SAMPLE", False):
+                    eps = eps_scheduler(train_state.n_updates)
+                    _rngs = jax.random.split(key_a, env.num_agents)
+                    actions = jax.vmap(eps_greedy_exploration, in_axes=(0, 0, None, 0))(
+                        _rngs, q_vals, eps, avail
+                    )
+                else:
+                    actions = get_greedy_actions(q_vals, avail)
                 actions = unbatchify(actions)
                 obs, env_state, rewards, dones, infos = jax.vmap(env.step, in_axes=(0, 0, 0, 0))(
                     jax.random.split(key_s, config["TEST_NUM_ENVS"]),

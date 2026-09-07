@@ -79,6 +79,10 @@ coach_eval_episodes: 64
 coach_eval_tie_eps: 0.02
 coach_eval_max_episode_steps: 512
 coach_eval_parallel_envs: 32
+# If true, oracle_pure / coach_eval sample like training (PPO categorical;
+# Q ε-greedy with ε reconstructed from checkpoint_meta.json training update).
+# Default false keeps greedy argmax. oracle_eps mix entries keep their own ε.
+oracle_train_like_sample: false
 
 # Comm dump: write game_manager.attack_target.npy (env_centric_v1_comm).
 # Default false keeps the old record schema. python -m generate.env_centric_comm

@@ -82,6 +82,8 @@ class Config:
     VALUE_EVAL_NUM_ENVS: int | None = None
     POSITION_PERMUTATION: bool = False
     FLIP: bool = False
+    # Online test / video: True = categorical sample (same as training). False = argmax.
+    EVAL_TRAIN_LIKE_SAMPLE: bool = True
 
 
 @struct.dataclass
@@ -297,7 +299,11 @@ def make_train(config):
                         avail_actions,
                     )
                     next_hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
-                    action = pi.sample(seed=_rng)
+                    action = (
+                        pi.sample(seed=_rng)
+                        if config.get("EVAL_TRAIN_LIKE_SAMPLE", True)
+                        else pi.mode()
+                    )
                     env_act = unbatchify(
                         action, eval_env.agents, config["NUM_ENVS"], eval_env.num_agents
                     )

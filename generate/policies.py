@@ -102,7 +102,13 @@ class SharedAllyPolicy:
         avail = stack_agent_avail(avail_by_agent, ally_keys)
         eps = float(self.spec.epsilon or 0.0) if self.spec.kind == "oracle_eps" else 0.0
         key, sub = jax.random.split(key)
-        flat = self.oracle.act_jax(obs, avail, key=sub, epsilon=eps)
+        flat = self.oracle.act_behavior_jax(
+            obs,
+            avail,
+            key=sub,
+            spec_kind=self.spec.kind,
+            spec_epsilon=eps,
+        )
         return {
             agent: jnp.asarray(flat[i], dtype=jnp.int32).reshape(())
             for i, agent in enumerate(ally_keys)
@@ -321,7 +327,13 @@ def act_shared_jax(
     avail = stack_agent_avail(avail_by_agent, ally_keys)
     eps = float(spec.epsilon or 0.0) if spec.kind == "oracle_eps" else 0.0
     key, sub = jax.random.split(key)
-    flat = oracle.act_jax(obs, avail, key=sub, epsilon=eps)
+    flat = oracle.act_behavior_jax(
+        obs,
+        avail,
+        key=sub,
+        spec_kind=spec.kind,
+        spec_epsilon=eps,
+    )
     actions = {
         agent: flat[i].reshape(()).astype(jnp.int32)
         for i, agent in enumerate(ally_keys)

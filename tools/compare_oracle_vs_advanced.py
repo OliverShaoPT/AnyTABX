@@ -116,6 +116,7 @@ def worker_main(payload: dict[str, Any]) -> str:
                 max_episode_steps=int(payload["max_episode_steps"]),
                 tie_eps=tie_eps,
                 parallel_envs=payload.get("parallel_envs"),
+                train_like_sample=bool(payload.get("train_like_sample", False)),
             )
             if write_task:
                 write_coach_eval_to_task_json(
@@ -260,6 +261,14 @@ def main(argv: list[str] | None = None) -> None:
         help="Write coach_eval into each package task.json metadata.",
     )
     parser.add_argument(
+        "--train_like_sample",
+        action="store_true",
+        help=(
+            "Sample oracle actions like training (PPO categorical / Q ε "
+            "from saved checkpoint update). Default: greedy argmax."
+        ),
+    )
+    parser.add_argument(
         "--task_index",
         type=int,
         nargs="*",
@@ -319,6 +328,7 @@ def main(argv: list[str] | None = None) -> None:
                 "seed": int(args.seed),
                 "tie_eps": float(args.tie_eps),
                 "write_task_json": bool(args.write_task_json),
+                "train_like_sample": bool(args.train_like_sample),
                 "result_path": str(scratch / f"worker_{slot.worker_id:02d}.json"),
             }
         )

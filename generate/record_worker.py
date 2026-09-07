@@ -481,6 +481,7 @@ def worker_main(payload: dict[str, Any]) -> str:
     coach_eval_parallel_envs = max(
         1, int(payload.get("coach_eval_parallel_envs", 32) or 32)
     )
+    train_like_sample = bool(payload.get("oracle_train_like_sample", False))
     # Adapt needs scan path (runtime CDF). Fall back to no-adapt if scan off.
     if winrate_adapt and not scan_rollout:
         print(
@@ -502,7 +503,9 @@ def worker_main(payload: dict[str, Any]) -> str:
             ctx = contexts.get(package.name)
             if ctx is None:
                 t_setup = time.perf_counter()
-                ctx = build_record_gen_context(package)
+                ctx = build_record_gen_context(
+                    package, train_like_sample=train_like_sample
+                )
                 setup_s = time.perf_counter() - t_setup
                 if best_teacher_reference:
                     # Missing coach_eval → pre-eval oracle vs advanced, write
@@ -516,6 +519,7 @@ def worker_main(payload: dict[str, Any]) -> str:
                         max_episode_steps=coach_eval_max_episode_steps,
                         tie_eps=coach_eval_tie_eps,
                         parallel_envs=coach_eval_parallel_envs,
+                        train_like_sample=train_like_sample,
                     )
                     best_policy = str(ensure["best_policy"])
                     if ensure["wrote"]:
