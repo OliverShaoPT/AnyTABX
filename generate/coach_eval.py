@@ -41,6 +41,7 @@ TIE_PREFERENCE_RANK = {
     BEST_ORACLE_ARGMAX: 1,
     BEST_ADVANCED: 2,
 }
+THREE_WAY_KEYS = (BEST_ORACLE_ARGMAX, BEST_ORACLE_SAMPLE, BEST_ADVANCED)
 
 
 def normalize_best_policy(
@@ -99,6 +100,7 @@ __all__ = [
     "evaluate_and_write_coach_leaf",
     "evaluate_package_oracle_vs_advanced",
     "normalize_best_policy",
+    "present_three_way_blocks",
     "read_best_policy",
     "read_coach_eval",
     "resolve_best_policy",
@@ -170,6 +172,52 @@ def _oracle_act_for_best(best: str) -> str:
     if best == BEST_ORACLE_SAMPLE:
         return "sample"
     return "heuristic"
+
+
+def _block_win_rate(block: Any) -> float | None:
+    if not isinstance(block, dict) or "win_rate" not in block:
+        return None
+    try:
+        return float(block["win_rate"])
+    except (TypeError, ValueError):
+        return None
+
+
+def present_three_way_blocks(existing: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Return already-measured arms: argmax / sample / advanced.
+
+    Legacy ``oracle_pure`` fills exactly one RL arm via ``oracle_act``
+    (greedy/argmax → ``oracle_argmax``; train_like/sample → ``oracle_sample``).
+    """
+
+    if not existing:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for key, act in (
+        (BEST_ORACLE_ARGMAX, "argmax"),
+        (BEST_ORACLE_SAMPLE, "sample"),
+        (BEST_ADVANCED, "heuristic"),
+    ):
+        block = existing.get(key)
+        if _block_win_rate(block) is None:
+            continue
+        copied = dict(block)
+        copied.setdefault("act", act)
+        out[key] = copied
+
+    pure = existing.get("oracle_pure")
+    if _block_win_rate(pure) is None:
+        return out
+    act = str(existing.get("oracle_act") or "").lower()
+    if BEST_ORACLE_ARGMAX not in out and act in {"greedy", "argmax"}:
+        copied = dict(pure)
+        copied.setdefault("act", "argmax")
+        out[BEST_ORACLE_ARGMAX] = copied
+    if BEST_ORACLE_SAMPLE not in out and act in {"train_like", "sample"}:
+        copied = dict(pure)
+        copied.setdefault("act", "sample")
+        out[BEST_ORACLE_SAMPLE] = copied
+    return out
 
 
 def task_package_from_leaf(package_dir: Path) -> TaskPackage:
@@ -408,17 +456,21 @@ def evaluate_package_oracle_vs_advanced(
     parallel_envs: int | None = None,
     ctx: Any | None = None,
     train_like_sample: bool = False,
+    keep: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compare RL argmax, RL sample, and heuristic_advanced; pick ``best_policy``.
 
-    Always rolls out both RL act modes. ``train_like_sample`` is unused for
-    which groups run (kept for call-site compatibility). Pass an existing
-    ``RecordGenContext`` as ``ctx`` to reuse env/oracle (e.g. inside
-    ``record_worker`` before generate). On return, ``ctx.oracle.train_like_sample``
-    matches the winning RL mode when the winner is RL.
+    Rolls out any arm not already in ``keep`` (``oracle_argmax`` /
+    ``oracle_sample`` / ``heuristic_advanced`` with ``win_rate``).
+    ``train_like_sample`` is unused for which groups run (kept for call-site
+    compatibility). Pass an existing ``RecordGenContext`` as ``ctx`` to reuse
+    env/oracle (e.g. inside ``record_worker`` before generate). On return,
+    ``ctx.oracle.train_like_sample`` matches the winning RL mode when the
+    winner is RL.
     """
 
     del train_like_sample
+    keep_blocks = present_three_way_blocks(keep)
     if ctx is None:
         from generate.env_centric import build_record_gen_context
 
@@ -429,35 +481,57 @@ def evaluate_package_oracle_vs_advanced(
     else:
         batch = max(1, min(n, int(parallel_envs)))
 
-    ctx.oracle.train_like_sample = False
-    argmax_counts = run_policy_episodes(
-        ctx=ctx,
-        spec_dict=ORACLE_SPEC,
-        num_episodes=num_episodes,
-        seed=seed,
-        max_episode_steps=max_episode_steps,
-        parallel_envs=batch,
-    )
-    ctx.oracle.train_like_sample = True
-    sample_counts = run_policy_episodes(
-        ctx=ctx,
-        spec_dict=ORACLE_SPEC,
-        num_episodes=num_episodes,
-        seed=seed,
-        max_episode_steps=max_episode_steps,
-        parallel_envs=batch,
-    )
-    advanced_counts = run_policy_episodes(
-        ctx=ctx,
-        spec_dict=ADVANCED_SPEC,
-        num_episodes=num_episodes,
-        seed=seed + 10_000_003,
-        max_episode_steps=max_episode_steps,
-        parallel_envs=batch,
-    )
-    argmax_wr = win_rate_from_counts(argmax_counts)
-    sample_wr = win_rate_from_counts(sample_counts)
-    a_wr = win_rate_from_counts(advanced_counts)
+    filled: list[str] = []
+    if BEST_ORACLE_ARGMAX in keep_blocks:
+        argmax_block = dict(keep_blocks[BEST_ORACLE_ARGMAX])
+        argmax_wr = float(argmax_block["win_rate"])
+        argmax_block.setdefault("act", "argmax")
+    else:
+        ctx.oracle.train_like_sample = False
+        argmax_counts = run_policy_episodes(
+            ctx=ctx,
+            spec_dict=ORACLE_SPEC,
+            num_episodes=num_episodes,
+            seed=seed,
+            max_episode_steps=max_episode_steps,
+            parallel_envs=batch,
+        )
+        argmax_wr = win_rate_from_counts(argmax_counts)
+        argmax_block = _counts_with_wr(argmax_counts, argmax_wr, act="argmax")
+        filled.append(BEST_ORACLE_ARGMAX)
+    if BEST_ORACLE_SAMPLE in keep_blocks:
+        sample_block = dict(keep_blocks[BEST_ORACLE_SAMPLE])
+        sample_wr = float(sample_block["win_rate"])
+        sample_block.setdefault("act", "sample")
+    else:
+        ctx.oracle.train_like_sample = True
+        sample_counts = run_policy_episodes(
+            ctx=ctx,
+            spec_dict=ORACLE_SPEC,
+            num_episodes=num_episodes,
+            seed=seed,
+            max_episode_steps=max_episode_steps,
+            parallel_envs=batch,
+        )
+        sample_wr = win_rate_from_counts(sample_counts)
+        sample_block = _counts_with_wr(sample_counts, sample_wr, act="sample")
+        filled.append(BEST_ORACLE_SAMPLE)
+    if BEST_ADVANCED in keep_blocks:
+        advanced_block = dict(keep_blocks[BEST_ADVANCED])
+        a_wr = float(advanced_block["win_rate"])
+        advanced_block.setdefault("act", "heuristic")
+    else:
+        advanced_counts = run_policy_episodes(
+            ctx=ctx,
+            spec_dict=ADVANCED_SPEC,
+            num_episodes=num_episodes,
+            seed=seed + 10_000_003,
+            max_episode_steps=max_episode_steps,
+            parallel_envs=batch,
+        )
+        a_wr = win_rate_from_counts(advanced_counts)
+        advanced_block = _counts_with_wr(advanced_counts, a_wr, act="heuristic")
+        filled.append(BEST_ADVANCED)
     best = resolve_best_policy(
         argmax_wr=argmax_wr,
         sample_wr=sample_wr,
@@ -465,9 +539,6 @@ def evaluate_package_oracle_vs_advanced(
         tie_eps=tie_eps,
     )
     apply_oracle_act_mode(ctx.oracle, best)
-    argmax_block = _counts_with_wr(argmax_counts, argmax_wr, act="argmax")
-    sample_block = _counts_with_wr(sample_counts, sample_wr, act="sample")
-    advanced_block = _counts_with_wr(advanced_counts, a_wr, act="heuristic")
     oracle_pure = _oracle_pure_alias(
         argmax_block=argmax_block,
         sample_block=sample_block,
@@ -490,6 +561,7 @@ def evaluate_package_oracle_vs_advanced(
         "heuristic_advanced": advanced_block,
         "delta_oracle_minus_advanced": max(argmax_wr, sample_wr) - a_wr,
         "best_policy": best,
+        "filled_policies": filled,
         "train_like_sample": bool(getattr(ctx.oracle, "train_like_sample", False)),
         "train_update_steps": getattr(ctx.oracle, "train_update_steps", None),
         "train_update_source": getattr(ctx.oracle, "train_update_source", ""),
@@ -517,6 +589,9 @@ def coach_eval_for_task_metadata(eval_result: dict[str, Any]) -> dict[str, Any]:
             eval_result["delta_oracle_minus_advanced"]
         ),
         "best_policy": str(eval_result["best_policy"]),
+        "filled_policies": [
+            str(x) for x in (eval_result.get("filled_policies") or [])
+        ],
         "oracle_act": str(eval_result.get("oracle_act", "sample")),
         "train_like_sample": bool(eval_result.get("train_like_sample", False)),
         "train_update_steps": eval_result.get("train_update_steps"),
@@ -638,8 +713,11 @@ def ensure_coach_eval(
 ) -> dict[str, Any]:
     """Return ``coach_eval`` for ``package``, evaluating+writing if missing.
 
-    Used by parallel record generation when ``best_teacher_reference`` is on but
-    the coach leaf was trained without ``COACH_EVAL`` / never wrote ``coach_eval``.
+    Used by parallel record generation when ``best_teacher_reference`` is on.
+    Reuses a complete 3-way ``coach_eval``; if some of ``oracle_argmax`` /
+    ``oracle_sample`` / ``heuristic_advanced`` are missing, only those arms
+    are rolled out. Legacy ``oracle_pure`` counts as the matching RL arm when
+    ``oracle_act`` is greedy/argmax or train_like/sample.
 
     Returns a dict with:
       - ``coach_eval``: metadata block
@@ -649,7 +727,8 @@ def ensure_coach_eval(
     """
 
     existing = None if force else read_coach_eval(package)
-    if existing is not None:
+    keep = present_three_way_blocks(existing)
+    if existing is not None and all(key in keep for key in THREE_WAY_KEYS):
         best = normalize_best_policy(
             existing.get("best_policy"),
             oracle_act=existing.get("oracle_act"),
@@ -672,6 +751,7 @@ def ensure_coach_eval(
         parallel_envs=parallel_envs,
         ctx=ctx,
         train_like_sample=bool(train_like_sample),
+        keep=keep,
     )
     block = coach_eval_for_task_metadata(result)
     write_coach_eval_to_task_json(package.task_json, block)

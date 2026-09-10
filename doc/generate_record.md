@@ -85,7 +85,7 @@ python -m generate.env_centric ... --seed 0
 
 Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank manifest）。
 
-`coach_eval` 由训练结束时的 **argmax / sample / advanced** 三路评测写入（或 `tools/compare_oracle_vs_advanced.py --write_task_json`）。`best_teacher_reference=true` 且叶子缺 `coach_eval` 时，每个 worker 在该 task 首次 setup 后会 **前测并写回** `task.json`，再按胜者设置 RL 的 argmax/sample，然后进入 warmup / generate（多 worker 并行测不同 task）。
+`coach_eval` 由训练结束时的 **argmax / sample / advanced** 三路评测写入（或 `tools/compare_oracle_vs_advanced.py --write_task_json`）。`best_teacher_reference=true` 时，每个 worker 在该 task 首次 setup 后若缺某路（`oracle_argmax` / `oracle_sample` / `heuristic_advanced`）会 **只补缺的路并写回** `task.json`，再按胜者设置 RL 的 argmax/sample，然后进入 warmup / generate。三路都齐则 reuse，不重评。
 
 ### 3.2 Ally policy 采样模式
 
@@ -131,7 +131,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `adapt_pilot_records`    | 4     | 每轮试跑 record 条数（临时）                            |
 | `adapt_max_iters`        | 3     | 最多试跑/调整轮数                                     |
 | `adapt_strength_max`     | 0.7   | 强组质量上限（保留弱策略）                                 |
-| `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy`（`oracle_sample` / `oracle_argmax` / `heuristic_advanced`）；缺字段时 generate 前自动三路评测写回 |
+| `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy`（`oracle_sample` / `oracle_argmax` / `heuristic_advanced`）；缺哪路只补哪路，三路齐则 reuse |
 | `coach_eval_episodes` | 64 | 前测 / 缺字段补评时每组 episode 数（argmax、sample、advanced 各跑一轮） |
 | `coach_eval_parallel_envs` | 32 | 前测 vmap batch |
 | `oracle_train_like_sample` | true | generate 默认：`oracle_pure` **行为**与 **RL 硬标签**都按训练方式 sample。`best_teacher_reference=true` 且 teacher 为 `oracle_argmax` 时改用 greedy。`false` 改回 greedy argmax。teacher 为 RL 时另存 `actions_reference_distribution` 作 KL。`oracle_eps` mix 仍用自己的 ε。 |

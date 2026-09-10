@@ -681,7 +681,7 @@ def main(
             "If true, hard reference actions follow task.json coach_eval.best_policy "
             "(oracle_sample | oracle_argmax | heuristic_advanced); "
             "soft dist stays RL. Also steers winrate_adapt focus. "
-            "Missing coach_eval is evaluated (3-way) and written before generate."
+            "Missing 3-way arms are filled and written before generate."
         ),
     )
     parser.add_argument("--coach_eval_episodes", type=int, default=None)

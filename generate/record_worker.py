@@ -512,8 +512,8 @@ def worker_main(payload: dict[str, Any]) -> str:
                 )
                 setup_s = time.perf_counter() - t_setup
                 if best_teacher_reference:
-                    # Missing coach_eval → 3-way pre-eval (argmax / sample /
-                    # advanced), write task.json, set RL act mode, then generate.
+                    # Incomplete coach_eval → fill only missing arms (argmax /
+                    # sample / advanced), write task.json, set RL act mode.
                     ensure = ensure_coach_eval(
                         package,
                         ctx=ctx,
@@ -532,10 +532,12 @@ def worker_main(payload: dict[str, Any]) -> str:
                     if sample_wr is None:
                         sample_wr = (ev.get("oracle_pure") or {}).get("win_rate")
                     a = (ev.get("heuristic_advanced") or {}).get("win_rate")
+                    filled = ev.get("filled_policies") or []
                     if ensure["wrote"]:
                         print(
                             f"[record_worker] package={package.name}: "
                             f"wrote coach_eval best_policy={best_policy} "
+                            f"filled={filled} "
                             f"argmax_wr={argmax_wr} sample_wr={sample_wr} "
                             f"advanced_wr={a}",
                             flush=True,
@@ -550,6 +552,7 @@ def worker_main(payload: dict[str, Any]) -> str:
                                 "package_name": package.name,
                                 "best_policy": best_policy,
                                 "wrote": True,
+                                "filled_policies": filled,
                                 "argmax_wr": argmax_wr,
                                 "sample_wr": sample_wr,
                                 "oracle_wr": sample_wr,

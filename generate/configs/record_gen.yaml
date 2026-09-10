@@ -73,9 +73,9 @@ adapt_strength_max: 0.7       # max strong-group mass (≥30% weak retained)
 #       (oracle_sample | oracle_argmax | heuristic_advanced);
 #       when the teacher is RL, also write actions_reference_distribution (softmax KL);
 #       winrate_adapt oracle_focus concentrates strong mass on that best_policy.
-#       If coach_eval is missing, each worker pre-evals argmax vs sample vs
-#       advanced for that task (parallel across workers), writes task.json,
-#       then starts generate with the winner's RL act mode.
+#       If coach_eval is missing some of oracle_argmax / oracle_sample /
+#       heuristic_advanced, each worker fills only the missing arms, writes
+#       task.json, then starts generate with the winner's RL act mode.
 best_teacher_reference: false
 coach_eval_episodes: 64
 coach_eval_tie_eps: 0.02
