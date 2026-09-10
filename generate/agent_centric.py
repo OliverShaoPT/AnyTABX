@@ -240,12 +240,15 @@ def split_one_record(
                 "truncation": "1 if episode ended by hitting max_episode_steps",
                 "is_win": "1 if team 0 (ally) won on this terminal step; else 0",
                 "reference_action": (
-                    "hard label: oracle argmax by default; with "
-                    "best_teacher_reference may be heuristic_advanced"
+                    "hard label: RL sample by default (oracle_train_like_sample); "
+                    "argmax if that flag is false or best_policy is oracle_argmax; "
+                    "heuristic_advanced when best_teacher_reference picks it"
                 ),
                 "reference_action_distribution": (
-                    "always oracle RL softmax probs (T, action_dim); KL soft target "
-                    "(HVAC label_action_distribution)"
+                    "RL softmax probs (T, action_dim) for KL "
+                    "(HVAC label_action_distribution); written when the "
+                    "teacher is RL (and still written as oracle softmax if "
+                    "hard labels come from advanced)"
                 ),
                 "policy_tag": (
                     "see policy_id_mapping / policy_tag_legend; "

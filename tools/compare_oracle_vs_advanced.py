@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare ally ``oracle_pure`` vs ``heuristic_advanced`` win rates on coach packages.
+"""Compare ally RL argmax / RL sample vs ``heuristic_advanced`` on coach packages.
 
 Enemy stays the package heuristic (same ``TABXEnemyHeuristicWrapper`` path as
 record generation). Multi-GPU: one process per worker slot with
@@ -36,7 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # Bump when changing eval logic; printed at startup so you can verify the remote copy.
-SCRIPT_VERSION = "2026-08-10-coach-eval-lib"
+SCRIPT_VERSION = "2026-09-10-three-way-rl"
 
 
 def _parse_gpu_ids(value: str | None) -> list[str]:
@@ -116,7 +116,6 @@ def worker_main(payload: dict[str, Any]) -> str:
                 max_episode_steps=int(payload["max_episode_steps"]),
                 tie_eps=tie_eps,
                 parallel_envs=payload.get("parallel_envs"),
-                train_like_sample=bool(payload.get("train_like_sample", False)),
             )
             if write_task:
                 write_coach_eval_to_task_json(
@@ -182,40 +181,47 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
     ok = [r for r in rows if "error" not in r]
     err = [r for r in rows if "error" in r]
     print(
-        f"{'task':<48} {'oracle':>8} {'advanced':>8} {'delta':>8} "
-        f"{'best':>18} {'o_w/d/l':>12} {'a_w/d/l':>12}",
+        f"{'task':<48} {'argmax':>8} {'sample':>8} {'advanced':>8} {'delta':>8} "
+        f"{'best':>18} {'g_w/d/l':>12} {'s_w/d/l':>12} {'a_w/d/l':>12}",
         flush=True,
     )
-    print("-" * 130, flush=True)
+    print("-" * 160, flush=True)
     for r in sorted(ok, key=lambda x: (int(x.get("task_index", 0)), x["package_name"])):
-        o = r["oracle_pure"]
+        g = r.get("oracle_argmax") or r.get("oracle_pure") or {}
+        s = r.get("oracle_sample") or r.get("oracle_pure") or {}
         a = r["heuristic_advanced"]
         print(
             f"{r['package_name']:<48} "
-            f"{o['win_rate']:>7.1%} "
+            f"{float(g.get('win_rate', 0.0)):>7.1%} "
+            f"{float(s.get('win_rate', 0.0)):>7.1%} "
             f"{a['win_rate']:>7.1%} "
             f"{r['delta_oracle_minus_advanced']:>+7.1%} "
             f"{str(r.get('best_policy', '')):>18} "
-            f"{o['win']}/{o['draw']}/{o['loss']:>4} "
+            f"{g.get('win', 0)}/{g.get('draw', 0)}/{g.get('loss', 0):>4} "
+            f"{s.get('win', 0)}/{s.get('draw', 0)}/{s.get('loss', 0):>4} "
             f"{a['win']}/{a['draw']}/{a['loss']:>4}",
             flush=True,
         )
     if ok:
-        mean_o = sum(r["oracle_pure"]["win_rate"] for r in ok) / len(ok)
-        mean_a = sum(r["heuristic_advanced"]["win_rate"] for r in ok) / len(ok)
-        oracle_better = sum(
-            1 for r in ok if r.get("best_policy") == "oracle_pure"
-            and r["delta_oracle_minus_advanced"] > 1e-9
-        )
-        advanced_better = sum(
-            1 for r in ok if r.get("best_policy") == "heuristic_advanced"
-        )
-        print("-" * 130, flush=True)
+        def _mean(key: str) -> float:
+            vals = []
+            for r in ok:
+                block = r.get(key) or {}
+                if "win_rate" in block:
+                    vals.append(float(block["win_rate"]))
+            return sum(vals) / len(vals) if vals else 0.0
+
+        mean_g = _mean("oracle_argmax")
+        mean_s = _mean("oracle_sample")
+        mean_a = _mean("heuristic_advanced")
+        n_argmax = sum(1 for r in ok if r.get("best_policy") == "oracle_argmax")
+        n_sample = sum(1 for r in ok if r.get("best_policy") == "oracle_sample")
+        n_adv = sum(1 for r in ok if r.get("best_policy") == "heuristic_advanced")
+        print("-" * 160, flush=True)
         print(
             f"[compare_oracle] tasks={len(ok)} "
-            f"mean oracle={mean_o:.1%} mean advanced={mean_a:.1%} "
-            f"delta={mean_o - mean_a:+.1%} "
-            f"(best_oracle={oracle_better} best_advanced={advanced_better})",
+            f"mean argmax={mean_g:.1%} sample={mean_s:.1%} advanced={mean_a:.1%} "
+            f"(best_argmax={n_argmax} best_sample={n_sample} best_advanced={n_adv})",
             flush=True,
         )
     if err:
@@ -226,7 +232,10 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Compare oracle_pure vs heuristic_advanced win rates on coach_root."
+        description=(
+            "Compare RL argmax, RL sample, and heuristic_advanced win rates "
+            "on coach_root; pick one of three by win rate."
+        )
     )
     parser.add_argument("--coach_root", type=Path, required=True)
     parser.add_argument(
@@ -264,8 +273,7 @@ def main(argv: list[str] | None = None) -> None:
         "--train_like_sample",
         action="store_true",
         help=(
-            "Sample oracle actions like training (PPO categorical / Q ε "
-            "from saved checkpoint update). Default: greedy argmax."
+            "Deprecated/ignored: eval always runs RL argmax and RL sample."
         ),
     )
     parser.add_argument(
@@ -328,7 +336,6 @@ def main(argv: list[str] | None = None) -> None:
                 "seed": int(args.seed),
                 "tie_eps": float(args.tie_eps),
                 "write_task_json": bool(args.write_task_json),
-                "train_like_sample": bool(args.train_like_sample),
                 "result_path": str(scratch / f"worker_{slot.worker_id:02d}.json"),
             }
         )

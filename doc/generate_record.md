@@ -32,11 +32,13 @@
 
 Generate record **只需要** `coach_root`：递归发现上述叶子，每个子文件夹对应一个环境。
 
-训练结束（`marl_baseline`，`COACH_EVAL=true` 默认开）会在该叶子 `task.json` 的 `tasks[0].metadata.coach_eval` 写入 `oracle_pure` / `heuristic_advanced` 胜率与 `best_policy`。评测默认 greedy argmax；`COACH_EVAL_TRAIN_LIKE_SAMPLE=true` 则与训练采集同分布（同时写入 `checkpoint_meta.json` 供事后反推 ε）。评测用 `vmap` 并行 episode（默认 `COACH_EVAL_PARALLEL_ENVS=32`）。也可事后跑：
+训练结束（`marl_baseline`，`COACH_EVAL=true` 默认开）会在该叶子 `task.json` 的 `tasks[0].metadata.coach_eval` 写入三组胜率：`oracle_argmax`、`oracle_sample`（PPO categorical / Q ε-greedy）、`heuristic_advanced`，并按胜率 **三选一** 写入 `best_policy`（并列时优先 sample > argmax > advanced，容差 `COACH_EVAL_TIE_EPS`）。评测用 `vmap` 并行 episode（默认 `COACH_EVAL_PARALLEL_ENVS=32`）。也可事后跑：
 
 ```bash
 python tools/compare_oracle_vs_advanced.py --coach_root ... --write_task_json --parallel_envs 32
 ```
+
+旧 `best_policy=oracle_pure` 读入时：若当时 `oracle_act` 是 greedy/argmax 则当作 `oracle_argmax`，否则当作 `oracle_sample`。
 
 ```bash
 # 编辑 generate/configs/record_gen.yaml 里的 coach_root，然后：
@@ -46,8 +48,6 @@ python tools/compare_oracle_vs_advanced.py --coach_root ... --write_task_json --
 旧版「先 pack 再生成」仍可用：提供 `task_bank` + `ckpt_root`，并在空的 `coach_root`/`task_packages_root` 下自动打包（`python -m generate.pack_task_packages`）。
 
 ---
-
-
 
 ## 3. Step 1：Env-centric
 
@@ -78,14 +78,14 @@ python -m generate.env_centric ... --seed 0
 
 | 序列                               | 含义                                                                                                                                                      |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `actions_behavior`               | 行为策略动作，**进入** `env.step`                                                                                                                                |
-| `actions_reference`              | 同一 obs 上硬标签：默认 **oracle argmax**；`best_teacher_reference=true` 时用 `task.json` → `metadata.coach_eval.best_policy`（`oracle_pure` 或 `heuristic_advanced`） |
-| `actions_reference_distribution` | **始终** oracle RL 的 soft 分布 `(T, n_ally, A)`，供 KL（HVAC `label_action_distribution`）                                                                      |
+| `actions_behavior`               | 行为策略动作，**进入** `env.step`。`oracle_pure` 默认按训练方式 **sample**（PPO categorical；可用 `oracle_train_like_sample=false` 改回 argmax）。`best_teacher_reference=true` 且 teacher 为 `oracle_argmax` 时，RL 行为与硬标签都用 argmax |
+| `actions_reference`              | 同一 obs 上硬标签：默认 RL **sample**；`best_teacher_reference=true` 时跟 `coach_eval.best_policy`（`oracle_sample` / `oracle_argmax` / `heuristic_advanced`） |
+| `actions_reference_distribution` | teacher 为 RL 时写入的 soft 分布 `(T, n_ally, A)`，供 KL（HVAC `label_action_distribution`）；hard label 是 sample 时仍保存该分布 |
 
 
 Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank manifest）。
 
-`coach_eval` 由训练结束时的 oracle vs advanced 评测写入（或 `tools/compare_oracle_vs_advanced.py --write_task_json`）。`best_teacher_reference=true` 且叶子缺 `coach_eval` 时，每个 worker 在该 task 首次 setup 后会 **前测并写回** `task.json`，再进入 warmup / generate（多 worker 并行测不同 task）。
+`coach_eval` 由训练结束时的 **argmax / sample / advanced** 三路评测写入（或 `tools/compare_oracle_vs_advanced.py --write_task_json`）。`best_teacher_reference=true` 且叶子缺 `coach_eval` 时，每个 worker 在该 task 首次 setup 后会 **前测并写回** `task.json`，再按胜者设置 RL 的 argmax/sample，然后进入 warmup / generate（多 worker 并行测不同 task）。
 
 ### 3.2 Ally policy 采样模式
 
@@ -131,10 +131,10 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `adapt_pilot_records`    | 4     | 每轮试跑 record 条数（临时）                            |
 | `adapt_max_iters`        | 3     | 最多试跑/调整轮数                                     |
 | `adapt_strength_max`     | 0.7   | 强组质量上限（保留弱策略）                                 |
-| `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy`；缺字段时 generate 前自动评测写回 |
-| `coach_eval_episodes` | 64 | 前测 / 缺字段补评时每策略 episode 数 |
+| `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy`（`oracle_sample` / `oracle_argmax` / `heuristic_advanced`）；缺字段时 generate 前自动三路评测写回 |
+| `coach_eval_episodes` | 64 | 前测 / 缺字段补评时每组 episode 数（argmax、sample、advanced 各跑一轮） |
 | `coach_eval_parallel_envs` | 32 | 前测 vmap batch |
-| `oracle_train_like_sample` | false | `true` 时 `oracle_pure` / coach_eval 与训练采集同分布：PPO 对 logits 做 categorical sample（旧 MAPPO/IPPO 叶子只需 `config.json` + actor 权重，不依赖 `checkpoint_meta.json`）；Q 用 checkpoint 保存时的 ε-greedy。ε 由 `checkpoint_meta.json` 的 `best_update_steps`/`final_update_steps` 反推（缺文件则读 `training_metrics.csv`，再退回 `total_updates` → `EPS_FINISH`）。`oracle_eps` mix 仍用自己的 ε。硬标签 `actions_reference` 仍是 argmax。 |
+| `oracle_train_like_sample` | true | generate 默认：`oracle_pure` **行为**与 **RL 硬标签**都按训练方式 sample。`best_teacher_reference=true` 且 teacher 为 `oracle_argmax` 时改用 greedy。`false` 改回 greedy argmax。teacher 为 RL 时另存 `actions_reference_distribution` 作 KL。`oracle_eps` mix 仍用自己的 ε。 |
 
 
 与 `independent_ally_policies=true` 兼容：adapt 仍只改共享 CDF，从而抬高每个 ally 抽到强策略的概率。
@@ -165,8 +165,8 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 {output_root}/task_{index:05d}_{task_id}/record-{id:06d}/
   meta.json
   actions_behavior.npy      # (T, n_ally)
-  actions_reference.npy     # (T, n_ally) hard argmax
-  actions_reference_distribution.npy  # (T, n_ally, A) oracle softmax
+  actions_reference.npy     # (T, n_ally) RL sample (or heuristic if best teacher)
+  actions_reference_distribution.npy  # (T, n_ally, A) RL softmax for KL
   reward_team.npy           # (T, n_ally) team 广播标量
   reward_individual.npy     # (T, n_ally) 消融用 hybrid
   done.npy, truncation.npy, is_win.npy
@@ -293,8 +293,8 @@ record-XXXXXX/agent_centric/{ally_key}/
   obs_dynamic.npy
   obs_dynamic_mask.npy
   behavior_action.npy
-  reference_action.npy                 # hard argmax of oracle
-  reference_action_distribution.npy    # (T, A) oracle softmax; KL soft target
+  reference_action.npy                 # RL sample (default)
+  reference_action_distribution.npy    # (T, A) RL softmax; KL soft target
   reward_team.npy
   reward_individual.npy
   done.npy

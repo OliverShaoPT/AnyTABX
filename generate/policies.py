@@ -9,6 +9,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from generate.coach_eval import (
+    BEST_ADVANCED,
+    BEST_ORACLE,
+    BEST_ORACLE_ARGMAX,
+    BEST_ORACLE_SAMPLE,
+    apply_oracle_act_mode,
+    normalize_best_policy,
+    train_like_from_best_policy,
+)
 from generate.behavior_mix import BehaviorSpec
 from generate.oracle_loader import OracleCoach
 from src.tabx.eval_task import load_heuristic_params
@@ -27,10 +36,26 @@ __all__ = [
     "act_shared_jax",
     "stack_agent_obs",
     "stack_agent_avail",
+    "is_rl_teacher",
+    "reference_hard_kind",
+    "normalize_best_policy",
+    "train_like_from_best_policy",
+    "apply_oracle_act_mode",
+    "BEST_ORACLE",
+    "BEST_ORACLE_ARGMAX",
+    "BEST_ORACLE_SAMPLE",
+    "BEST_ADVANCED",
 ]
 
-BEST_ORACLE = "oracle_pure"
-BEST_ADVANCED = "heuristic_advanced"
+
+def is_rl_teacher(best_policy: str) -> bool:
+    return normalize_best_policy(best_policy) != BEST_ADVANCED
+
+
+def reference_hard_kind(oracle: OracleCoach, best_policy: str) -> str:
+    if not is_rl_teacher(best_policy):
+        return "heuristic"
+    return "sample" if oracle.train_like_sample else "argmax"
 
 
 @dataclass
@@ -137,13 +162,23 @@ def reference_labels_jax(
     obs_by_agent: dict[str, Any],
     avail_by_agent: dict[str, Any],
     ally_keys: list[str],
+    key: jax.Array | None = None,
 ) -> tuple[dict[str, jax.Array], jax.Array]:
-    """Hard + soft oracle labels on-device (no host sync)."""
+    """Hard + soft oracle labels on-device (no host sync).
+
+    Soft ``dist`` is always RL softmax (KL target). Hard actions follow
+    ``oracle.train_like_sample``: categorical / train-ε when true, else argmax.
+    """
 
     obs = stack_agent_obs(obs_by_agent, ally_keys)
     avail = stack_agent_avail(avail_by_agent, ally_keys)
     dist = oracle.action_distribution_jax(obs, avail)
-    flat = jnp.argmax(dist, axis=-1).astype(jnp.int32)
+    if oracle.train_like_sample:
+        if key is None:
+            raise ValueError("key is required when oracle.train_like_sample is true")
+        flat = oracle.act_jax(obs, avail, key=key, train_like=True)
+    else:
+        flat = jnp.argmax(dist, axis=-1).astype(jnp.int32)
     actions = {
         agent: flat[i].reshape(()).astype(jnp.int32)
         for i, agent in enumerate(ally_keys)
@@ -157,6 +192,7 @@ def reference_labels(
     obs_by_agent: dict[str, Any],
     avail_by_agent: dict[str, Any],
     ally_keys: list[str],
+    key: jax.Array | None = None,
 ) -> tuple[dict[str, jnp.ndarray], np.ndarray]:
     """Hard + soft oracle labels from one forward pass.
 
@@ -170,6 +206,7 @@ def reference_labels(
         obs_by_agent=obs_by_agent,
         avail_by_agent=avail_by_agent,
         ally_keys=ally_keys,
+        key=key,
     )
     return actions, np.asarray(dist, dtype=np.float32)
 
@@ -225,13 +262,15 @@ def reference_labels_best_teacher_jax(
       actions, distribution (n_ally, A), updated ref_last_visible, key
     """
 
+    key, ref_key = jax.random.split(key)
     oracle_actions, dist = reference_labels_jax(
         oracle,
         obs_by_agent=obs_by_agent,
         avail_by_agent=avail_by_agent,
         ally_keys=ally_keys,
+        key=ref_key,
     )
-    if str(best_policy) != BEST_ADVANCED:
+    if is_rl_teacher(best_policy):
         return oracle_actions, dist, ref_last_visible, key
     if advanced_params is None:
         raise ValueError("advanced_params required when best_policy is heuristic_advanced")
@@ -349,9 +388,9 @@ def reference_actions(
     avail_by_agent: dict[str, Any],
     ally_keys: list[str],
 ) -> dict[str, jnp.ndarray]:
-    del key  # greedy reference; kept for call-site compatibility
     actions, _ = reference_labels(
         oracle,
+        key=key,
         obs_by_agent=obs_by_agent,
         avail_by_agent=avail_by_agent,
         ally_keys=ally_keys,

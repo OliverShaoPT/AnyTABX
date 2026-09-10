@@ -27,9 +27,10 @@ from generate.behavior_mix import (
 from generate.dump_schema import ensure_dir, write_env_centric_record
 from generate.oracle_loader import OracleCoach, load_oracle_coach
 from generate.policies import (
-    BEST_ADVANCED,
     BEST_ORACLE,
     SharedAllyPolicy,
+    is_rl_teacher,
+    reference_hard_kind,
     reference_labels,
     reference_labels_best_teacher,
 )
@@ -148,7 +149,7 @@ def build_env_and_params(package: TaskPackage):
 def build_record_gen_context(
     package: TaskPackage,
     *,
-    train_like_sample: bool = False,
+    train_like_sample: bool = True,
 ) -> RecordGenContext:
     """Build env + oracle once; reuse across records for the same package."""
 
@@ -217,7 +218,7 @@ def warmup_record_gen_context(
         )
         for _ in range(n_steps):
             avail = env.get_avail_actions(state)
-            key, bkey, skey = jax.random.split(key, 3)
+            key, bkey, skey, rkey = jax.random.split(key, 4)
             behavior = shared.act(
                 key=bkey,
                 obs_by_agent=obs,
@@ -227,6 +228,7 @@ def warmup_record_gen_context(
             )
             _ = reference_labels(
                 oracle,
+                key=rkey,
                 obs_by_agent=obs,
                 avail_by_agent=avail,
                 ally_keys=ally_keys,
@@ -337,7 +339,7 @@ def generate_one_record(
     # heuristic_policy parses obs with total unit count (allies + enemies).
     n_units_total = len(unit_keys)
     advanced_params = (
-        load_heuristic_params("advanced") if teacher == BEST_ADVANCED else None
+        load_heuristic_params("advanced") if not is_rl_teacher(teacher) else None
     )
     ref_last_visible = {agent: LastVisibleTarget() for agent in ally_keys}
 
@@ -654,6 +656,9 @@ def generate_one_record(
         "n_episodes_seen": int(episode_id + 1),
         "scan_rollout": False,
         "switcher_rng": "numpy",
+        "oracle_train_like_sample": bool(oracle.train_like_sample),
+        "reference_hard": reference_hard_kind(oracle, teacher),
+        "has_reference_kl_distribution": bool(is_rl_teacher(teacher)),
     }
     if dump_attack_target:
         meta["schema"] = "env_centric_v1_comm"

@@ -68,21 +68,25 @@ adapt_max_iters: 3
 adapt_strength_max: 0.7       # max strong-group mass (≥30% weak retained)
 
 # --- Best teacher reference (reads tasks[0].metadata.coach_eval from task.json) ---
-# false (default): hard reference = oracle argmax; adapt focus → oracle_pure.
-# true: hard reference = coach_eval.best_policy (oracle_pure | heuristic_advanced);
-#       soft actions_reference_distribution always stays RL softmax;
+# false (default): hard reference = RL oracle (sample by default); adapt focus → oracle_pure.
+# true: hard reference = coach_eval.best_policy
+#       (oracle_sample | oracle_argmax | heuristic_advanced);
+#       when the teacher is RL, also write actions_reference_distribution (softmax KL);
 #       winrate_adapt oracle_focus concentrates strong mass on that best_policy.
-#       If coach_eval is missing, each worker pre-evals oracle vs advanced for that
-#       task (parallel across workers), writes task.json, then starts generate.
+#       If coach_eval is missing, each worker pre-evals argmax vs sample vs
+#       advanced for that task (parallel across workers), writes task.json,
+#       then starts generate with the winner's RL act mode.
 best_teacher_reference: false
 coach_eval_episodes: 64
 coach_eval_tie_eps: 0.02
 coach_eval_max_episode_steps: 512
 coach_eval_parallel_envs: 32
-# If true, oracle_pure / coach_eval sample like training (PPO categorical;
-# Q ε-greedy with ε reconstructed from checkpoint_meta.json training update).
-# Default false keeps greedy argmax. oracle_eps mix entries keep their own ε.
-oracle_train_like_sample: false
+# RL oracle_pure behavior + RL hard labels: sample like training (PPO
+# categorical; Q ε-greedy from saved update). Default true. Set false for
+# greedy argmax. When best_teacher_reference picks oracle_argmax, generate
+# overrides this to greedy for that task. oracle_eps mix entries keep
+# their own ε.
+oracle_train_like_sample: true
 
 # Comm dump: write game_manager.attack_target.npy (env_centric_v1_comm).
 # Default false keeps the old record schema. python -m generate.env_centric_comm

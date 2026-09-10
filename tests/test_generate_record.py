@@ -448,6 +448,17 @@ class WinrateAdaptTest(unittest.TestCase):
         self.assertAlmostEqual(focused_w["oracle_eps0.1"], 0.0, places=5)
         self.assertGreater(focused_w["oracle_eps0.3"], 0.0)
 
+    def test_focus_policy_oracle_argmax_concentrates_rl(self) -> None:
+        focused = reweight_mix(
+            DEFAULT_BEHAVIOR_MIX,
+            0.7,
+            oracle_focus=1.0,
+            focus_policy="oracle_argmax",
+        )
+        focused_w = {s.name: s.weight for s in focused}
+        self.assertAlmostEqual(focused_w["oracle_pure"], 0.7, places=5)
+        self.assertAlmostEqual(focused_w["heuristic_advanced"], 0.0, places=5)
+
     def test_win_rate_max_none_skips_upper_bound(self) -> None:
         self.assertTrue(in_win_rate_band(0.95, win_rate_min=0.3, win_rate_max=None))
         self.assertFalse(in_win_rate_band(0.95, win_rate_min=0.3, win_rate_max=0.7))

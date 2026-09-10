@@ -49,7 +49,7 @@ def _matches_focus_policy(spec: BehaviorSpec, focus_policy: str) -> bool:
     focus = str(focus_policy or "oracle_pure")
     if focus == "heuristic_advanced":
         return spec.kind == "heuristic" and str(spec.heuristic or "") == "advanced"
-    # Default / oracle_pure
+    # oracle_pure / oracle_argmax / oracle_sample all focus the RL mix entry.
     return spec.kind == "oracle"
 
 
@@ -82,7 +82,7 @@ def reweight_mix(
 
     - ``strength`` is clipped to ``[0, strength_max]`` (default max 0.7 ⇒ ≥30% weak).
     - ``oracle_focus`` in ``[0, 1]``: 0 keeps relative strong weights; 1 puts all
-      strong mass on ``focus_policy`` (``oracle_pure`` or ``heuristic_advanced``).
+      strong mass on ``focus_policy`` (RL ``oracle_*`` or ``heuristic_advanced``).
     """
 
     s_max = float(np.clip(strength_max, 0.0, 1.0))

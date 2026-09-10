@@ -70,15 +70,16 @@ class MARLConfig:
     WORLD_STATE_TYPE: Literal["concat", "global"] = "global"
     POSITION_PERMUTATION: bool = False
     FLIP: bool = False
-    # Post-train oracle_pure vs heuristic_advanced eval → task.json metadata.coach_eval
+    # Post-train 3-way eval (RL argmax, RL sample, heuristic_advanced) →
+    # task.json metadata.coach_eval. Always runs both RL act modes.
     COACH_EVAL: bool = True
     COACH_EVAL_EPISODES: int = 64
     COACH_EVAL_TIE_EPS: float = 0.02
     COACH_EVAL_MAX_EPISODE_STEPS: int = 512
     # vmap batch width for coach_eval episodes (capped by COACH_EVAL_EPISODES).
     COACH_EVAL_PARALLEL_ENVS: int = 32
-    # If true, coach_eval / later oracle_pure use the same action sample as
-    # training (PPO: categorical; Q: ε-greedy at the saved checkpoint update).
+    # Unused by the 3-way coach_eval (both RL modes always run). Kept so old
+    # configs still parse. Generate uses generate.oracle_train_like_sample.
     COACH_EVAL_TRAIN_LIKE_SAMPLE: bool = False
     # Shared optimization
     LR: float = 4e-4
@@ -594,10 +595,20 @@ class BaseMARLTrainer(ABC):
                             self.config.COACH_EVAL_TRAIN_LIKE_SAMPLE
                         ),
                     )
+                    argmax_wr = float(
+                        (eval_result.get("oracle_argmax") or {}).get(
+                            "win_rate", 0.0
+                        )
+                    )
+                    sample_wr = float(
+                        (eval_result.get("oracle_sample") or {}).get(
+                            "win_rate", 0.0
+                        )
+                    )
                     print(
                         f"[coach_eval] wrote task.json metadata.coach_eval "
                         f"best_policy={eval_result.get('best_policy')} "
-                        f"oracle={eval_result['oracle_pure']['win_rate']:.3f} "
+                        f"argmax={argmax_wr:.3f} sample={sample_wr:.3f} "
                         f"advanced={eval_result['heuristic_advanced']['win_rate']:.3f}",
                         flush=True,
                     )

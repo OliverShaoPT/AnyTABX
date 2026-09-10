@@ -97,7 +97,8 @@ class ProgressTracker:
                 f"[parallel_records] coach_eval worker={event.get('worker_id')} "
                 f"pkg={event.get('package_name')} "
                 f"best_policy={event.get('best_policy')} "
-                f"oracle_wr={event.get('oracle_wr')} "
+                f"argmax_wr={event.get('argmax_wr')} "
+                f"sample_wr={event.get('sample_wr')} "
                 f"advanced_wr={event.get('advanced_wr')} "
                 f"wrote={event.get('wrote')}",
                 flush=True,

@@ -26,9 +26,10 @@ from generate.dump_schema import write_env_centric_record
 from generate.env_centric import RecordGenContext, sample_record_seed
 from generate.oracle_loader import OracleCoach
 from generate.policies import (
-    BEST_ADVANCED,
     BEST_ORACLE,
     act_shared_jax,
+    is_rl_teacher,
+    reference_hard_kind,
     reference_labels_best_teacher_jax,
 )
 from generate.task_package import TaskPackage
@@ -218,7 +219,7 @@ def _make_single_env_rollout(
     best_policy = str(best_teacher_policy or BEST_ORACLE)
     include_attack_target = bool(dump_attack_target)
     advanced_params = (
-        load_heuristic_params("advanced") if best_policy == BEST_ADVANCED else None
+        load_heuristic_params("advanced") if not is_rl_teacher(best_policy) else None
     )
     # Map mix position -> policy_id / quality tag (usually identity, but honor config).
     policy_ids = jnp.asarray([int(s.policy_id) for s in mix], dtype=jnp.int32)
@@ -656,6 +657,9 @@ def _record_meta(
         "scan_rollout": True,
         "switcher_rng": "jax",
         "parallel_envs": int(parallel_envs),
+        "oracle_train_like_sample": bool(ctx.oracle.train_like_sample),
+        "reference_hard": reference_hard_kind(ctx.oracle, best_policy),
+        "has_reference_kl_distribution": bool(is_rl_teacher(best_policy)),
     }
     if "attack_target" in arrays:
         meta["schema"] = "env_centric_v1_comm"

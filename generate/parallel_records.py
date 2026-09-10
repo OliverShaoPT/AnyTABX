@@ -277,7 +277,7 @@ def plan_jobs(
     coach_eval_max_episode_steps: int = 512,
     coach_eval_parallel_envs: int = 32,
     dump_attack_target: bool = False,
-    oracle_train_like_sample: bool = False,
+    oracle_train_like_sample: bool = True,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -463,7 +463,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         ),
         dump_attack_target=bool(config.get("dump_attack_target", False)),
         oracle_train_like_sample=bool(
-            config.get("oracle_train_like_sample", False)
+            config.get("oracle_train_like_sample", True)
         ),
     )
 
@@ -477,7 +477,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"best_teacher_reference={config.get('best_teacher_reference', False)} "
         f"coach_eval_episodes={config.get('coach_eval_episodes', 64)} "
         f"dump_attack_target={config.get('dump_attack_target', False)} "
-        f"oracle_train_like_sample={config.get('oracle_train_like_sample', False)} "
+        f"oracle_train_like_sample={config.get('oracle_train_like_sample', True)} "
         f"independent_ally_policies={config.get('independent_ally_policies', False)} "
         f"mid_episode_policy_switch={config.get('mid_episode_policy_switch', True)} "
         f"win_rate_min={config.get('win_rate_min', 0.30)} "
@@ -678,9 +678,10 @@ def main(
         choices=("true", "false"),
         default=None,
         help=(
-            "If true, hard reference actions follow task.json coach_eval.best_policy; "
+            "If true, hard reference actions follow task.json coach_eval.best_policy "
+            "(oracle_sample | oracle_argmax | heuristic_advanced); "
             "soft dist stays RL. Also steers winrate_adapt focus. "
-            "Missing coach_eval is evaluated and written before generate."
+            "Missing coach_eval is evaluated (3-way) and written before generate."
         ),
     )
     parser.add_argument("--coach_eval_episodes", type=int, default=None)
@@ -703,8 +704,9 @@ def main(
         choices=("true", "false"),
         default=None,
         help=(
-            "If true, oracle_pure matches training action sample "
-            "(PPO categorical / Q ε at saved update). Default greedy argmax."
+            "If true (default), oracle_pure behavior and RL hard labels "
+            "sample like training (PPO categorical / Q ε at saved update). "
+            "false = greedy argmax."
         ),
     )
     parser.add_argument(

@@ -10,7 +10,10 @@ from pathlib import Path
 from generate.coach_eval import (
     BEST_ADVANCED,
     BEST_ORACLE,
+    BEST_ORACLE_ARGMAX,
+    BEST_ORACLE_SAMPLE,
     coach_eval_for_task_metadata,
+    normalize_best_policy,
     resolve_best_policy,
     write_coach_eval_to_task_json,
     read_best_policy,
@@ -19,36 +22,102 @@ from generate.coach_eval import (
 
 
 class ResolveBestPolicyTest(unittest.TestCase):
-    def test_oracle_wins(self) -> None:
+    def test_sample_wins(self) -> None:
         self.assertEqual(
-            resolve_best_policy(oracle_wr=0.6, advanced_wr=0.4, tie_eps=0.02),
-            BEST_ORACLE,
+            resolve_best_policy(
+                argmax_wr=0.4, sample_wr=0.6, advanced_wr=0.4, tie_eps=0.02
+            ),
+            BEST_ORACLE_SAMPLE,
+        )
+
+    def test_argmax_wins(self) -> None:
+        self.assertEqual(
+            resolve_best_policy(
+                argmax_wr=0.7, sample_wr=0.4, advanced_wr=0.4, tie_eps=0.02
+            ),
+            BEST_ORACLE_ARGMAX,
         )
 
     def test_advanced_wins(self) -> None:
         self.assertEqual(
-            resolve_best_policy(oracle_wr=0.3, advanced_wr=0.55, tie_eps=0.02),
+            resolve_best_policy(
+                argmax_wr=0.3, sample_wr=0.3, advanced_wr=0.55, tie_eps=0.02
+            ),
             BEST_ADVANCED,
         )
 
-    def test_tie_prefers_oracle(self) -> None:
+    def test_tie_prefers_sample_over_argmax_and_advanced(self) -> None:
         self.assertEqual(
-            resolve_best_policy(oracle_wr=0.50, advanced_wr=0.50, tie_eps=0.02),
-            BEST_ORACLE,
+            resolve_best_policy(
+                argmax_wr=0.50, sample_wr=0.50, advanced_wr=0.50, tie_eps=0.02
+            ),
+            BEST_ORACLE_SAMPLE,
         )
         self.assertEqual(
-            resolve_best_policy(oracle_wr=0.51, advanced_wr=0.50, tie_eps=0.02),
-            BEST_ORACLE,
+            resolve_best_policy(
+                argmax_wr=0.51, sample_wr=0.50, advanced_wr=0.50, tie_eps=0.02
+            ),
+            BEST_ORACLE_SAMPLE,
         )
         self.assertEqual(
-            resolve_best_policy(oracle_wr=0.49, advanced_wr=0.50, tie_eps=0.02),
-            BEST_ORACLE,
+            resolve_best_policy(
+                argmax_wr=0.50, sample_wr=0.49, advanced_wr=0.50, tie_eps=0.02
+            ),
+            BEST_ORACLE_SAMPLE,
         )
 
-    def test_just_outside_tie_eps(self) -> None:
+    def test_just_outside_tie_eps_picks_clear_leader(self) -> None:
         self.assertEqual(
-            resolve_best_policy(oracle_wr=0.47, advanced_wr=0.50, tie_eps=0.02),
+            resolve_best_policy(
+                argmax_wr=0.47, sample_wr=0.47, advanced_wr=0.50, tie_eps=0.02
+            ),
             BEST_ADVANCED,
+        )
+        self.assertEqual(
+            resolve_best_policy(
+                argmax_wr=0.53, sample_wr=0.50, advanced_wr=0.50, tie_eps=0.02
+            ),
+            BEST_ORACLE_ARGMAX,
+        )
+
+
+class NormalizeBestPolicyTest(unittest.TestCase):
+    def test_passthrough(self) -> None:
+        self.assertEqual(normalize_best_policy(BEST_ORACLE_SAMPLE), BEST_ORACLE_SAMPLE)
+        self.assertEqual(normalize_best_policy(BEST_ORACLE_ARGMAX), BEST_ORACLE_ARGMAX)
+        self.assertEqual(normalize_best_policy(BEST_ADVANCED), BEST_ADVANCED)
+
+    def test_legacy_oracle_pure(self) -> None:
+        self.assertEqual(
+            normalize_best_policy(BEST_ORACLE, oracle_act="greedy"),
+            BEST_ORACLE_ARGMAX,
+        )
+        self.assertEqual(
+            normalize_best_policy(BEST_ORACLE, oracle_act="argmax"),
+            BEST_ORACLE_ARGMAX,
+        )
+        self.assertEqual(
+            normalize_best_policy(BEST_ORACLE, oracle_act="train_like"),
+            BEST_ORACLE_SAMPLE,
+        )
+        self.assertEqual(
+            normalize_best_policy(BEST_ORACLE),
+            BEST_ORACLE_SAMPLE,
+        )
+
+
+class TrainLikeFromBestPolicyTest(unittest.TestCase):
+    def test_modes(self) -> None:
+        from generate.coach_eval import train_like_from_best_policy
+
+        self.assertTrue(train_like_from_best_policy(BEST_ORACLE_SAMPLE))
+        self.assertFalse(train_like_from_best_policy(BEST_ORACLE_ARGMAX))
+        self.assertIsNone(train_like_from_best_policy(BEST_ADVANCED))
+        self.assertTrue(train_like_from_best_policy(BEST_ORACLE))
+        self.assertFalse(
+            train_like_from_best_policy(
+                normalize_best_policy(BEST_ORACLE, oracle_act="greedy")
+            )
         )
 
 
@@ -75,6 +144,24 @@ class WriteCoachEvalTest(unittest.TestCase):
                 "parallel_envs": 8,
                 "seed": 1,
                 "tie_eps": 0.02,
+                "oracle_argmax": {
+                    "win": 3,
+                    "draw": 0,
+                    "loss": 5,
+                    "episodes": 8,
+                    "truncated": 0,
+                    "win_rate": 0.375,
+                    "act": "argmax",
+                },
+                "oracle_sample": {
+                    "win": 2,
+                    "draw": 0,
+                    "loss": 6,
+                    "episodes": 8,
+                    "truncated": 0,
+                    "win_rate": 0.25,
+                    "act": "sample",
+                },
                 "oracle_pure": {
                     "win": 3,
                     "draw": 0,
@@ -82,6 +169,7 @@ class WriteCoachEvalTest(unittest.TestCase):
                     "episodes": 8,
                     "truncated": 0,
                     "win_rate": 0.375,
+                    "act": "argmax",
                 },
                 "heuristic_advanced": {
                     "win": 6,
@@ -90,9 +178,11 @@ class WriteCoachEvalTest(unittest.TestCase):
                     "episodes": 8,
                     "truncated": 0,
                     "win_rate": 0.75,
+                    "act": "heuristic",
                 },
                 "delta_oracle_minus_advanced": 0.375 - 0.75,
                 "best_policy": BEST_ADVANCED,
+                "oracle_act": "heuristic",
             }
             write_coach_eval_to_task_json(
                 path, coach_eval_for_task_metadata(eval_result)
@@ -101,13 +191,36 @@ class WriteCoachEvalTest(unittest.TestCase):
             self.assertIsNotNone(block)
             assert block is not None
             self.assertEqual(block["best_policy"], BEST_ADVANCED)
-            self.assertAlmostEqual(block["oracle_pure"]["win_rate"], 0.375)
+            self.assertAlmostEqual(block["oracle_argmax"]["win_rate"], 0.375)
+            self.assertAlmostEqual(block["oracle_sample"]["win_rate"], 0.25)
             self.assertEqual(read_best_policy(path), BEST_ADVANCED)
-            # Other metadata preserved.
             reloaded = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
                 reloaded["tasks"][0]["metadata"]["composition_archetype"], "balanced"
             )
+
+    def test_legacy_oracle_pure_greedy_reads_as_argmax(self) -> None:
+        bank = {
+            "schema_version": "1.0",
+            "manifest": {},
+            "tasks": [
+                {
+                    "task_id": "t0",
+                    "metadata": {
+                        "coach_eval": {
+                            "best_policy": BEST_ORACLE,
+                            "oracle_act": "greedy",
+                            "oracle_pure": {"win_rate": 0.6},
+                            "heuristic_advanced": {"win_rate": 0.4},
+                        }
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "task.json"
+            path.write_text(json.dumps(bank), encoding="utf-8")
+            self.assertEqual(read_best_policy(path), BEST_ORACLE_ARGMAX)
 
 
 class EnsureCoachEvalTest(unittest.TestCase):

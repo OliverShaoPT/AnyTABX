@@ -463,7 +463,11 @@ def worker_main(payload: dict[str, Any]) -> str:
     )
     from generate.task_package import discover_task_packages
 
-    from generate.coach_eval import BEST_ORACLE, ensure_coach_eval
+    from generate.coach_eval import (
+        BEST_ORACLE,
+        apply_oracle_act_mode,
+        ensure_coach_eval,
+    )
 
     packages = {p.name: p for p in discover_task_packages(payload["packages_root"])}
     base_mix = behavior_mix_from_config(payload.get("behavior_mix"))
@@ -481,7 +485,7 @@ def worker_main(payload: dict[str, Any]) -> str:
     coach_eval_parallel_envs = max(
         1, int(payload.get("coach_eval_parallel_envs", 32) or 32)
     )
-    train_like_sample = bool(payload.get("oracle_train_like_sample", False))
+    train_like_sample = bool(payload.get("oracle_train_like_sample", True))
     # Adapt needs scan path (runtime CDF). Fall back to no-adapt if scan off.
     if winrate_adapt and not scan_rollout:
         print(
@@ -508,8 +512,8 @@ def worker_main(payload: dict[str, Any]) -> str:
                 )
                 setup_s = time.perf_counter() - t_setup
                 if best_teacher_reference:
-                    # Missing coach_eval → pre-eval oracle vs advanced, write
-                    # task.json, then generate with the winner as hard reference.
+                    # Missing coach_eval → 3-way pre-eval (argmax / sample /
+                    # advanced), write task.json, set RL act mode, then generate.
                     ensure = ensure_coach_eval(
                         package,
                         ctx=ctx,
@@ -522,14 +526,18 @@ def worker_main(payload: dict[str, Any]) -> str:
                         train_like_sample=train_like_sample,
                     )
                     best_policy = str(ensure["best_policy"])
+                    ev = ensure.get("eval_result") or ensure.get("coach_eval") or {}
+                    argmax_wr = (ev.get("oracle_argmax") or {}).get("win_rate")
+                    sample_wr = (ev.get("oracle_sample") or {}).get("win_rate")
+                    if sample_wr is None:
+                        sample_wr = (ev.get("oracle_pure") or {}).get("win_rate")
+                    a = (ev.get("heuristic_advanced") or {}).get("win_rate")
                     if ensure["wrote"]:
-                        ev = ensure.get("eval_result") or {}
-                        o = (ev.get("oracle_pure") or {}).get("win_rate")
-                        a = (ev.get("heuristic_advanced") or {}).get("win_rate")
                         print(
                             f"[record_worker] package={package.name}: "
                             f"wrote coach_eval best_policy={best_policy} "
-                            f"oracle_wr={o} advanced_wr={a}",
+                            f"argmax_wr={argmax_wr} sample_wr={sample_wr} "
+                            f"advanced_wr={a}",
                             flush=True,
                         )
                         _report(
@@ -542,19 +550,25 @@ def worker_main(payload: dict[str, Any]) -> str:
                                 "package_name": package.name,
                                 "best_policy": best_policy,
                                 "wrote": True,
-                                "oracle_wr": o,
+                                "argmax_wr": argmax_wr,
+                                "sample_wr": sample_wr,
+                                "oracle_wr": sample_wr,
                                 "advanced_wr": a,
                             },
                         )
                     else:
                         print(
                             f"[record_worker] package={package.name}: "
-                            f"reuse coach_eval best_policy={best_policy}",
+                            f"reuse coach_eval best_policy={best_policy} "
+                            f"argmax_wr={argmax_wr} sample_wr={sample_wr} "
+                            f"advanced_wr={a}",
                             flush=True,
                         )
                 else:
                     best_policy = BEST_ORACLE
                 package_best_policy[package.name] = best_policy
+                if best_teacher_reference:
+                    apply_oracle_act_mode(ctx.oracle, best_policy)
                 # Warm *every* behavior in the mix so generate-time switches
                 # do not re-enter XLA compile (as much as JAX allows).
                 compile_s = warmup_record_gen_context(
