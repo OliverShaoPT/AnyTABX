@@ -231,12 +231,27 @@ class OracleCoach:
 
         scores, avail_j = self._masked_scores(obs, avail)
         use_train = self.train_like_sample if train_like is None else bool(train_like)
-        if use_train and self.family == "ppo":
+        return self._act_from_scores(
+            scores, avail_j, key=key, epsilon=epsilon, train_like=use_train
+        )
+
+    def _act_from_scores(
+        self,
+        scores: jax.Array,
+        avail_j: jax.Array,
+        *,
+        key: jax.Array,
+        epsilon: float,
+        train_like: bool,
+    ) -> jax.Array:
+        """Sample or greedy from scores already produced by one forward."""
+
+        if train_like and self.family == "ppo":
             return jax.random.categorical(key, scores).astype(jnp.int32)
 
         greedy = jnp.argmax(scores, axis=-1)
         eps_value = float(epsilon)
-        if use_train and self.family == "q" and eps_value <= 0.0:
+        if train_like and self.family == "q" and eps_value <= 0.0:
             eps_value = float(self.train_epsilon)
         eps = jnp.asarray(eps_value, dtype=jnp.float32)
 
@@ -254,6 +269,33 @@ class OracleCoach:
             return greedy_a.astype(jnp.int32)
 
         return jax.lax.cond(eps > 0.0, _explore, _greedy, (greedy, avail_j, key))
+
+    def hard_pair_jax(
+        self,
+        obs: np.ndarray | jax.Array,
+        avail: np.ndarray | jax.Array,
+        *,
+        key: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Train-like sample, argmax, and softmax from one masked forward.
+
+        Returns:
+          sample: (A,) int32. PPO categorical; Q ε-greedy at ``train_epsilon``.
+          argmax: (A,) int32.
+          dist: (A, action_dim) float32 softmax.
+        """
+
+        scores, avail_j = self._masked_scores(obs, avail)
+        dist = jax.nn.softmax(scores, axis=-1)
+        argmax = jnp.argmax(scores, axis=-1).astype(jnp.int32)
+        sample = self._act_from_scores(
+            scores,
+            avail_j,
+            key=key,
+            epsilon=float(self.train_epsilon),
+            train_like=True,
+        )
+        return sample, argmax, dist
 
     def act_behavior_jax(
         self,

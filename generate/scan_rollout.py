@@ -31,6 +31,8 @@ from generate.policies import (
     is_rl_teacher,
     reference_hard_kind,
     reference_labels_best_teacher_jax,
+    select_rl_hard_actions,
+    stack_actions,
 )
 from generate.task_package import TaskPackage
 from src.tabx.eval_task import load_heuristic_params
@@ -103,7 +105,10 @@ def _build_policy_branches(
             _spec=spec,
             _heur=heur,
         ):
-            key, obs, avail, physics_params, last_visible = operands
+            key, obs, avail, physics_params, last_visible, oracle_behavior = operands
+            if _spec.kind == "oracle":
+                # Same sample/argmax draw as the reference pair; no second forward.
+                return oracle_behavior, last_visible, key
             actions, new_last, key = act_shared_jax(
                 key=key,
                 spec=_spec,
@@ -164,6 +169,7 @@ def _act_independent_allies(
     last_visible: list[LastVisibleTarget],
     ally_keys: list[str],
     n_ally: int,
+    oracle_behavior: dict[str, jax.Array],
 ) -> tuple[dict[str, jax.Array], list[LastVisibleTarget], jax.Array]:
     """Run every mix policy, then pick each agent's action by its mix index."""
 
@@ -173,7 +179,7 @@ def _act_independent_allies(
     for branch in branches:
         key_work, sub = jax.random.split(key_work)
         acts, new_last, _ = branch(
-            (sub, obs, avail, physics_params, last_visible)
+            (sub, obs, avail, physics_params, last_visible, oracle_behavior)
         )
         actions_by_mix.append(
             jnp.stack(
@@ -307,28 +313,17 @@ def _make_single_env_rollout(
                 policy_tag_agents = jnp.full((n_ally,), policy_tag, dtype=jnp.int32)
 
             avail = env.get_avail_actions(state)
-            # Same split pattern as env_centric (key, bkey, skey[, rkey]).
+            # Same split pattern as env_centric (key, bkey, skey, rkey).
             key, bkey, skey, rkey = jax.random.split(key, 4)
-            if independent:
-                behavior, last_visible, _bkey_out = _act_independent_allies(
-                    key=bkey,
-                    mix_indices=mix_index,
-                    branches=branches,
-                    obs=obs,
-                    avail=avail,
-                    physics_params=state["physics_params"],
-                    last_visible=last_visible,
-                    ally_keys=ally_keys,
-                    n_ally=n_ally,
-                )
-            else:
-                behavior, last_visible, _bkey_out = jax.lax.switch(
-                    mix_index,
-                    branches,
-                    (bkey, obs, avail, state["physics_params"], last_visible),
-                )
-
-            ref, ref_dist, ref_last_visible, _rkey = reference_labels_best_teacher_jax(
+            # One RL forward: sample + argmax. Flag picks the oracle env action.
+            (
+                ref,
+                ref_dist,
+                ref_last_visible,
+                _rkey,
+                sample_actions,
+                argmax_actions,
+            ) = reference_labels_best_teacher_jax(
                 oracle,
                 key=rkey,
                 obs_by_agent=obs,
@@ -341,6 +336,35 @@ def _make_single_env_rollout(
                 advanced_params=advanced_params,
                 ref_last_visible=ref_last_visible,
             )
+            oracle_behavior = select_rl_hard_actions(
+                oracle, sample_actions, argmax_actions
+            )
+            if independent:
+                behavior, last_visible, _bkey_out = _act_independent_allies(
+                    key=bkey,
+                    mix_indices=mix_index,
+                    branches=branches,
+                    obs=obs,
+                    avail=avail,
+                    physics_params=state["physics_params"],
+                    last_visible=last_visible,
+                    ally_keys=ally_keys,
+                    n_ally=n_ally,
+                    oracle_behavior=oracle_behavior,
+                )
+            else:
+                behavior, last_visible, _bkey_out = jax.lax.switch(
+                    mix_index,
+                    branches,
+                    (
+                        bkey,
+                        obs,
+                        avail,
+                        state["physics_params"],
+                        last_visible,
+                        oracle_behavior,
+                    ),
+                )
 
             unit_pack = _extract_unit_arrays_jax(state["state"], unit_keys)
             if include_attack_target:
@@ -387,12 +411,8 @@ def _make_single_env_rollout(
             trunc = jnp.asarray(info["truncation"]).reshape(-1)[0].astype(jnp.bool_)
             ally_win = jnp.asarray(info["is_win"]).reshape(-1)[0].astype(jnp.bool_)
 
-            actions_behavior = jnp.stack(
-                [jnp.asarray(behavior[a], dtype=jnp.int32).reshape(()) for a in ally_keys]
-            )
-            actions_reference = jnp.stack(
-                [jnp.asarray(ref[a], dtype=jnp.int32).reshape(()) for a in ally_keys]
-            )
+            actions_behavior = stack_actions(behavior, ally_keys)
+            actions_reference = stack_actions(ref, ally_keys)
             reward_team = jnp.stack(
                 [jnp.asarray(team_by_agent[a], dtype=jnp.float32).reshape(()) for a in ally_keys]
             )
@@ -417,6 +437,9 @@ def _make_single_env_rollout(
                 "obs_flat": obs_flat,
                 **unit_pack,
             }
+            if is_rl_teacher(best_policy):
+                out["actions_reference_sample"] = stack_actions(sample_actions, ally_keys)
+                out["actions_reference_argmax"] = stack_actions(argmax_actions, ally_keys)
 
             do_reset = ep_done & (t + jnp.int32(1) < jnp.int32(total_timesteps))
 
@@ -576,6 +599,8 @@ def _cast_array(name: str, arr: np.ndarray) -> np.ndarray:
         "unit_team",
         "actions_behavior",
         "actions_reference",
+        "actions_reference_sample",
+        "actions_reference_argmax",
         "attack_target",
     }:
         return arr.astype(np.int32)
@@ -660,6 +685,7 @@ def _record_meta(
         "oracle_train_like_sample": bool(ctx.oracle.train_like_sample),
         "reference_hard": reference_hard_kind(ctx.oracle, best_policy),
         "has_reference_kl_distribution": bool(is_rl_teacher(best_policy)),
+        "has_reference_rl_pair": bool(is_rl_teacher(best_policy)),
     }
     if "attack_target" in arrays:
         meta["schema"] = "env_centric_v1_comm"

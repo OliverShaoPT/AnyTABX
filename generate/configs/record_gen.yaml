@@ -71,7 +71,8 @@ adapt_strength_max: 0.7       # max strong-group mass (≥30% weak retained)
 # false (default): hard reference = RL oracle (sample by default); adapt focus → oracle_pure.
 # true: hard reference = coach_eval.best_policy
 #       (oracle_sample | oracle_argmax | heuristic_advanced);
-#       when the teacher is RL, also write actions_reference_distribution (softmax KL);
+#       when the teacher is RL, also write actions_reference_distribution (softmax KL)
+#       plus actions_reference_sample / actions_reference_argmax from one forward;
 #       winrate_adapt oracle_focus concentrates strong mass on that best_policy.
 #       If coach_eval is missing some of oracle_argmax / oracle_sample /
 #       heuristic_advanced, each worker fills only the missing arms, writes
@@ -81,17 +82,18 @@ coach_eval_episodes: 64
 coach_eval_tie_eps: 0.02
 coach_eval_max_episode_steps: 512
 coach_eval_parallel_envs: 32
-# RL oracle_pure behavior + RL hard labels: sample like training (PPO
-# categorical; Q ε-greedy from saved update). Default true. Set false for
-# greedy argmax. When best_teacher_reference picks oracle_argmax, generate
-# overrides this to greedy for that task. oracle_eps mix entries keep
-# their own ε.
+# Which RL hard action steps the env when the behavior kind is oracle_pure.
+# One forward writes both sample and argmax; this flag picks the env action
+# (PPO categorical / Q train-ε, or greedy argmax). When best teacher is RL,
+# both are stored as actions_reference_{sample,argmax}.npy.
+# best_teacher_reference + oracle_argmax overrides this to greedy for that task.
+# oracle_eps mix entries keep their own ε.
 oracle_train_like_sample: true
 
 # Comm dump: write game_manager.attack_target.npy (env_centric_v1_comm).
 # Default false keeps the old record schema. python -m generate.env_centric_comm
 # forces this true and uses the same GPU workers as parallel_records.
-dump_attack_target: false
+dump_attack_target: true
 
 # --- Behavior policy mixture (weights renormalized) ---
 # Ordered by quality so policy_id == policy_tag (0=weakest … 7=oracle; 8=mask at convert).

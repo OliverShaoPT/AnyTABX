@@ -33,6 +33,7 @@ from generate.policies import (
     reference_hard_kind,
     reference_labels,
     reference_labels_best_teacher,
+    select_rl_hard_actions,
 )
 from generate.task_package import TaskPackage, discover_task_packages, load_package_task_bank
 from src.tabx.eval_task import load_heuristic_params
@@ -414,6 +415,10 @@ def generate_one_record(
     }
     if dump_attack_target:
         buffers["attack_target"] = []
+    store_rl_pair = is_rl_teacher(teacher)
+    if store_rl_pair:
+        buffers["actions_reference_sample"] = []
+        buffers["actions_reference_argmax"] = []
 
     episode_id = 0
     is_reset_step = True
@@ -421,7 +426,23 @@ def generate_one_record(
 
     while steps < total_timesteps:
         avail = env.get_avail_actions(state)
-        key, bkey, skey = jax.random.split(key, 3)
+        key, bkey, skey, rkey = jax.random.split(key, 4)
+        ref, ref_dist, ref_last_visible, sample_actions, argmax_actions = (
+            reference_labels_best_teacher(
+                oracle,
+                key=rkey,
+                obs_by_agent=obs,
+                avail_by_agent=avail,
+                ally_keys=ally_keys,
+                best_policy=teacher,
+                n_agents=n_units_total,
+                max_n_zone=env.max_n_zone,
+                physics_params=state["physics_params"],
+                advanced_params=advanced_params,
+                ref_last_visible=ref_last_visible,
+            )
+        )
+        oracle_behavior = select_rl_hard_actions(oracle, sample_actions, argmax_actions)
         if independent:
             assert switchers is not None and policies is not None
             behavior = {}
@@ -437,15 +458,18 @@ def generate_one_record(
                         n_agents=n_units_total,
                         max_n_zone=env.max_n_zone,
                     )
-                key, sub = jax.random.split(key)
-                act_i = policies[i].act(
-                    key=sub,
-                    obs_by_agent=obs,
-                    avail_by_agent=avail,
-                    ally_keys=[agent],
-                    physics_params=state["physics_params"],
-                )
-                behavior[agent] = act_i[agent]
+                if policies[i].spec.kind == "oracle":
+                    behavior[agent] = oracle_behavior[agent]
+                else:
+                    key, sub = jax.random.split(key)
+                    act_i = policies[i].act(
+                        key=sub,
+                        obs_by_agent=obs,
+                        avail_by_agent=avail,
+                        ally_keys=[agent],
+                        physics_params=state["physics_params"],
+                    )
+                    behavior[agent] = act_i[agent]
                 policy_id_row[i] = int(spec_i.policy_id)
                 policy_tag_row[i] = int(policy_tag_for_spec(spec_i))
         else:
@@ -460,31 +484,20 @@ def generate_one_record(
                     n_agents=n_units_total,
                     max_n_zone=env.max_n_zone,
                 )
-            behavior = shared.act(
-                key=bkey,
-                obs_by_agent=obs,
-                avail_by_agent=avail,
-                ally_keys=ally_keys,
-                physics_params=state["physics_params"],
-            )
+            if shared.spec.kind == "oracle":
+                behavior = oracle_behavior
+            else:
+                behavior = shared.act(
+                    key=bkey,
+                    obs_by_agent=obs,
+                    avail_by_agent=avail,
+                    ally_keys=ally_keys,
+                    physics_params=state["physics_params"],
+                )
             policy_id_row = np.full((n_ally,), int(shared.spec.policy_id), dtype=np.int32)
             policy_tag_row = np.full(
                 (n_ally,), int(policy_tag_for_spec(shared.spec)), dtype=np.int32
             )
-        key, rkey = jax.random.split(key)
-        ref, ref_dist, ref_last_visible = reference_labels_best_teacher(
-            oracle,
-            key=rkey,
-            obs_by_agent=obs,
-            avail_by_agent=avail,
-            ally_keys=ally_keys,
-            best_policy=teacher,
-            n_agents=n_units_total,
-            max_n_zone=env.max_n_zone,
-            physics_params=state["physics_params"],
-            advanced_params=advanced_params,
-            ref_last_visible=ref_last_visible,
-        )
 
         unit_pack = _extract_unit_arrays(state["state"], unit_keys)
         visible = _to_numpy(state["state"]["game_manager"].visible_matrix).astype(np.uint8)
@@ -522,6 +535,13 @@ def generate_one_record(
         buffers["actions_reference_distribution"].append(
             np.asarray(ref_dist, dtype=np.float32)
         )
+        if store_rl_pair:
+            buffers["actions_reference_sample"].append(
+                np.asarray([int(sample_actions[a]) for a in ally_keys], dtype=np.int32)
+            )
+            buffers["actions_reference_argmax"].append(
+                np.asarray([int(argmax_actions[a]) for a in ally_keys], dtype=np.int32)
+            )
         buffers["reward_team"].append(
             np.asarray([float(_to_numpy(team_by_agent[a])) for a in ally_keys], dtype=np.float32)
         )
@@ -612,6 +632,13 @@ def generate_one_record(
         "unit_is_alive": np.stack(buffers["unit_is_alive"], axis=0),
         "unit_team": np.stack(buffers["unit_team"], axis=0),
     }
+    if store_rl_pair:
+        arrays["actions_reference_sample"] = np.stack(
+            buffers["actions_reference_sample"], axis=0
+        )
+        arrays["actions_reference_argmax"] = np.stack(
+            buffers["actions_reference_argmax"], axis=0
+        )
     if dump_attack_target:
         arrays["attack_target"] = np.stack(buffers["attack_target"], axis=0)
 
@@ -659,6 +686,7 @@ def generate_one_record(
         "oracle_train_like_sample": bool(oracle.train_like_sample),
         "reference_hard": reference_hard_kind(oracle, teacher),
         "has_reference_kl_distribution": bool(is_rl_teacher(teacher)),
+        "has_reference_rl_pair": bool(store_rl_pair),
     }
     if dump_attack_target:
         meta["schema"] = "env_centric_v1_comm"

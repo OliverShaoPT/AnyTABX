@@ -199,6 +199,16 @@ def split_one_record(
         save_npy(agent_dir / "obs_dynamic_mask.npy", np.stack(mask_list, axis=0))
         save_npy(agent_dir / "behavior_action.npy", arrays["actions_behavior"][:, ally_index])
         save_npy(agent_dir / "reference_action.npy", arrays["actions_reference"][:, ally_index])
+        if "actions_reference_sample" in arrays:
+            save_npy(
+                agent_dir / "reference_action_sample.npy",
+                arrays["actions_reference_sample"][:, ally_index],
+            )
+        if "actions_reference_argmax" in arrays:
+            save_npy(
+                agent_dir / "reference_action_argmax.npy",
+                arrays["actions_reference_argmax"][:, ally_index],
+            )
         # Soft oracle π(a|o); HVAC label_action_distribution equivalent, shape (T, A).
         save_npy(
             agent_dir / "reference_action_distribution.npy",
@@ -240,9 +250,18 @@ def split_one_record(
                 "truncation": "1 if episode ended by hitting max_episode_steps",
                 "is_win": "1 if team 0 (ally) won on this terminal step; else 0",
                 "reference_action": (
-                    "hard label: RL sample by default (oracle_train_like_sample); "
-                    "argmax if that flag is false or best_policy is oracle_argmax; "
-                    "heuristic_advanced when best_teacher_reference picks it"
+                    "selected hard label: RL sample or argmax via "
+                    "oracle_train_like_sample; heuristic_advanced when "
+                    "best_teacher_reference picks it"
+                ),
+                "reference_action_sample": (
+                    "RL train-like hard label (T,). Present when best teacher is RL. "
+                    "Same draw as reference_action when the flag is true"
+                ),
+                "reference_action_argmax": (
+                    "RL argmax hard label (T,). Present when best teacher is RL. "
+                    "Same draw as reference_action when the flag is false. "
+                    "oracle_pure env steps use the flag's choice of these two"
                 ),
                 "reference_action_distribution": (
                     "RL softmax probs (T, action_dim) for KL "

@@ -31,6 +31,9 @@ __all__ = [
     "reference_labels_jax",
     "reference_labels_best_teacher",
     "reference_labels_best_teacher_jax",
+    "reference_rl_pair_jax",
+    "select_rl_hard_actions",
+    "stack_actions",
     "reference_actions",
     "reference_action_distribution",
     "act_shared_jax",
@@ -156,6 +159,57 @@ def stack_agent_avail(
     )
 
 
+def _actions_from_flat(flat: jax.Array, ally_keys: list[str]) -> dict[str, jax.Array]:
+    return {
+        agent: flat[i].reshape(()).astype(jnp.int32)
+        for i, agent in enumerate(ally_keys)
+    }
+
+
+def stack_actions(actions: dict[str, jax.Array], ally_keys: list[str]) -> jax.Array:
+    """``(n_ally,)`` int32 from an agent -> action dict."""
+
+    return jnp.stack(
+        [jnp.asarray(actions[agent], dtype=jnp.int32).reshape(()) for agent in ally_keys]
+    )
+
+
+def reference_rl_pair_jax(
+    oracle: OracleCoach,
+    *,
+    key: jax.Array,
+    obs_by_agent: dict[str, Any],
+    avail_by_agent: dict[str, Any],
+    ally_keys: list[str],
+) -> tuple[dict[str, jax.Array], dict[str, jax.Array], jax.Array]:
+    """Sample and argmax hard actions plus softmax, from one RL forward."""
+
+    obs = stack_agent_obs(obs_by_agent, ally_keys)
+    avail = stack_agent_avail(avail_by_agent, ally_keys)
+    sample, argmax, dist = oracle.hard_pair_jax(obs, avail, key=key)
+    return (
+        _actions_from_flat(sample, ally_keys),
+        _actions_from_flat(argmax, ally_keys),
+        dist,
+    )
+
+
+def select_rl_hard_actions(
+    oracle: OracleCoach,
+    sample_actions: dict[str, jax.Array],
+    argmax_actions: dict[str, jax.Array],
+) -> dict[str, jax.Array]:
+    """Which RL hard action steps the env when behavior kind is ``oracle``.
+
+    ``oracle.train_like_sample`` true → train-like sample; false → argmax.
+    ``oracle_eps`` does not use this.
+    """
+
+    if oracle.train_like_sample:
+        return sample_actions
+    return argmax_actions
+
+
 def reference_labels_jax(
     oracle: OracleCoach,
     *,
@@ -168,21 +222,25 @@ def reference_labels_jax(
 
     Soft ``dist`` is always RL softmax (KL target). Hard actions follow
     ``oracle.train_like_sample``: categorical / train-ε when true, else argmax.
+    With a ``key``, sample and argmax come from one forward.
     """
 
-    obs = stack_agent_obs(obs_by_agent, ally_keys)
-    avail = stack_agent_avail(avail_by_agent, ally_keys)
-    dist = oracle.action_distribution_jax(obs, avail)
-    if oracle.train_like_sample:
-        if key is None:
+    if key is None:
+        if oracle.train_like_sample:
             raise ValueError("key is required when oracle.train_like_sample is true")
-        flat = oracle.act_jax(obs, avail, key=key, train_like=True)
-    else:
+        obs = stack_agent_obs(obs_by_agent, ally_keys)
+        avail = stack_agent_avail(avail_by_agent, ally_keys)
+        dist = oracle.action_distribution_jax(obs, avail)
         flat = jnp.argmax(dist, axis=-1).astype(jnp.int32)
-    actions = {
-        agent: flat[i].reshape(()).astype(jnp.int32)
-        for i, agent in enumerate(ally_keys)
-    }
+        return _actions_from_flat(flat, ally_keys), dist
+    sample_actions, argmax_actions, dist = reference_rl_pair_jax(
+        oracle,
+        key=key,
+        obs_by_agent=obs_by_agent,
+        avail_by_agent=avail_by_agent,
+        ally_keys=ally_keys,
+    )
+    actions = select_rl_hard_actions(oracle, sample_actions, argmax_actions)
     return actions, dist
 
 
@@ -255,23 +313,37 @@ def reference_labels_best_teacher_jax(
     physics_params: Any,
     advanced_params: TABXHeuristicParam | None,
     ref_last_visible: list[LastVisibleTarget],
-) -> tuple[dict[str, jax.Array], jax.Array, list[LastVisibleTarget], jax.Array]:
-    """Hard labels from best teacher; soft dist always from RL coach.
+) -> tuple[
+    dict[str, jax.Array],
+    jax.Array,
+    list[LastVisibleTarget],
+    jax.Array,
+    dict[str, jax.Array],
+    dict[str, jax.Array],
+]:
+    """Hard labels from best teacher; sample and argmax from one RL forward.
 
     Returns:
-      actions, distribution (n_ally, A), updated ref_last_visible, key
+      actions, distribution (n_ally, A), updated ref_last_visible, key,
+      sample_actions, argmax_actions.
+
+    ``actions`` is the teacher hard label (RL selection or heuristic).
+    ``sample_actions`` / ``argmax_actions`` are always the RL pair.
+    ``select_rl_hard_actions`` picks which of those two steps the env
+    when the behavior kind is ``oracle``.
     """
 
     key, ref_key = jax.random.split(key)
-    oracle_actions, dist = reference_labels_jax(
+    sample_actions, argmax_actions, dist = reference_rl_pair_jax(
         oracle,
+        key=ref_key,
         obs_by_agent=obs_by_agent,
         avail_by_agent=avail_by_agent,
         ally_keys=ally_keys,
-        key=ref_key,
     )
     if is_rl_teacher(best_policy):
-        return oracle_actions, dist, ref_last_visible, key
+        actions = select_rl_hard_actions(oracle, sample_actions, argmax_actions)
+        return actions, dist, ref_last_visible, key, sample_actions, argmax_actions
     if advanced_params is None:
         raise ValueError("advanced_params required when best_policy is heuristic_advanced")
     adv_actions, new_last, key = _advanced_hard_actions_jax(
@@ -284,7 +356,7 @@ def reference_labels_best_teacher_jax(
         heuristic_params=advanced_params,
         last_visible=ref_last_visible,
     )
-    return adv_actions, dist, new_last, key
+    return adv_actions, dist, new_last, key, sample_actions, argmax_actions
 
 
 def reference_labels_best_teacher(
@@ -300,30 +372,43 @@ def reference_labels_best_teacher(
     physics_params: Any,
     advanced_params: TABXHeuristicParam | None,
     ref_last_visible: dict[str, LastVisibleTarget] | list[LastVisibleTarget],
-) -> tuple[dict[str, jnp.ndarray], np.ndarray, dict[str, LastVisibleTarget]]:
-    """Host-friendly best-teacher reference labels."""
+) -> tuple[
+    dict[str, jnp.ndarray],
+    np.ndarray,
+    dict[str, LastVisibleTarget],
+    dict[str, jax.Array],
+    dict[str, jax.Array],
+]:
+    """Host-friendly best-teacher reference labels.
+
+    Returns actions, distribution, last_visible, sample_actions, argmax_actions.
+    """
 
     if isinstance(ref_last_visible, dict):
         last_list = [ref_last_visible[a] for a in ally_keys]
     else:
         last_list = list(ref_last_visible)
-    actions, dist, new_last, _key = reference_labels_best_teacher_jax(
-        oracle,
-        key=key,
-        obs_by_agent=obs_by_agent,
-        avail_by_agent=avail_by_agent,
-        ally_keys=ally_keys,
-        best_policy=best_policy,
-        n_agents=n_agents,
-        max_n_zone=max_n_zone,
-        physics_params=physics_params,
-        advanced_params=advanced_params,
-        ref_last_visible=last_list,
+    actions, dist, new_last, _key, sample_actions, argmax_actions = (
+        reference_labels_best_teacher_jax(
+            oracle,
+            key=key,
+            obs_by_agent=obs_by_agent,
+            avail_by_agent=avail_by_agent,
+            ally_keys=ally_keys,
+            best_policy=best_policy,
+            n_agents=n_agents,
+            max_n_zone=max_n_zone,
+            physics_params=physics_params,
+            advanced_params=advanced_params,
+            ref_last_visible=last_list,
+        )
     )
     return (
         actions,
         np.asarray(dist, dtype=np.float32),
         {agent: new_last[i] for i, agent in enumerate(ally_keys)},
+        sample_actions,
+        argmax_actions,
     )
 
 

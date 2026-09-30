@@ -78,9 +78,11 @@ python -m generate.env_centric ... --seed 0
 
 | 序列                               | 含义                                                                                                                                                      |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `actions_behavior`               | 行为策略动作，**进入** `env.step`。`oracle_pure` 默认按训练方式 **sample**（PPO categorical；可用 `oracle_train_like_sample=false` 改回 argmax）。`best_teacher_reference=true` 且 teacher 为 `oracle_argmax` 时，RL 行为与硬标签都用 argmax |
-| `actions_reference`              | 同一 obs 上硬标签：默认 RL **sample**；`best_teacher_reference=true` 时跟 `coach_eval.best_policy`（`oracle_sample` / `oracle_argmax` / `heuristic_advanced`） |
-| `actions_reference_distribution` | teacher 为 RL 时写入的 soft 分布 `(T, n_ally, A)`，供 KL（HVAC `label_action_distribution`）；hard label 是 sample 时仍保存该分布 |
+| `actions_behavior`               | 行为策略动作，**进入** `env.step`。`oracle_pure` 用同一次 RL forward 里的 sample 或 argmax，由 `oracle_train_like_sample` 选择。`best_teacher_reference=true` 且 teacher 为 `oracle_argmax` 时该 task 改为 argmax。`oracle_eps` 仍用自己的 ε |
+| `actions_reference`              | 同一 obs 上选中的硬标签：RL 时与上面的选择相同；`best_teacher_reference=true` 且 teacher 为 `heuristic_advanced` 时是启发式贪心 |
+| `actions_reference_sample`       | best teacher 为 RL 时写入。训练方式硬动作 `(T, n_ally)`，与 argmax 同一次 forward |
+| `actions_reference_argmax`       | best teacher 为 RL 时写入。greedy 硬动作 `(T, n_ally)` |
+| `actions_reference_distribution` | RL softmax `(T, n_ally, A)`，供 KL；teacher 为 advanced 时仍写 oracle softmax |
 
 
 Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank manifest）。
@@ -134,7 +136,7 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 | `best_teacher_reference` | false | 硬标签与 adapt focus 是否跟 `coach_eval.best_policy`（`oracle_sample` / `oracle_argmax` / `heuristic_advanced`）；缺哪路只补哪路，三路齐则 reuse |
 | `coach_eval_episodes` | 64 | 前测 / 缺字段补评时每组 episode 数（argmax、sample、advanced 各跑一轮） |
 | `coach_eval_parallel_envs` | 32 | 前测 vmap batch |
-| `oracle_train_like_sample` | true | generate 默认：`oracle_pure` **行为**与 **RL 硬标签**都按训练方式 sample。`best_teacher_reference=true` 且 teacher 为 `oracle_argmax` 时改用 greedy。`false` 改回 greedy argmax。teacher 为 RL 时另存 `actions_reference_distribution` 作 KL。`oracle_eps` mix 仍用自己的 ε。 |
+| `oracle_train_like_sample` | true | 同一次 RL forward 产出 sample 与 argmax。`true` 时 `oracle_pure` 用 sample 进 `env.step`，`false` 用 argmax。best teacher 为 RL 时两条都落盘。`oracle_argmax` teacher 会把该 task 改成 greedy。`oracle_eps` 仍用自己的 ε。 |
 
 
 与 `independent_ally_policies=true` 兼容：adapt 仍只改共享 CDF，从而抬高每个 ally 抽到强策略的概率。
@@ -165,7 +167,9 @@ Enemy 始终由 `TABXEnemyHeuristicWrapper` 控制（preset 来自 task bank man
 {output_root}/task_{index:05d}_{task_id}/record-{id:06d}/
   meta.json
   actions_behavior.npy      # (T, n_ally)
-  actions_reference.npy     # (T, n_ally) RL sample (or heuristic if best teacher)
+  actions_reference.npy     # (T, n_ally) selected hard label
+  actions_reference_sample.npy   # (T, n_ally) RL sample; only if teacher is RL
+  actions_reference_argmax.npy   # (T, n_ally) RL argmax; only if teacher is RL
   actions_reference_distribution.npy  # (T, n_ally, A) RL softmax for KL
   reward_team.npy           # (T, n_ally) team 广播标量
   reward_individual.npy     # (T, n_ally) 消融用 hybrid

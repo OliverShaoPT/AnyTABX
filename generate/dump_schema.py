@@ -22,6 +22,8 @@ OTHER_FEATURE_DIM_WITH_UNIT_ID = 17
 ENV_CENTRIC_ARRAYS = (
     "actions_behavior",
     "actions_reference",
+    "actions_reference_sample",
+    "actions_reference_argmax",
     "actions_reference_distribution",
     "reward_team",
     "reward_individual",
