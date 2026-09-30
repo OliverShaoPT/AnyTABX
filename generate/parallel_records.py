@@ -351,7 +351,11 @@ def run_from_config(config: dict[str, Any]) -> None:
     # JAX-free (lazy imports in task_package); do not init JAX here — CPU JAX
     # in a long-lived parent has caused host RAM growth, and any accidental
     # JAX import before CUDA_VISIBLE_DEVICES is set would hog physical GPU 0.
-    from generate.task_package import discover_task_packages
+    from generate.task_package import (
+        discover_task_packages,
+        filter_packages_by_names,
+        parse_task_list,
+    )
 
     if device == "cpu":
         print(
@@ -403,6 +407,36 @@ def run_from_config(config: dict[str, Any]) -> None:
     if task_filter is not None:
         allowed = set(int(x) for x in task_filter)
         packages = [p for p in packages if p.task_index in allowed]
+    task_list_path = config.get("task_list")
+    if task_list_path:
+        spec = parse_task_list(task_list_path)
+        packages, missing = filter_packages_by_names(packages, spec["names"])
+        records_per_task = spec.get("records_per_task")
+        if (
+            records_per_task
+            and not config.get("_total_records_from_cli")
+        ):
+            config["total_records"] = len(packages) * int(records_per_task)
+        shard = spec.get("shard")
+        n_shards = spec.get("n_shards")
+        shard_s = (
+            f" shard={shard}/{n_shards}"
+            if shard is not None and n_shards is not None
+            else ""
+        )
+        print(
+            f"[parallel_records] task_list={task_list_path}{shard_s} "
+            f"kept={len(packages)} missing={len(missing)} "
+            f"total_records={config.get('total_records')}",
+            flush=True,
+        )
+        if missing:
+            preview = ", ".join(missing[:8])
+            extra = "" if len(missing) <= 8 else f" ... +{len(missing) - 8}"
+            print(
+                f"[parallel_records] task_list missing: {preview}{extra}",
+                flush=True,
+            )
     if not packages:
         raise RuntimeError("No task packages to generate")
 
@@ -716,6 +750,17 @@ def main(
         default=None,
         help="Optional subset of task indices",
     )
+    parser.add_argument(
+        "--task_list",
+        type=str,
+        default=None,
+        help=(
+            "Shard JSON from tools/split_coach_tasks.py. "
+            "Only those packages are generated. When the file sets "
+            "records_per_task and --total_records is omitted, "
+            "total_records becomes kept_tasks * records_per_task."
+        ),
+    )
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
@@ -751,6 +796,9 @@ def main(
         config["gpu_ids"] = gpu_ids
     if args.task_index is not None:
         config["task_index"] = args.task_index
+    if args.task_list is not None:
+        config["task_list"] = args.task_list
+    config["_total_records_from_cli"] = args.total_records is not None
     if args.scan_rollout is not None:
         config["scan_rollout"] = args.scan_rollout == "true"
     if args.parallel_envs is not None:

@@ -155,6 +155,109 @@ def discover_task_packages(
     return packages
 
 
+def parse_task_list(path: str | Path) -> dict[str, Any]:
+    """Load a shard JSON written by ``tools/split_coach_tasks.py``.
+
+    Returns names in file order plus optional ``records_per_task``.
+    A bare JSON list of package names is also accepted.
+    """
+
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        names = [str(item) for item in data]
+        records_per_task = None
+        shard = None
+        n_shards = None
+    elif isinstance(data, dict):
+        raw_tasks = data.get("tasks", [])
+        names = []
+        for item in raw_tasks:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict) and item.get("name"):
+                names.append(str(item["name"]))
+            else:
+                raise ValueError(f"Bad task entry in {path}: {item!r}")
+        records_per_task = data.get("records_per_task")
+        shard = data.get("shard")
+        n_shards = data.get("n_shards")
+    else:
+        raise ValueError(f"Task list {path} must be a JSON object or list")
+    if not names:
+        raise ValueError(f"Task list {path} has no tasks")
+    return {
+        "path": str(path),
+        "names": names,
+        "records_per_task": (
+            None if records_per_task is None else int(records_per_task)
+        ),
+        "shard": None if shard is None else int(shard),
+        "n_shards": None if n_shards is None else int(n_shards),
+    }
+
+
+def split_even(items: list[Any], n_shards: int) -> list[list[Any]]:
+    """Contiguous chunks. The first chunks take the remainder."""
+
+    if n_shards < 1:
+        raise ValueError("n_shards must be >= 1")
+    if n_shards > len(items):
+        raise ValueError(
+            f"n_shards={n_shards} is larger than the number of tasks ({len(items)})"
+        )
+    base, rem = divmod(len(items), n_shards)
+    shards: list[list[Any]] = []
+    start = 0
+    for shard in range(n_shards):
+        size = base + (1 if shard < rem else 0)
+        shards.append(items[start : start + size])
+        start += size
+    return shards
+
+
+def shard_payload(
+    packages: list[TaskPackage],
+    *,
+    coach_root: Path,
+    shard: int,
+    n_shards: int,
+    records_per_task: int,
+) -> dict[str, Any]:
+    """One shard file: package names plus records_per_task for generate."""
+
+    tasks = [
+        {
+            "name": package.name,
+            "task_index": int(package.task_index),
+            "task_id": str(package.task_id),
+        }
+        for package in packages
+    ]
+    return {
+        "coach_root": str(coach_root),
+        "shard": int(shard),
+        "n_shards": int(n_shards),
+        "records_per_task": int(records_per_task),
+        "total_records": len(tasks) * int(records_per_task),
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+
+
+def filter_packages_by_names(
+    packages: list[TaskPackage],
+    names: list[str],
+) -> tuple[list[TaskPackage], list[str]]:
+    """Keep packages whose ``name`` is listed. Missing names stay in order."""
+
+    allowed = set(names)
+    kept = [package for package in packages if package.name in allowed]
+    found = {package.name for package in kept}
+    missing = [name for name in names if name not in found]
+    return kept, missing
+
+
 def _infer_index_from_path(path: Path) -> int:
     for part in reversed(path.parts):
         match = re.search(r"task[_-](\d+)", part)
