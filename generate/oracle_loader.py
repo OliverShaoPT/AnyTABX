@@ -168,9 +168,15 @@ class OracleCoach:
         self,
         obs: np.ndarray | jax.Array,
         avail: np.ndarray | jax.Array,
+        params: Any = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Return (masked logits-or-Q, avail) with batch dim. Shape (A, action_dim)."""
+        """Return (masked logits-or-Q, avail) with batch dim. Shape (A, action_dim).
 
+        Pass ``params`` inside a jitted rollout so weights stay arguments.
+        The default reads ``self.params`` and bakes those values into the HLO.
+        """
+
+        weights = self.params if params is None else params
         obs_j = jnp.asarray(obs, dtype=jnp.float32)
         avail_j = jnp.asarray(avail, dtype=bool)
         if obs_j.ndim == 1:
@@ -179,9 +185,9 @@ class OracleCoach:
 
         if self.family == "ppo":
             # PolicyNetwork already masks unavailable actions with -1e10.
-            scores = self.apply_fn(self.params, obs_j, avail_j)
+            scores = self.apply_fn(weights, obs_j, avail_j)
         else:
-            q_values = self.apply_fn(self.params, obs_j)
+            q_values = self.apply_fn(weights, obs_j)
             scores = jnp.where(avail_j, q_values, -1e10)
         return scores, avail_j
 
@@ -191,10 +197,11 @@ class OracleCoach:
         avail: np.ndarray | jax.Array,
         *,
         temperature: float = 1.0,
+        params: Any = None,
     ) -> jax.Array:
         """Soft action probs on-device. Shape (A, action_dim)."""
 
-        scores, _ = self._masked_scores(obs, avail)
+        scores, _ = self._masked_scores(obs, avail, params=params)
         temp = jnp.maximum(jnp.asarray(temperature, dtype=jnp.float32), 1e-6)
         return jax.nn.softmax(scores / temp, axis=-1)
 
@@ -220,6 +227,7 @@ class OracleCoach:
         key: jax.Array,
         epsilon: float = 0.0,
         train_like: bool | None = None,
+        params: Any = None,
     ) -> jax.Array:
         """On-device actions for a batch of agents. obs/avail: (A, ...).
 
@@ -229,7 +237,7 @@ class OracleCoach:
         Default is greedy argmax (or ε-greedy when ``epsilon>0``).
         """
 
-        scores, avail_j = self._masked_scores(obs, avail)
+        scores, avail_j = self._masked_scores(obs, avail, params=params)
         use_train = self.train_like_sample if train_like is None else bool(train_like)
         return self._act_from_scores(
             scores, avail_j, key=key, epsilon=epsilon, train_like=use_train
@@ -276,6 +284,7 @@ class OracleCoach:
         avail: np.ndarray | jax.Array,
         *,
         key: jax.Array,
+        params: Any = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Train-like sample, argmax, and softmax from one masked forward.
 
@@ -285,7 +294,7 @@ class OracleCoach:
           dist: (A, action_dim) float32 softmax.
         """
 
-        scores, avail_j = self._masked_scores(obs, avail)
+        scores, avail_j = self._masked_scores(obs, avail, params=params)
         dist = jax.nn.softmax(scores, axis=-1)
         argmax = jnp.argmax(scores, axis=-1).astype(jnp.int32)
         sample = self._act_from_scores(
@@ -305,18 +314,31 @@ class OracleCoach:
         key: jax.Array,
         spec_kind: str,
         spec_epsilon: float = 0.0,
+        params: Any = None,
     ) -> jax.Array:
         """Behavior-mix action: ``oracle_eps`` keeps its ε; else honor train-like."""
 
         if spec_kind == "oracle_eps":
             return self.act_jax(
-                obs, avail, key=key, epsilon=float(spec_epsilon), train_like=False
+                obs,
+                avail,
+                key=key,
+                epsilon=float(spec_epsilon),
+                train_like=False,
+                params=params,
             )
         if self.train_like_sample:
             return self.act_jax(
-                obs, avail, key=key, epsilon=float(self.train_epsilon), train_like=True
+                obs,
+                avail,
+                key=key,
+                epsilon=float(self.train_epsilon),
+                train_like=True,
+                params=params,
             )
-        return self.act_jax(obs, avail, key=key, epsilon=0.0, train_like=False)
+        return self.act_jax(
+            obs, avail, key=key, epsilon=0.0, train_like=False, params=params
+        )
 
     def act(
         self,

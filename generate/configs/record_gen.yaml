@@ -52,6 +52,9 @@ mid_episode_policy_switch: true
 independent_ally_policies: false
 # Device-side lax.scan for a whole record (one host sync at dump). Set false
 # for the legacy per-step Python loop (numpy BehaviorSwitcher).
+# Tasks that share schema, network width, and RL act mode reuse one compiled
+# scan per worker. The executable is also written to JAX_COMPILATION_CACHE_DIR
+# (default /tmp/anytabx_jax_compilation_cache) so the other GPU workers can load it.
 scan_rollout: true
 # vmap batch size B: each scan call runs B envs in parallel (pad last batch to B
 # so one JIT is reused). N records → ceil(N/B) calls. Prefer workers_per_gpu=1

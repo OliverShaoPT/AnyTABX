@@ -48,6 +48,40 @@ def force_jax_gpu_env(gpu_id: int | str, *, jax_platform: str = "cuda") -> None:
     os.environ["JAX_PLATFORMS"] = str(jax_platform)
     os.environ.pop("JAX_PLATFORM_NAME", None)
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    # Same directory on every worker so identical HLO loads instead of recompiling.
+    os.environ.setdefault(
+        "JAX_COMPILATION_CACHE_DIR",
+        "/tmp/anytabx_jax_compilation_cache",
+    )
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "1")
+
+
+def enable_compilation_cache() -> None:
+    """Turn on JAX's on-disk executable cache. Call after the CUDA env is set."""
+
+    cache_dir = os.environ.setdefault(
+        "JAX_COMPILATION_CACHE_DIR",
+        "/tmp/anytabx_jax_compilation_cache",
+    )
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "1")
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    import jax
+
+    for key, value in (
+        ("jax_compilation_cache_dir", cache_dir),
+        ("jax_persistent_cache_min_compile_time_secs", 1),
+    ):
+        try:
+            jax.config.update(key, value)
+        except Exception:
+            pass
+    try:
+        from jax.experimental.compilation_cache import compilation_cache as cc
+
+        cc.set_cache_dir(cache_dir)
+    except Exception:
+        # Env / jax.config is enough on JAX versions that dropped this helper.
+        pass
 
 
 def _report(payload: dict[str, Any], event: dict[str, Any]) -> None:
@@ -452,6 +486,7 @@ def worker_main(payload: dict[str, Any]) -> str:
         force_jax_gpu_env(
             gpu_id, jax_platform=str(payload.get("jax_platform", "cuda"))
         )
+        enable_compilation_cache()
     else:
         force_jax_cpu_env()
 
@@ -499,6 +534,8 @@ def worker_main(payload: dict[str, Any]) -> str:
     # Reuse env+oracle (+ optional scan fn) per package inside this process.
     contexts: dict[str, Any] = {}
     rollout_fns: dict[str, Any] = {}
+    # One compiled scan per schema / act-mode, shared across packages.
+    shared_rollouts: dict[tuple, Any] = {}
     package_best_policy: dict[str, str] = {}
     paths: list[str] = []
     try:
@@ -572,46 +609,58 @@ def worker_main(payload: dict[str, Any]) -> str:
                 package_best_policy[package.name] = best_policy
                 if best_teacher_reference:
                     apply_oracle_act_mode(ctx.oracle, best_policy)
-                # Warm *every* behavior in the mix so generate-time switches
-                # do not re-enter XLA compile (as much as JAX allows).
-                compile_s = warmup_record_gen_context(
-                    ctx,
-                    behavior_mix=base_mix,
-                    steps=2,
-                    seed=int(payload.get("seed") or 0) + worker_id,
-                )
+                compile_s = 0.0
+                rollout_reused = False
                 if scan_rollout:
+                    # Host warmup compiles a different region from jit_rollout.
                     from generate.scan_rollout import (
                         build_scan_rollout_fn,
+                        rollout_signature,
                         warmup_scan_rollout,
                     )
 
                     teacher = best_policy if best_teacher_reference else BEST_ORACLE
-                    rollout_fn = build_scan_rollout_fn(
-                        ctx,
-                        mix=base_mix,
-                        min_behavior_steps=min_behavior_steps,
-                        behavior_switch_prob=behavior_switch_prob,
-                        total_timesteps=total_timesteps,
-                        parallel_envs=parallel_envs,
-                        independent_ally_policies=bool(
-                            payload.get("independent_ally_policies", False)
-                        ),
-                        mid_episode_policy_switch=bool(
-                            payload.get("mid_episode_policy_switch", True)
-                        ),
-                        best_teacher_policy=teacher,
-                        dump_attack_target=bool(
-                            payload.get("dump_attack_target", False)
-                        ),
-                    )
-                    compile_s += warmup_scan_rollout(
-                        rollout_fn,
-                        mix=base_mix,
-                        seed=int(payload.get("seed") or 0) + worker_id,
-                        parallel_envs=parallel_envs,
-                    )
+                    sig = rollout_signature(ctx, teacher)
+                    rollout_fn = shared_rollouts.get(sig)
+                    if rollout_fn is None:
+                        rollout_fn = build_scan_rollout_fn(
+                            ctx,
+                            mix=base_mix,
+                            min_behavior_steps=min_behavior_steps,
+                            behavior_switch_prob=behavior_switch_prob,
+                            total_timesteps=total_timesteps,
+                            parallel_envs=parallel_envs,
+                            independent_ally_policies=bool(
+                                payload.get("independent_ally_policies", False)
+                            ),
+                            mid_episode_policy_switch=bool(
+                                payload.get("mid_episode_policy_switch", True)
+                            ),
+                            best_teacher_policy=teacher,
+                            dump_attack_target=bool(
+                                payload.get("dump_attack_target", False)
+                            ),
+                        )
+                        compile_s = warmup_scan_rollout(
+                            rollout_fn,
+                            ctx=ctx,
+                            mix=base_mix,
+                            seed=int(payload.get("seed") or 0) + worker_id,
+                            parallel_envs=parallel_envs,
+                        )
+                        shared_rollouts[sig] = rollout_fn
+                    else:
+                        rollout_reused = True
                     rollout_fns[package.name] = rollout_fn
+                else:
+                    # Legacy per-step loop: warm every mix entry so switches
+                    # do not re-enter XLA compile.
+                    compile_s = warmup_record_gen_context(
+                        ctx,
+                        behavior_mix=base_mix,
+                        steps=2,
+                        seed=int(payload.get("seed") or 0) + worker_id,
+                    )
                 contexts[package.name] = ctx
                 _report(
                     payload,
@@ -625,6 +674,7 @@ def worker_main(payload: dict[str, Any]) -> str:
                         "compile_s": round(compile_s, 3),
                         "parallel_envs": parallel_envs,
                         "best_policy": package_best_policy[package.name],
+                        "rollout_reused": rollout_reused,
                     },
                 )
 

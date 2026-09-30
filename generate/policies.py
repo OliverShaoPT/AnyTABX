@@ -181,12 +181,15 @@ def reference_rl_pair_jax(
     obs_by_agent: dict[str, Any],
     avail_by_agent: dict[str, Any],
     ally_keys: list[str],
+    oracle_params: Any = None,
 ) -> tuple[dict[str, jax.Array], dict[str, jax.Array], jax.Array]:
     """Sample and argmax hard actions plus softmax, from one RL forward."""
 
     obs = stack_agent_obs(obs_by_agent, ally_keys)
     avail = stack_agent_avail(avail_by_agent, ally_keys)
-    sample, argmax, dist = oracle.hard_pair_jax(obs, avail, key=key)
+    sample, argmax, dist = oracle.hard_pair_jax(
+        obs, avail, key=key, params=oracle_params
+    )
     return (
         _actions_from_flat(sample, ally_keys),
         _actions_from_flat(argmax, ally_keys),
@@ -313,6 +316,7 @@ def reference_labels_best_teacher_jax(
     physics_params: Any,
     advanced_params: TABXHeuristicParam | None,
     ref_last_visible: list[LastVisibleTarget],
+    oracle_params: Any = None,
 ) -> tuple[
     dict[str, jax.Array],
     jax.Array,
@@ -340,6 +344,7 @@ def reference_labels_best_teacher_jax(
         obs_by_agent=obs_by_agent,
         avail_by_agent=avail_by_agent,
         ally_keys=ally_keys,
+        oracle_params=oracle_params,
     )
     if is_rl_teacher(best_policy):
         actions = select_rl_hard_actions(oracle, sample_actions, argmax_actions)
@@ -425,6 +430,7 @@ def act_shared_jax(
     physics_params: Any,
     heuristic_params: TABXHeuristicParam | None,
     last_visible: list[LastVisibleTarget],
+    oracle_params: Any = None,
 ) -> tuple[dict[str, jax.Array], list[LastVisibleTarget], jax.Array]:
     """On-device shared ally act; returns actions, updated last_visible, key."""
 
@@ -457,6 +463,7 @@ def act_shared_jax(
         key=sub,
         spec_kind=spec.kind,
         spec_epsilon=eps,
+        params=oracle_params,
     )
     actions = {
         agent: flat[i].reshape(()).astype(jnp.int32)

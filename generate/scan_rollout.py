@@ -105,7 +105,15 @@ def _build_policy_branches(
             _spec=spec,
             _heur=heur,
         ):
-            key, obs, avail, physics_params, last_visible, oracle_behavior = operands
+            (
+                key,
+                obs,
+                avail,
+                physics_params,
+                last_visible,
+                oracle_behavior,
+                oracle_params,
+            ) = operands
             if _spec.kind == "oracle":
                 # Same sample/argmax draw as the reference pair; no second forward.
                 return oracle_behavior, last_visible, key
@@ -121,6 +129,7 @@ def _build_policy_branches(
                 physics_params=physics_params,
                 heuristic_params=_heur,
                 last_visible=last_visible,
+                oracle_params=oracle_params,
             )
             return actions, new_last, key
 
@@ -170,6 +179,7 @@ def _act_independent_allies(
     ally_keys: list[str],
     n_ally: int,
     oracle_behavior: dict[str, jax.Array],
+    oracle_params: Any,
 ) -> tuple[dict[str, jax.Array], list[LastVisibleTarget], jax.Array]:
     """Run every mix policy, then pick each agent's action by its mix index."""
 
@@ -179,7 +189,15 @@ def _act_independent_allies(
     for branch in branches:
         key_work, sub = jax.random.split(key_work)
         acts, new_last, _ = branch(
-            (sub, obs, avail, physics_params, last_visible, oracle_behavior)
+            (
+                sub,
+                obs,
+                avail,
+                physics_params,
+                last_visible,
+                oracle_behavior,
+                oracle_params,
+            )
         )
         actions_by_mix.append(
             jnp.stack(
@@ -209,10 +227,9 @@ def _make_single_env_rollout(
     best_teacher_policy: str = BEST_ORACLE,
     dump_attack_target: bool = False,
 ):
-    """Unjitted ``(seed, cdf) -> traj`` for one env (vmappable over seed)."""
+    """Unjitted ``(seed, cdf, env_params, oracle_params) -> traj`` (vmappable over seed)."""
 
     env = ctx.env
-    env_params = ctx.env_params
     ally_keys = list(ctx.ally_keys)
     unit_keys = list(ctx.unit_keys)
     n_ally = int(ctx.n_ally)
@@ -238,8 +255,12 @@ def _make_single_env_rollout(
         max_n_zone=max_n_zone,
     )
 
-    def rollout(seed: jax.Array, cdf: jax.Array):
-        """``seed`` + runtime mix ``cdf`` (weights change without recompile)."""
+    def rollout(seed: jax.Array, cdf: jax.Array, env_params: Any, oracle_params: Any):
+        """``seed`` + mix ``cdf`` + task ``env_params`` / ``oracle_params``.
+
+        Task weights and scenario stay arguments so tasks that share a schema
+        and network shape reuse one compiled program.
+        """
 
         # Match env_centric: jax.random.key(seed % 2**32).
         key = jax.random.key(jnp.asarray(seed, dtype=jnp.uint32))
@@ -335,6 +356,7 @@ def _make_single_env_rollout(
                 physics_params=state["physics_params"],
                 advanced_params=advanced_params,
                 ref_last_visible=ref_last_visible,
+                oracle_params=oracle_params,
             )
             oracle_behavior = select_rl_hard_actions(
                 oracle, sample_actions, argmax_actions
@@ -351,6 +373,7 @@ def _make_single_env_rollout(
                     ally_keys=ally_keys,
                     n_ally=n_ally,
                     oracle_behavior=oracle_behavior,
+                    oracle_params=oracle_params,
                 )
             else:
                 behavior, last_visible, _bkey_out = jax.lax.switch(
@@ -363,6 +386,7 @@ def _make_single_env_rollout(
                         state["physics_params"],
                         last_visible,
                         oracle_behavior,
+                        oracle_params,
                     ),
                 )
 
@@ -539,9 +563,11 @@ def build_scan_rollout_fn(
 ):
     """Return jitted rollout.
 
-    - ``parallel_envs <= 1``: ``(seed, cdf) -> traj`` with leaves ``(T, ...)``
-    - ``parallel_envs > 1``: ``(seeds[B], cdf) -> traj`` with leaves ``(B, T, ...)``
-      (vmap over seeds only; cdf broadcast). Fixed B; pad incomplete batches.
+    - ``parallel_envs <= 1``: ``(seed, cdf, env_params, oracle_params) -> traj``
+      with leaves ``(T, ...)``
+    - ``parallel_envs > 1``: ``(seeds[B], cdf, env_params, oracle_params) -> traj``
+      with leaves ``(B, T, ...)`` (vmap over seeds only). Fixed B; pad incomplete
+      batches.
     """
 
     raw = _make_single_env_rollout(
@@ -558,12 +584,44 @@ def build_scan_rollout_fn(
     b = max(1, int(parallel_envs))
     if b <= 1:
         return jax.jit(raw)
-    return jax.jit(jax.vmap(raw, in_axes=(0, None)))
+    return jax.jit(jax.vmap(raw, in_axes=(0, None, None, None)))
+
+
+def rollout_signature(ctx: Any, best_policy: str) -> tuple:
+    """Identity of one compiled scan. Same key reuses the program.
+
+    Q ε is part of the key because that scalar is a Python constant in the
+    trace. PPO categorical does not use it.
+    """
+
+    from generate.policies import is_rl_teacher
+
+    oracle = ctx.oracle
+    eps = round(float(oracle.train_epsilon), 6) if oracle.family == "q" else 0.0
+    return (
+        bool(oracle.train_like_sample),
+        bool(is_rl_teacher(best_policy)),
+        str(oracle.family),
+        int(oracle.hidden_size),
+        int(ctx.n_ally),
+        int(ctx.n_units_total),
+        int(ctx.env.max_n_zone),
+        int(ctx.obs_dim),
+        int(ctx.action_dim),
+        eps,
+    )
+
+
+def call_scan_rollout(rollout_fn, seeds, cdf, ctx: Any):
+    """Run a compiled scan with this task's scenario and coach weights."""
+
+    return rollout_fn(seeds, cdf, ctx.env_params, ctx.oracle.params)
 
 
 def warmup_scan_rollout(
     rollout_fn,
     *,
+    ctx: Any,
     mix: tuple[BehaviorSpec, ...] | None = None,
     cdf: jax.Array | None = None,
     seed: int = 0,
@@ -578,10 +636,12 @@ def warmup_scan_rollout(
     t0 = time.perf_counter()
     b = max(1, int(parallel_envs))
     if b <= 1:
-        traj = rollout_fn(jnp.asarray(seed, dtype=jnp.uint32), cdf)
+        traj = call_scan_rollout(
+            rollout_fn, jnp.asarray(seed, dtype=jnp.uint32), cdf, ctx
+        )
     else:
         seeds = jnp.arange(b, dtype=jnp.uint32) + jnp.uint32(int(seed) % (2**32))
-        traj = rollout_fn(seeds, cdf)
+        traj = call_scan_rollout(rollout_fn, seeds, cdf, ctx)
     # Touch a leaf so device work finishes.
     leaf = traj["done"]
     if hasattr(leaf, "block_until_ready"):
@@ -790,7 +850,9 @@ def generate_one_record_scan(
             dump_attack_target=dump_attack_target,
         )
 
-    traj = rollout_fn(jnp.asarray(seed_i % (2**32), dtype=jnp.uint32), cdf)
+    traj = call_scan_rollout(
+        rollout_fn, jnp.asarray(seed_i % (2**32), dtype=jnp.uint32), cdf, ctx
+    )
     arrays = trajectory_to_numpy(traj)
     return _write_one_from_arrays(
         package,
@@ -896,7 +958,9 @@ def generate_records_scan_batch(
         while len(seeds_list) < b:
             seeds_list.append(0)
 
-        traj = rollout_fn(jnp.asarray(seeds_list, dtype=jnp.uint32), cdf)
+        traj = call_scan_rollout(
+            rollout_fn, jnp.asarray(seeds_list, dtype=jnp.uint32), cdf, ctx
+        )
         batch = batch_trajectory_to_numpy(traj)
         for i in range(valid):
             rid = chunk[i]

@@ -78,7 +78,8 @@ class ProgressTracker:
                 f"[parallel_records] compile worker={event.get('worker_id')} "
                 f"pkg={event.get('package_name')} "
                 f"setup={float(event.get('setup_s', 0.0)):.1f}s "
-                f"jit={float(event.get('compile_s', 0.0)):.1f}s",
+                f"jit={float(event.get('compile_s', 0.0)):.1f}s"
+                f"{' reused' if event.get('rollout_reused') else ''}",
                 flush=True,
             )
         elif kind == "record_done":
