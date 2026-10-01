@@ -24,7 +24,7 @@ from generate.behavior_mix import (
     policy_tag_for_spec,
     policy_tag_legend_json,
 )
-from generate.dump_schema import ensure_dir, write_env_centric_record
+from generate.dump_schema import ensure_dir, env_record_dir, write_env_centric_record
 from generate.oracle_loader import OracleCoach, load_oracle_coach
 from generate.policies import (
     BEST_ORACLE,
@@ -642,11 +642,11 @@ def generate_one_record(
     if dump_attack_target:
         arrays["attack_target"] = np.stack(buffers["attack_target"], axis=0)
 
-    safe_id = package.task_id.replace("/", "_")
-    record_dir = (
-        Path(output_root)
-        / f"task_{package.task_index:05d}_{safe_id}"
-        / f"record-{record_id:06d}"
+    record_dir = env_record_dir(
+        output_root,
+        task_index=package.task_index,
+        task_id=package.task_id,
+        record_id=record_id,
     )
     meta = {
         "schema": "env_centric_v1",

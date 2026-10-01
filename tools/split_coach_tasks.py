@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Split discovered coach leaves into N shard JSON files.
+"""Split coach task directories into N shard JSON files.
 
-Leaves are the same ones record generation uses (task.json + checkpoint),
-sorted by task_index. Each shard lists those packages by name. Pass one
+Only directory names are listed. task.json and checkpoints are not opened,
+so this stays a single directory listing on a flat coach root. Pass one
 file to generate so that machine only builds the tasks in it.
 
   python tools/split_coach_tasks.py /path/to/coach_root --shards 4 --out-dir ./task_shards
@@ -25,7 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from generate.task_package import (  # noqa: E402
-    discover_task_packages,
+    list_task_leaf_refs,
     shard_payload,
     split_even,
 )
@@ -61,7 +61,8 @@ def main() -> None:
         raise SystemExit("--records-per-task must be >= 1")
 
     root = Path(args.coach_root)
-    packages = discover_task_packages(root)
+    print(f"listing {root}", flush=True)
+    packages = list_task_leaf_refs(root)
     shards = split_even(packages, int(args.shards))
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

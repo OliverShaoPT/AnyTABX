@@ -95,7 +95,9 @@ __all__ = [
     "DEFAULT_TIE_EPS",
     "ORACLE_SPEC",
     "apply_oracle_act_mode",
+    "coach_eval_batch_size",
     "coach_eval_for_task_metadata",
+    "compile_coach_eval_programs",
     "ensure_coach_eval",
     "evaluate_and_write_coach_leaf",
     "evaluate_package_oracle_vs_advanced",
@@ -390,6 +392,71 @@ def _build_batched_episode_fn(
     return jax.jit(jax.vmap(run_one_episode))
 
 
+def coach_eval_batch_size(num_episodes: int, parallel_envs: int | None) -> int:
+    """vmap width used by coach eval. Compile and rollout must share this width."""
+
+    n = max(1, int(num_episodes))
+    if parallel_envs is None:
+        return min(n, DEFAULT_PARALLEL_ENVS)
+    return max(1, min(n, int(parallel_envs)))
+
+
+def compile_coach_eval_programs(
+    package: TaskPackage,
+    *,
+    ctx: Any | None = None,
+    num_episodes: int = 64,
+    max_episode_steps: int = 512,
+    parallel_envs: int | None = None,
+    seed: int = 0,
+) -> list[str]:
+    """Compile missing coach-eval arms into the JAX cache.
+
+    Does not roll out episodes and does not write ``task.json``. A complete
+    3-way block returns immediately. Arm order and ``train_like_sample`` match
+    ``evaluate_package_oracle_vs_advanced`` so the worker's later trace hits
+    the same executable.
+    """
+
+    existing = read_coach_eval(package)
+    keep = present_three_way_blocks(existing)
+    if existing is not None and all(key in keep for key in THREE_WAY_KEYS):
+        return []
+
+    if ctx is None:
+        from generate.env_centric import build_record_gen_context
+
+        ctx = build_record_gen_context(package, train_like_sample=False)
+
+    batch = coach_eval_batch_size(num_episodes, parallel_envs)
+    arms: list[tuple[str, dict[str, Any], bool | None, int]] = []
+    if BEST_ORACLE_ARGMAX not in keep:
+        arms.append((BEST_ORACLE_ARGMAX, ORACLE_SPEC, False, int(seed)))
+    if BEST_ORACLE_SAMPLE not in keep:
+        arms.append((BEST_ORACLE_SAMPLE, ORACLE_SPEC, True, int(seed)))
+    if BEST_ADVANCED not in keep:
+        arms.append((BEST_ADVANCED, ADVANCED_SPEC, None, int(seed) + 10_000_003))
+
+    import jax
+
+    compiled: list[str] = []
+    for name, spec, train_like, arm_seed in arms:
+        if train_like is not None:
+            ctx.oracle.train_like_sample = bool(train_like)
+        batched_fn = _build_batched_episode_fn(
+            ctx=ctx,
+            spec_dict=spec,
+            max_episode_steps=max_episode_steps,
+        )
+        key = jax.random.key(int(arm_seed) % (2**32))
+        _key, sub = jax.random.split(key)
+        ep_keys = jax.random.split(sub, batch)
+        executable = batched_fn.lower(ep_keys).compile()
+        del executable
+        compiled.append(name)
+    return compiled
+
+
 def run_policy_episodes(
     *,
     ctx: Any,
@@ -405,10 +472,7 @@ def run_policy_episodes(
     import numpy as np
 
     n = max(1, int(num_episodes))
-    if parallel_envs is None:
-        batch = min(n, DEFAULT_PARALLEL_ENVS)
-    else:
-        batch = max(1, min(n, int(parallel_envs)))
+    batch = coach_eval_batch_size(num_episodes, parallel_envs)
 
     batched_fn = _build_batched_episode_fn(
         ctx=ctx,
@@ -475,11 +539,7 @@ def evaluate_package_oracle_vs_advanced(
         from generate.env_centric import build_record_gen_context
 
         ctx = build_record_gen_context(package, train_like_sample=False)
-    n = max(1, int(num_episodes))
-    if parallel_envs is None:
-        batch = min(n, DEFAULT_PARALLEL_ENVS)
-    else:
-        batch = max(1, min(n, int(parallel_envs)))
+    batch = coach_eval_batch_size(num_episodes, parallel_envs)
 
     filled: list[str] = []
     if BEST_ORACLE_ARGMAX in keep_blocks:

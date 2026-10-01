@@ -49,6 +49,67 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def env_task_dir(
+    output_root: Path | str,
+    *,
+    task_index: int,
+    task_id: str,
+) -> Path:
+    """Directory for one task's records: ``task_{index:05d}_{task_id}``."""
+
+    safe_id = str(task_id).replace("/", "_")
+    return Path(output_root) / f"task_{int(task_index):05d}_{safe_id}"
+
+
+def env_record_dir(
+    output_root: Path | str,
+    *,
+    task_index: int,
+    task_id: str,
+    record_id: int,
+) -> Path:
+    """One record directory. ``meta.json`` is written last, so it marks completion."""
+
+    return env_task_dir(
+        output_root, task_index=task_index, task_id=task_id
+    ) / f"record-{int(record_id):06d}"
+
+
+def env_record_is_complete(record_dir: Path) -> bool:
+    return (Path(record_dir) / "meta.json").is_file()
+
+
+def completed_record_ids(task_dir: Path) -> set[int]:
+    """Record ids under ``task_dir`` whose ``meta.json`` is already written."""
+
+    task_dir = Path(task_dir)
+    done: set[int] = set()
+    if not task_dir.is_dir():
+        return done
+    for child in task_dir.iterdir():
+        if not child.is_dir() or not child.name.startswith("record-"):
+            continue
+        suffix = child.name[len("record-") :]
+        if not suffix.isdigit():
+            continue
+        if (child / "meta.json").is_file():
+            done.add(int(suffix))
+    return done
+
+
+def find_completed_record_meta(task_dir: Path) -> dict[str, Any] | None:
+    """First finished record's ``meta.json``, in record-id order."""
+
+    task_dir = Path(task_dir)
+    if not task_dir.is_dir():
+        return None
+    for record_id in sorted(completed_record_ids(task_dir)):
+        meta_path = task_dir / f"record-{record_id:06d}" / "meta.json"
+        if meta_path.is_file():
+            return load_meta(meta_path)
+    return None
+
+
 def save_meta(path: Path, meta: dict[str, Any]) -> None:
     path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

@@ -33,6 +33,14 @@ stagger_s: 1.0                # worker_id * stagger_s sleep before start (JIT st
 # With parallel_envs>=8 prefer workers_per_gpu=1 to limit VRAM.
 gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
 workers_per_gpu: 1
+# Compile-only processes per GPU. They warm later tasks' coach-eval into
+# JAX_COMPILATION_CACHE_DIR while the worker runs the current task.
+# Used only when best_teacher_reference is true. 0 disables. Keep this small
+# (2, at most 4): each process holds a CUDA context and several GB of host RAM.
+compile_prefetch: 2
+# Skip record directories that already contain meta.json. A partial task
+# keeps the finished ids and generates only the missing ones.
+skip_existing: true
 jax_platform: cuda            # JAX_PLATFORMS for GPU workers
 
 # --- RNG ---

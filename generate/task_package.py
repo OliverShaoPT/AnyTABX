@@ -21,6 +21,7 @@ Legacy packed layout still works::
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -195,6 +196,61 @@ def parse_task_list(path: str | Path) -> dict[str, Any]:
         "shard": None if shard is None else int(shard),
         "n_shards": None if n_shards is None else int(n_shards),
     }
+
+
+_TASK_DIR_RE = re.compile(r"^task[_-](\d+)(?:[_-](.+))?$")
+
+
+@dataclass(frozen=True)
+class TaskLeafRef:
+    """Directory name used to split shards. No file reads."""
+
+    name: str
+    task_index: int
+    task_id: str
+
+
+def list_task_leaf_refs(root: str | Path) -> list[TaskLeafRef]:
+    """List ``task_<index>_...`` directories without opening their files.
+
+    Flat coach roots are one ``scandir``. A non-task wrapper is scanned one
+    level deeper. Matching task directories are not descended into, so
+    checkpoints under each leaf are never listed.
+    """
+
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"coach_root / task_packages_root not found: {root}")
+
+    leaves: list[TaskLeafRef] = []
+
+    def consider(parent_parts: tuple[str, ...], entry: os.DirEntry[str]) -> None:
+        if not entry.is_dir(follow_symlinks=False):
+            return
+        match = _TASK_DIR_RE.fullmatch(entry.name)
+        if match is not None:
+            task_index = int(match.group(1))
+            task_id = match.group(2) or str(task_index)
+            name = "__".join((*parent_parts, entry.name))
+            leaves.append(
+                TaskLeafRef(name=name, task_index=task_index, task_id=task_id)
+            )
+            return
+        if parent_parts:
+            return
+        with os.scandir(entry.path) as children:
+            for child in children:
+                consider((entry.name,), child)
+
+    with os.scandir(root) as entries:
+        for entry in entries:
+            consider((), entry)
+    if not leaves:
+        raise FileNotFoundError(
+            f"No task_* directories under {root}"
+        )
+    leaves.sort(key=lambda leaf: (leaf.task_index, leaf.name))
+    return leaves
 
 
 def split_even(items: list[Any], n_shards: int) -> list[list[Any]]:

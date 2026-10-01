@@ -84,6 +84,44 @@ def enable_compilation_cache() -> None:
         pass
 
 
+def _publish_worker_index(payload: dict[str, Any], index: int) -> None:
+    """Tell prefetch processes this task is starting so they compile later ones."""
+
+    cursor = payload.get("worker_index")
+    if cursor is None:
+        return
+    lock = payload.get("prefetch_lock")
+    if lock is None:
+        cursor.value = int(index)
+        return
+    with lock:
+        cursor.value = int(index)
+
+
+def _reuse_finished_mix(package: Any, payload: dict[str, Any], base_mix: Any):
+    """If this task already has a finished record, reuse its mix and skip pilots."""
+
+    from generate.behavior_mix import behavior_mix_from_config
+    from generate.dump_schema import env_task_dir, find_completed_record_meta
+
+    meta = find_completed_record_meta(
+        env_task_dir(
+            payload["output_root"],
+            task_index=int(package.task_index),
+            task_id=str(package.task_id),
+        )
+    )
+    if meta is None:
+        return None
+    adapt = meta.get("adapt")
+    if isinstance(adapt, dict) and adapt.get("behavior_mix"):
+        mix = behavior_mix_from_config(adapt["behavior_mix"])
+        reused = dict(adapt)
+        reused["pilot"] = False
+        return mix, reused
+    return base_mix, None
+
+
 def _report(payload: dict[str, Any], event: dict[str, Any]) -> None:
     queue = payload.get("progress_queue")
     if queue is None:
@@ -539,7 +577,8 @@ def worker_main(payload: dict[str, Any]) -> str:
     package_best_policy: dict[str, str] = {}
     paths: list[str] = []
     try:
-        for item in payload["items"]:
+        for item_index, item in enumerate(payload["items"]):
+            _publish_worker_index(payload, item_index)
             package = packages[item["package_name"]]
             ctx = contexts.get(package.name)
             if ctx is None:
@@ -686,7 +725,10 @@ def worker_main(payload: dict[str, Any]) -> str:
             )
 
             record_ids = [int(r) for r in item["record_ids"]]
-            if winrate_adapt:
+            reused = None
+            if winrate_adapt and bool(payload.get("skip_existing", True)):
+                reused = _reuse_finished_mix(package, item_payload, base_mix)
+            if winrate_adapt and reused is None:
                 _adapt_mix_for_package(
                     package=package,
                     record_ids=record_ids,
@@ -701,6 +743,30 @@ def worker_main(payload: dict[str, Any]) -> str:
                     behavior_switch_prob=behavior_switch_prob,
                     worker_id=worker_id,
                     device=device,
+                    paths=paths,
+                )
+            elif reused is not None:
+                reused_mix, reused_adapt = reused
+                print(
+                    f"[record_worker] package={package.name}: "
+                    f"reuse finished mix for {len(record_ids)} remaining records",
+                    flush=True,
+                )
+                _generate_ids(
+                    package=package,
+                    record_ids=record_ids,
+                    payload=item_payload,
+                    ctx=ctx,
+                    rollout_fn=rollout_fns.get(package.name),
+                    mix=reused_mix,
+                    scan_rollout=scan_rollout,
+                    parallel_envs=parallel_envs,
+                    total_timesteps=total_timesteps,
+                    min_behavior_steps=min_behavior_steps,
+                    behavior_switch_prob=behavior_switch_prob,
+                    worker_id=worker_id,
+                    device=device,
+                    adapt=reused_adapt,
                     paths=paths,
                 )
             else:

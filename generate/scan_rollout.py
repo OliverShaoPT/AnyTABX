@@ -22,7 +22,7 @@ from generate.behavior_mix import (
     sample_policy_index,
     sample_policy_indices,
 )
-from generate.dump_schema import write_env_centric_record
+from generate.dump_schema import env_record_dir, write_env_centric_record
 from generate.env_centric import RecordGenContext, sample_record_seed
 from generate.oracle_loader import OracleCoach
 from generate.policies import (
@@ -774,11 +774,11 @@ def _write_one_from_arrays(
     best_teacher_reference: bool = False,
     best_policy: str = BEST_ORACLE,
 ) -> Path:
-    safe_id = package.task_id.replace("/", "_")
-    record_dir = (
-        Path(output_root)
-        / f"task_{package.task_index:05d}_{safe_id}"
-        / f"record-{record_id:06d}"
+    record_dir = env_record_dir(
+        output_root,
+        task_index=package.task_index,
+        task_id=package.task_id,
+        record_id=record_id,
     )
     meta = _record_meta(
         package=package,

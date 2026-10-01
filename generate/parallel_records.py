@@ -16,7 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from generate.dump_schema import ensure_dir
+from generate.compile_prefetch import prefetch_main
+from generate.dump_schema import completed_record_ids, ensure_dir, env_task_dir
 from generate.progress import LocalQueue, ProgressTracker
 from generate.record_worker import worker_main
 
@@ -78,6 +79,58 @@ def _drain_progress_queue(
         except Exception as exc:  # noqa: BLE001
             print(f"[parallel_records] progress handle error: {exc}", flush=True)
             break
+
+
+def start_compile_prefetch(
+    ctx: Any, jobs: list[dict[str, Any]], n_prefetch: int
+) -> list[Any]:
+    """One compile-only process group per GPU job. Mutates jobs with a shared cursor."""
+
+    procs: list[Any] = []
+    if n_prefetch <= 0:
+        return procs
+    try:
+        for job in jobs:
+            if str(job.get("device")) != "gpu" or job.get("gpu_id") is None:
+                continue
+            if not job.get("best_teacher_reference"):
+                continue
+            if len(job.get("items") or []) <= 1:
+                continue
+            cursor = ctx.Value("i", -1)
+            nxt = ctx.Value("i", 1)
+            lock = ctx.Lock()
+            job["worker_index"] = cursor
+            job["next_compile"] = nxt
+            job["prefetch_lock"] = lock
+            for slot in range(int(n_prefetch)):
+                payload = dict(job)
+                payload["prefetch_slot"] = slot
+                proc = ctx.Process(
+                    target=prefetch_main,
+                    name=f"prefetch-gpu{job['gpu_id']}-{slot}",
+                    args=(payload,),
+                )
+                proc.start()
+                procs.append(proc)
+    except Exception:
+        stop_compile_prefetch(procs)
+        raise
+    if procs:
+        print(
+            f"[parallel_records] compile_prefetch processes={len(procs)} "
+            f"per_gpu={n_prefetch}",
+            flush=True,
+        )
+    return procs
+
+
+def stop_compile_prefetch(procs: list[Any]) -> None:
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+    for proc in procs:
+        proc.join(timeout=5)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -147,18 +200,54 @@ def even_records_per_task(total_records: int, n_tasks: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(n_tasks)]
 
 
+def record_ids_for_package(
+    *,
+    count: int,
+    start_index: int,
+    explicit: list[int] | None = None,
+) -> list[int]:
+    """Planned record ids. ``explicit`` wins, including an empty list (skip task)."""
+
+    if explicit is not None:
+        return [int(record_id) for record_id in explicit]
+    if count <= 0:
+        return []
+    return list(range(int(start_index), int(start_index) + int(count)))
+
+
+def pending_record_ids(
+    *,
+    output_root: Path,
+    task_index: int,
+    task_id: str,
+    record_ids: list[int],
+    skip_existing: bool,
+) -> list[int]:
+    """Drop ids whose record directory already has ``meta.json``."""
+
+    ids = [int(record_id) for record_id in record_ids]
+    if not skip_existing or not ids:
+        return ids
+    done = completed_record_ids(
+        env_task_dir(output_root, task_index=task_index, task_id=task_id)
+    )
+    return [record_id for record_id in ids if record_id not in done]
+
+
 def flatten_record_units(
     packages: list[Any],
     counts: list[int],
     start_index: int,
+    record_ids: list[list[int]] | None = None,
 ) -> list[tuple[str, int]]:
     """Flatten all (package_name, record_id) work units across tasks."""
 
     units: list[tuple[str, int]] = []
-    for package, count in zip(packages, counts):
-        if count <= 0:
-            continue
-        for record_id in range(start_index, start_index + count):
+    for index, (package, count) in enumerate(zip(packages, counts)):
+        explicit = None if record_ids is None else record_ids[index]
+        for record_id in record_ids_for_package(
+            count=count, start_index=start_index, explicit=explicit
+        ):
             units.append((package.name, int(record_id)))
     return units
 
@@ -186,6 +275,7 @@ def plan_jobs_task_affinity(
     counts: list[int],
     start_index: int,
     slots: list[WorkerSlot],
+    record_ids: list[list[int]] | None = None,
 ) -> list[tuple[WorkerSlot, list[dict[str, Any]]]]:
     """Assign whole tasks to workers (round-robin over tasks).
 
@@ -194,15 +284,17 @@ def plan_jobs_task_affinity(
     """
 
     task_items: list[dict[str, Any]] = []
-    for package, count in zip(packages, counts):
-        if count <= 0:
+    for index, (package, count) in enumerate(zip(packages, counts)):
+        explicit = None if record_ids is None else record_ids[index]
+        ids = record_ids_for_package(
+            count=count, start_index=start_index, explicit=explicit
+        )
+        if not ids:
             continue
         task_items.append(
             {
                 "package_name": package.name,
-                "record_ids": list(
-                    range(start_index, start_index + int(count))
-                ),
+                "record_ids": ids,
             }
         )
     if not task_items:
@@ -226,10 +318,13 @@ def plan_jobs_record_stripe(
     counts: list[int],
     start_index: int,
     slots: list[WorkerSlot],
+    record_ids: list[list[int]] | None = None,
 ) -> list[tuple[WorkerSlot, list[dict[str, Any]]]]:
     """LEGACY: flatten (task, record_id) and round-robin (avoid for GPU production)."""
 
-    units = flatten_record_units(packages, counts, start_index)
+    units = flatten_record_units(
+        packages, counts, start_index, record_ids=record_ids
+    )
     if not units:
         return []
 
@@ -278,6 +373,8 @@ def plan_jobs(
     coach_eval_parallel_envs: int = 32,
     dump_attack_target: bool = False,
     oracle_train_like_sample: bool = True,
+    record_ids: list[list[int]] | None = None,
+    skip_existing: bool = True,
 ) -> list[dict[str, Any]]:
     """Build one job payload per active worker.
 
@@ -294,6 +391,7 @@ def plan_jobs(
             counts=counts,
             start_index=start_index,
             slots=slots,
+            record_ids=record_ids,
         )
     elif schedule == "record":
         assignments = plan_jobs_record_stripe(
@@ -301,6 +399,7 @@ def plan_jobs(
             counts=counts,
             start_index=start_index,
             slots=slots,
+            record_ids=record_ids,
         )
     else:
         raise ValueError(f"Unsupported schedule={schedule!r} (expected task|record)")
@@ -340,6 +439,7 @@ def plan_jobs(
                 "coach_eval_parallel_envs": int(coach_eval_parallel_envs),
                 "dump_attack_target": bool(dump_attack_target),
                 "oracle_train_like_sample": bool(oracle_train_like_sample),
+                "skip_existing": bool(skip_existing),
             }
         )
     return jobs
@@ -443,6 +543,22 @@ def run_from_config(config: dict[str, Any]) -> None:
     total_records = int(config["total_records"])
     counts = even_records_per_task(total_records, len(packages))
     start_index = int(config.get("start_index", 0))
+    skip_existing = bool(config.get("skip_existing", True))
+    id_lists: list[list[int]] = []
+    skipped = 0
+    for package, count in zip(packages, counts):
+        planned_ids = record_ids_for_package(
+            count=int(count), start_index=start_index
+        )
+        pending = pending_record_ids(
+            output_root=output_root,
+            task_index=int(package.task_index),
+            task_id=str(package.task_id),
+            record_ids=planned_ids,
+            skip_existing=skip_existing,
+        )
+        skipped += len(planned_ids) - len(pending)
+        id_lists.append(pending)
     slots = build_worker_slots(
         device=device,
         cpu_workers=int(config.get("cpu_workers", 8)),
@@ -499,9 +615,16 @@ def run_from_config(config: dict[str, Any]) -> None:
         oracle_train_like_sample=bool(
             config.get("oracle_train_like_sample", True)
         ),
+        record_ids=id_lists,
+        skip_existing=skip_existing,
     )
 
     planned = _planned_record_count(jobs)
+    compile_prefetch = int(config.get("compile_prefetch", 2) or 0)
+    if compile_prefetch < 0:
+        raise ValueError("compile_prefetch must be >= 0")
+    if device != "gpu" or not bool(config.get("best_teacher_reference", False)):
+        compile_prefetch = 0
     parallel_envs = max(1, int(config.get("parallel_envs", 1) or 1))
     print(
         f"[parallel_records] schedule={schedule} stagger_s={stagger_s} "
@@ -517,6 +640,8 @@ def run_from_config(config: dict[str, Any]) -> None:
         f"win_rate_min={config.get('win_rate_min', 0.30)} "
         f"win_rate_max={config.get('win_rate_max', None)} "
         f"tasks={len(packages)} total_records={total_records} "
+        f"skipped={skipped} remaining={planned} "
+        f"skip_existing={skip_existing} compile_prefetch={compile_prefetch} "
         f"planned={planned} "
         f"per_task={counts[0] if len(set(counts)) == 1 else counts} "
         f"slots={len(slots)} active_workers={len(jobs)} device={slots[0].device}",
@@ -539,17 +664,23 @@ def run_from_config(config: dict[str, Any]) -> None:
             flush=True,
         )
 
+    if planned <= 0:
+        print("[parallel_records] nothing to generate", flush=True)
+        return
+
     tracker = ProgressTracker(total=planned, output_root=output_root)
     status = "done"
+    prefetch_procs: list[Any] = []
     try:
+        mp_ctx = mp.get_context("spawn")
+        prefetch_procs = start_compile_prefetch(mp_ctx, jobs, compile_prefetch)
         if len(jobs) <= 1:
             queue = LocalQueue(tracker.handle)
             for job in _attach_progress_queue(jobs, queue):
                 worker_main(job)
             return
 
-        ctx = mp.get_context("spawn")
-        manager = ctx.Manager()
+        manager = mp_ctx.Manager()
         queue = manager.Queue()
         stop = threading.Event()
         drain = threading.Thread(
@@ -567,7 +698,7 @@ def run_from_config(config: dict[str, Any]) -> None:
                 from generate.record_worker import force_jax_cpu_env
 
                 pool_kwargs["initializer"] = force_jax_cpu_env
-            with ctx.Pool(**pool_kwargs) as pool:
+            with mp_ctx.Pool(**pool_kwargs) as pool:
                 for _ in pool.imap_unordered(
                     worker_main, _attach_progress_queue(jobs, queue)
                 ):
@@ -581,6 +712,7 @@ def run_from_config(config: dict[str, Any]) -> None:
         status = "failed"
         raise
     finally:
+        stop_compile_prefetch(prefetch_procs)
         tracker.finish(status=status)
 
 
@@ -640,6 +772,21 @@ def main(
         help="Comma-separated GPU ids, e.g. 0,1,3",
     )
     parser.add_argument("--workers_per_gpu", type=int, default=None)
+    parser.add_argument(
+        "--compile_prefetch",
+        type=int,
+        default=None,
+        help=(
+            "Compile-only processes per GPU that warm later tasks' coach-eval "
+            "into the JAX cache. 0 disables. Default 2 when best_teacher_reference is on."
+        ),
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Skip record dirs that already contain meta.json (default: true).",
+    )
     parser.add_argument(
         "--schedule",
         type=str,
@@ -777,6 +924,7 @@ def main(
         "device": args.device,
         "cpu_workers": args.cpu_workers,
         "workers_per_gpu": args.workers_per_gpu,
+        "compile_prefetch": args.compile_prefetch,
         "schedule": args.schedule,
         "stagger_s": args.stagger_s,
         "seed": args.seed,
@@ -798,6 +946,8 @@ def main(
         config["task_index"] = args.task_index
     if args.task_list is not None:
         config["task_list"] = args.task_list
+    if args.skip_existing is not None:
+        config["skip_existing"] = bool(args.skip_existing)
     config["_total_records_from_cli"] = args.total_records is not None
     if args.scan_rollout is not None:
         config["scan_rollout"] = args.scan_rollout == "true"
