@@ -122,6 +122,44 @@ def _reuse_finished_mix(package: Any, payload: dict[str, Any], base_mix: Any):
     return base_mix, None
 
 
+def _drop_low_win_task(
+    payload: dict[str, Any],
+    *,
+    package_name: str,
+    record_ids: list[int],
+    argmax_wr: float,
+    sample_wr: float,
+    advanced_wr: float,
+    worker_id: int,
+    device: str,
+) -> None:
+    """Skip record generation when every teacher win rate is below 0.3."""
+
+    n_records = len(record_ids)
+    print(
+        f"[record_worker] package={package_name}: drop task "
+        f"all win rates < 0.3 "
+        f"(argmax_wr={argmax_wr} sample_wr={sample_wr} advanced_wr={advanced_wr}); "
+        f"skip {n_records} records",
+        flush=True,
+    )
+    _report(
+        payload,
+        {
+            "event": "task_skipped",
+            "worker_id": worker_id,
+            "device": device,
+            "gpu_id": payload.get("gpu_id"),
+            "package_name": package_name,
+            "n_records": n_records,
+            "argmax_wr": argmax_wr,
+            "sample_wr": sample_wr,
+            "advanced_wr": advanced_wr,
+            "reason": "all_teachers_below_0.3",
+        },
+    )
+
+
 def _report(payload: dict[str, Any], event: dict[str, Any]) -> None:
     queue = payload.get("progress_queue")
     if queue is None:
@@ -580,6 +618,27 @@ def worker_main(payload: dict[str, Any]) -> str:
         for item_index, item in enumerate(payload["items"]):
             _publish_worker_index(payload, item_index)
             package = packages[item["package_name"]]
+            if best_teacher_reference:
+                from generate.coach_eval import (
+                    all_teachers_below_win_rate,
+                    read_coach_eval,
+                    three_way_win_rates,
+                )
+
+                cached = read_coach_eval(package)
+                if all_teachers_below_win_rate(cached):
+                    argmax_wr, sample_wr, advanced_wr = three_way_win_rates(cached)
+                    _drop_low_win_task(
+                        payload,
+                        package_name=package.name,
+                        record_ids=[int(r) for r in item["record_ids"]],
+                        argmax_wr=argmax_wr,
+                        sample_wr=sample_wr,
+                        advanced_wr=advanced_wr,
+                        worker_id=worker_id,
+                        device=device,
+                    )
+                    continue
             ctx = contexts.get(package.name)
             if ctx is None:
                 t_setup = time.perf_counter()
@@ -643,6 +702,20 @@ def worker_main(payload: dict[str, Any]) -> str:
                             f"advanced_wr={a}",
                             flush=True,
                         )
+                    from generate.coach_eval import all_teachers_below_win_rate
+
+                    if all_teachers_below_win_rate(ev):
+                        _drop_low_win_task(
+                            payload,
+                            package_name=package.name,
+                            record_ids=[int(r) for r in item["record_ids"]],
+                            argmax_wr=float(argmax_wr),
+                            sample_wr=float(sample_wr),
+                            advanced_wr=float(a),
+                            worker_id=worker_id,
+                            device=device,
+                        )
+                        continue
                 else:
                     best_policy = BEST_ORACLE
                 package_best_policy[package.name] = best_policy

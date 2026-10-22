@@ -82,13 +82,24 @@ def _drain_progress_queue(
 
 
 def start_compile_prefetch(
-    ctx: Any, jobs: list[dict[str, Any]], n_prefetch: int
+    ctx: Any,
+    jobs: list[dict[str, Any]],
+    n_prefetch: int,
+    manager: Any,
 ) -> list[Any]:
-    """One compile-only process group per GPU job. Mutates jobs with a shared cursor."""
+    """One compile-only process group per GPU job. Mutates jobs with a shared cursor.
+
+    Cursors are ``Manager`` proxies. A raw ``Value`` or ``Lock`` can be inherited
+    by a ``Process`` at spawn, but the Pool later pickles each job onto its task
+    queue, and that raises ``Synchronized objects should only be shared between
+    processes through inheritance``.
+    """
 
     procs: list[Any] = []
     if n_prefetch <= 0:
         return procs
+    if manager is None:
+        raise RuntimeError("compile_prefetch requires a multiprocessing Manager")
     try:
         for job in jobs:
             if str(job.get("device")) != "gpu" or job.get("gpu_id") is None:
@@ -97,9 +108,9 @@ def start_compile_prefetch(
                 continue
             if len(job.get("items") or []) <= 1:
                 continue
-            cursor = ctx.Value("i", -1)
-            nxt = ctx.Value("i", 1)
-            lock = ctx.Lock()
+            cursor = manager.Value("i", -1)
+            nxt = manager.Value("i", 1)
+            lock = manager.Lock()
             job["worker_index"] = cursor
             job["next_compile"] = nxt
             job["prefetch_lock"] = lock
@@ -671,16 +682,20 @@ def run_from_config(config: dict[str, Any]) -> None:
     tracker = ProgressTracker(total=planned, output_root=output_root)
     status = "done"
     prefetch_procs: list[Any] = []
+    manager = None
     try:
         mp_ctx = mp.get_context("spawn")
-        prefetch_procs = start_compile_prefetch(mp_ctx, jobs, compile_prefetch)
+        if len(jobs) > 1 or compile_prefetch > 0:
+            manager = mp_ctx.Manager()
+        prefetch_procs = start_compile_prefetch(
+            mp_ctx, jobs, compile_prefetch, manager
+        )
         if len(jobs) <= 1:
             queue = LocalQueue(tracker.handle)
             for job in _attach_progress_queue(jobs, queue):
                 worker_main(job)
             return
 
-        manager = mp_ctx.Manager()
         queue = manager.Queue()
         stop = threading.Event()
         drain = threading.Thread(
@@ -713,6 +728,8 @@ def run_from_config(config: dict[str, Any]) -> None:
         raise
     finally:
         stop_compile_prefetch(prefetch_procs)
+        if manager is not None:
+            manager.shutdown()
         tracker.finish(status=status)
 
 

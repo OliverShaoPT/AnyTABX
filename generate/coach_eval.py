@@ -222,6 +222,43 @@ def present_three_way_blocks(existing: dict[str, Any] | None) -> dict[str, dict[
     return out
 
 
+# Drop a task from record generation when every measured teacher is below this.
+DROP_TASK_WIN_RATE = 0.3
+
+
+def three_way_win_rates(
+    existing: dict[str, Any] | None,
+) -> tuple[float, float, float] | None:
+    """``(argmax, sample, advanced)`` when all three arms have a win rate."""
+
+    blocks = present_three_way_blocks(existing)
+    if not all(key in blocks for key in THREE_WAY_KEYS):
+        return None
+    return (
+        float(blocks[BEST_ORACLE_ARGMAX]["win_rate"]),
+        float(blocks[BEST_ORACLE_SAMPLE]["win_rate"]),
+        float(blocks[BEST_ADVANCED]["win_rate"]),
+    )
+
+
+def all_teachers_below_win_rate(
+    existing: dict[str, Any] | None,
+    *,
+    threshold: float = DROP_TASK_WIN_RATE,
+) -> bool:
+    """True when argmax, sample, and advanced are all strictly below ``threshold``.
+
+    Incomplete eval (a missing arm) returns False so the task is not dropped
+    before those arms are measured.
+    """
+
+    rates = three_way_win_rates(existing)
+    if rates is None:
+        return False
+    limit = float(threshold)
+    return all(rate < limit for rate in rates)
+
+
 def task_package_from_leaf(package_dir: Path) -> TaskPackage:
     """Build a ``TaskPackage`` from a coach leaf directory."""
 

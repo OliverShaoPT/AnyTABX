@@ -90,6 +90,23 @@ class ProgressTracker:
             self._last_heartbeat_at = time.time()
             self._write_snapshot(status="running")
             self._print_line(final=False)
+        elif kind == "task_skipped":
+            n = int(event.get("n_records") or 0)
+            self.total = max(0, self.total - n)
+            self.last_event = event
+            self._append_jsonl(event)
+            self._last_heartbeat_at = time.time()
+            self._write_snapshot(status="running")
+            print(
+                f"[parallel_records] drop task worker={event.get('worker_id')} "
+                f"pkg={event.get('package_name')} "
+                f"argmax_wr={event.get('argmax_wr')} "
+                f"sample_wr={event.get('sample_wr')} "
+                f"advanced_wr={event.get('advanced_wr')} "
+                f"skipped_records={n} remaining_total={self.total}",
+                flush=True,
+            )
+            self._print_line(final=False)
         elif kind == "coach_eval_done":
             self.last_event = event
             self._append_jsonl(event)
